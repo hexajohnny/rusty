@@ -241,6 +241,7 @@ struct SshTab {
     screen: vt100::Screen,
     scroll_wheel_accum: f32,
     scrollback_max: usize,
+    scrollbar_dragging: bool,
 
     ui_rx: Option<Receiver<UiMessage>>,
     worker_tx: Option<Sender<WorkerMessage>>,
@@ -283,6 +284,7 @@ impl SshTab {
             screen,
             scroll_wheel_accum: 0.0,
             scrollback_max: 0,
+            scrollbar_dragging: false,
             ui_rx: None,
             worker_tx: None,
             last_sent_size: None,
@@ -341,6 +343,7 @@ impl SshTab {
         self.pending_resize = None;
         self.scroll_wheel_accum = 0.0;
         self.scrollback_max = 0;
+        self.scrollbar_dragging = false;
         self.selection = None;
         self.pending_remote_click = None;
         self.pending_auth = None;
@@ -1164,11 +1167,55 @@ impl AppState {
         let primary_released = ui.input(|i| i.pointer.primary_released());
         let hovering_term = pointer_pos.map(|pos| term_rect.contains(pos)).unwrap_or(false) || response.hovered();
 
+        // Scrollbar interaction (hover-only; click-drag to scroll).
+        // We keep this independent from "remote mouse mode" so you can always scroll locally.
+        let scrollbar_w = 10.0;
+        let scrollbar_rect = Rect::from_min_max(
+            Pos2::new(term_rect.right() - scrollbar_w, term_rect.top()),
+            Pos2::new(term_rect.right(), term_rect.bottom()),
+        );
+        let hovering_scrollbar = pointer_pos
+            .map(|p| scrollbar_rect.contains(p))
+            .unwrap_or(false);
+        if primary_pressed && hovering_scrollbar && tab.connected && tab.scrollback_max > 0 {
+            tab.scrollbar_dragging = true;
+            response.request_focus();
+        }
+        if primary_released {
+            tab.scrollbar_dragging = false;
+        }
+        if tab.scrollbar_dragging && primary_down && tab.connected && tab.scrollback_max > 0 {
+            if let Some(pos) = pointer_pos {
+                // Map pointer Y to scrollback offset.
+                let visible_rows = tab.screen.size().0 as f32;
+                let total_rows = visible_rows + tab.scrollback_max as f32;
+                let track_h = term_rect.height().max(1.0);
+                let handle_h = (track_h * (visible_rows / total_rows))
+                    .clamp(18.0, track_h);
+                let track_min = term_rect.top();
+                let track_max = term_rect.bottom() - handle_h;
+                let y = pos.y.clamp(track_min, track_max.max(track_min));
+                let t = if track_max > track_min {
+                    (y - track_min) / (track_max - track_min)
+                } else {
+                    0.0
+                };
+                // t=0 => top (max scrollback), t=1 => bottom (0 scrollback)
+                let max = tab.scrollback_max as f32;
+                let desired = ((1.0 - t) * max).round().clamp(0.0, max) as usize;
+                if desired != tab.screen.scrollback() {
+                    Self::set_scrollback(tab, desired);
+                }
+            }
+        }
+
         // Local scrollback (mouse wheel / trackpad). This is independent of any remote app state.
         if hovering_term && tab.connected {
-            // Prefer egui's per-frame aggregated deltas (more reliable than scanning events).
-            // Values are in points.
-            let mut dy = ui.input(|i| i.smooth_scroll_delta.y);
+            // Use egui's aggregated deltas (points). Some backends don't always generate `Event::Scroll`.
+            let mut dy = ui.input(|i| i.raw_scroll_delta.y);
+            if dy == 0.0 {
+                dy = ui.input(|i| i.smooth_scroll_delta.y);
+            }
             if dy == 0.0 {
                 for ev in events.iter() {
                     if let egui::Event::Scroll(delta) = ev {
@@ -1176,28 +1223,17 @@ impl AppState {
                     }
                 }
             }
-            if dy != 0.0 {
-                // Consume so parent containers don't steal the wheel.
-                ui.input_mut(|i| {
-                    i.raw_scroll_delta = Vec2::ZERO;
-                    i.smooth_scroll_delta = Vec2::ZERO;
-                });
-            }
 
             if dy != 0.0 {
-                // Track in "rows" so wheel notches move predictably.
+                // Accumulate into rows and apply integer deltas.
                 let step = cell_h.max(1.0);
                 tab.scroll_wheel_accum += dy / step;
-                let rows_delta = tab.scroll_wheel_accum.round() as i32;
+                let rows_delta = tab.scroll_wheel_accum.trunc() as i32;
                 if rows_delta != 0 {
                     tab.scroll_wheel_accum -= rows_delta as f32;
                     let cur = tab.screen.scrollback() as i32;
-                    let max = tab.scrollback_max as i32;
-                    let mut next = cur + rows_delta;
-                    next = next.clamp(0, max);
-                    if next != cur {
-                        Self::set_scrollback(tab, next as usize);
-                    }
+                    let next = (cur + rows_delta).max(0) as usize;
+                    Self::set_scrollback(tab, next);
                 }
             }
         }

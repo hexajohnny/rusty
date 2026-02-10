@@ -508,6 +508,7 @@ fn run_shell(
                 Ok(WorkerMessage::SetScrollback(rows)) => {
                     parser.set_scrollback(rows);
                     let _ = ui_tx.send(UiMessage::Screen(parser.screen().clone()));
+                    let _ = ui_tx.send(UiMessage::ScrollbackMax(compute_scrollback_max(&mut parser)));
                 }
                 Ok(WorkerMessage::Disconnect) => {
                     disconnected = true;
