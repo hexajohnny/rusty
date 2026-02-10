@@ -232,6 +232,7 @@ struct SshTab {
     user_title: Option<String>,
     color: Option<Color32>,
     profile_name: Option<String>,
+    scrollback_len: usize,
     settings: ConnectionSettings,
     connected: bool,
     connecting: bool,
@@ -257,8 +258,16 @@ struct SshTab {
 }
 
 impl SshTab {
-    fn new(id: u64, settings: ConnectionSettings, profile_name: Option<String>, log_path: String) -> Self {
-        let screen = vt100::Parser::new(24, 80, ssh::TERM_SCROLLBACK_LEN).screen().clone();
+    fn new(
+        id: u64,
+        settings: ConnectionSettings,
+        profile_name: Option<String>,
+        scrollback_len: usize,
+        log_path: String,
+    ) -> Self {
+        let len = scrollback_len.clamp(0, 200_000);
+        let len = if len == 0 { ssh::TERM_SCROLLBACK_LEN } else { len };
+        let screen = vt100::Parser::new(24, 80, len).screen().clone();
         let title = Self::title_for(id, &settings);
         Self {
             id,
@@ -266,6 +275,7 @@ impl SshTab {
             user_title: None,
             color: None,
             profile_name,
+            scrollback_len: len,
             settings,
             connected: false,
             connecting: false,
@@ -314,8 +324,9 @@ impl SshTab {
         self.title = Self::title_for(self.id, &self.settings);
 
         let settings = self.settings.clone();
+        let scrollback_len = self.scrollback_len;
         let log_path = self.log_path.clone();
-        let _handle = ssh::start_shell(settings, ui_tx, worker_rx, log_path);
+        let _handle = ssh::start_shell(settings, scrollback_len, ui_tx, worker_rx, log_path);
     }
 
     fn disconnect(&mut self) {
@@ -438,6 +449,7 @@ impl AppState {
             next_session_id,
             initial_settings,
             initial_profile_name,
+            config.terminal_scrollback_lines,
             format!("logs\\tab-{next_session_id}.log"),
         );
         next_session_id += 1;
@@ -558,18 +570,30 @@ impl AppState {
             return;
         }
 
-        let pane_id = self.create_pane(ConnectionSettings::default(), None, None);
+        let pane_id = self.create_pane(ConnectionSettings::default(), None, None, self.config.terminal_scrollback_lines);
         let root = self.tree.tiles.insert_tab_tile(vec![pane_id]);
         self.tree.root = Some(root);
         self.active_tile = Some(pane_id);
         self.settings_dialog.target_tile = Some(pane_id);
     }
 
-    fn create_pane(&mut self, settings: ConnectionSettings, color: Option<Color32>, profile_name: Option<String>) -> TileId {
+    fn create_pane(
+        &mut self,
+        settings: ConnectionSettings,
+        color: Option<Color32>,
+        profile_name: Option<String>,
+        scrollback_len: usize,
+    ) -> TileId {
         let id = self.next_session_id;
         self.next_session_id += 1;
 
-        let mut tab = SshTab::new(id, settings, profile_name, format!("logs\\tab-{id}.log"));
+        let mut tab = SshTab::new(
+            id,
+            settings,
+            profile_name,
+            scrollback_len,
+            format!("logs\\tab-{id}.log"),
+        );
         tab.color = color;
         tab.focus_terminal_next_frame = true;
         if !tab.settings.host.trim().is_empty() && !tab.settings.username.trim().is_empty() {
@@ -590,11 +614,15 @@ impl AppState {
         tabs_container_id: TileId,
         base_pane_id: Option<TileId>,
     ) -> Option<TileId> {
-        let (settings, color, profile_name) = base_pane_id
-            .and_then(|id| self.pane(id).map(|p| (p.settings.clone(), p.color, p.profile_name.clone())))
-            .unwrap_or((ConnectionSettings::default(), None, None));
+        let (settings, color, profile_name, scrollback_len) = base_pane_id
+            .and_then(|id| {
+                self.pane(id).map(|p| {
+                    (p.settings.clone(), p.color, p.profile_name.clone(), p.scrollback_len)
+                })
+            })
+            .unwrap_or((ConnectionSettings::default(), None, None, self.config.terminal_scrollback_lines));
 
-        let pane_id = self.create_pane(settings, color, profile_name);
+        let pane_id = self.create_pane(settings, color, profile_name, scrollback_len);
 
         if let Some(Tile::Container(Container::Tabs(tabs))) =
             self.tree.tiles.get_mut(tabs_container_id)
@@ -706,7 +734,7 @@ impl AppState {
         color: Option<Color32>,
         profile_name: Option<String>,
     ) -> Option<TileId> {
-        let pane_id = self.create_pane(settings, color, profile_name);
+        let pane_id = self.create_pane(settings, color, profile_name, self.config.terminal_scrollback_lines);
 
         if let Some(Tile::Container(Container::Tabs(tabs))) =
             self.tree.tiles.get_mut(tabs_container_id)
@@ -791,17 +819,17 @@ impl AppState {
     }
 
     fn split_pane(&mut self, pane_id: TileId, dir: LinearDir) -> Option<TileId> {
-        let (settings, color, profile_name) = self
+        let (settings, color, profile_name, scrollback_len) = self
             .pane(pane_id)
-            .map(|p| (p.settings.clone(), p.color, p.profile_name.clone()))
-            .unwrap_or((ConnectionSettings::default(), None, None));
+            .map(|p| (p.settings.clone(), p.color, p.profile_name.clone(), p.scrollback_len))
+            .unwrap_or((ConnectionSettings::default(), None, None, self.config.terminal_scrollback_lines));
 
         let Some(tabs_container_id) = self.tree.tiles.parent_of(pane_id) else {
             return None;
         };
         let parent_of_tabs = self.tree.tiles.parent_of(tabs_container_id);
 
-        let new_pane_id = self.create_pane(settings, color, profile_name);
+        let new_pane_id = self.create_pane(settings, color, profile_name, scrollback_len);
         let new_tabs_id = self.tree.tiles.insert_tab_tile(vec![new_pane_id]);
         let new_linear_id = match dir {
             LinearDir::Horizontal => self
@@ -1138,19 +1166,31 @@ impl AppState {
 
         // Local scrollback (mouse wheel / trackpad). This is independent of any remote app state.
         if hovering_term && tab.connected {
-            let mut dy = 0.0f32;
-            for ev in events.iter() {
-                if let egui::Event::Scroll(delta) = ev {
-                    dy += delta.y;
+            // Prefer egui's per-frame aggregated deltas (more reliable than scanning events).
+            // Values are in points.
+            let mut dy = ui.input(|i| i.smooth_scroll_delta.y);
+            if dy == 0.0 {
+                for ev in events.iter() {
+                    if let egui::Event::Scroll(delta) = ev {
+                        dy += delta.y;
+                    }
                 }
+            }
+            if dy != 0.0 {
+                // Consume so parent containers don't steal the wheel.
+                ui.input_mut(|i| {
+                    i.raw_scroll_delta = Vec2::ZERO;
+                    i.smooth_scroll_delta = Vec2::ZERO;
+                });
             }
 
             if dy != 0.0 {
-                tab.scroll_wheel_accum += dy;
+                // Track in "rows" so wheel notches move predictably.
                 let step = cell_h.max(1.0);
-                let rows_delta = (tab.scroll_wheel_accum / step).trunc() as i32;
+                tab.scroll_wheel_accum += dy / step;
+                let rows_delta = tab.scroll_wheel_accum.round() as i32;
                 if rows_delta != 0 {
-                    tab.scroll_wheel_accum -= rows_delta as f32 * step;
+                    tab.scroll_wheel_accum -= rows_delta as f32;
                     let cur = tab.screen.scrollback() as i32;
                     let max = tab.scrollback_max as i32;
                     let mut next = cur + rows_delta;
@@ -1929,6 +1969,33 @@ impl AppState {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new("Updates live, even for existing sessions.").color(theme.muted),
+        );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        let before = self.config.terminal_scrollback_lines;
+        ui.add(
+            egui::DragValue::new(&mut self.config.terminal_scrollback_lines)
+                .speed(100.0)
+                .clamp_range(0..=200_000),
+        );
+        ui.label("Terminal scrollback lines (0 = default)");
+        if self.config.terminal_scrollback_lines != before {
+            // Applies to new tabs and future connects. Existing sessions must reconnect to change capacity.
+            let new_len = self.config.terminal_scrollback_lines;
+            for id in self.pane_ids() {
+                if let Some(tab) = self.pane_mut(id) {
+                    tab.scrollback_len = new_len;
+                }
+            }
+            config::save(&self.config);
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Applies on new connections (reconnect existing tabs to take effect).")
+                .color(theme.muted),
         );
 
         ui.add_space(12.0);
@@ -3519,7 +3586,7 @@ impl eframe::App for AppState {
                     }
 
                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if enter && resp.has_focus() {
+                    if enter {
                         rename_action = Some((popup.tile_id, popup.value.trim().to_string()));
                         close_popup = true;
                     }

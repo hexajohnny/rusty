@@ -285,13 +285,14 @@ impl<'a> KeyboardInteractivePrompt for UiPrompter<'a> {
 
 pub fn start_shell(
     settings: ConnectionSettings,
+    scrollback_len: usize,
     ui_tx: Sender<UiMessage>,
     worker_rx: Receiver<WorkerMessage>,
     log_path: String,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         logger::log_line(&log_path, "Starting SSH worker.");
-        let result = run_shell(settings, &ui_tx, worker_rx, &log_path);
+        let result = run_shell(settings, scrollback_len, &ui_tx, worker_rx, &log_path);
         if let Err(err) = result {
             logger::log_line(&log_path, &format!("Worker error: {err}"));
             let _ = ui_tx.send(UiMessage::Status(format!("Connection failed: {err}")));
@@ -302,6 +303,7 @@ pub fn start_shell(
 
 fn run_shell(
     settings: ConnectionSettings,
+    scrollback_len: usize,
     ui_tx: &Sender<UiMessage>,
     worker_rx: Receiver<WorkerMessage>,
     log_path: &str,
@@ -473,7 +475,9 @@ fn run_shell(
     logger::log_line(log_path, "Shell connected.");
 
     let mut read_buf = [0u8; READ_BUF_SIZE];
-    let mut parser = Parser::new(24, 80, TERM_SCROLLBACK_LEN);
+    let len = scrollback_len.clamp(0, 200_000);
+    let len = if len == 0 { TERM_SCROLLBACK_LEN } else { len };
+    let mut parser = Parser::new(24, 80, len);
     let mut scanner = CsiQueryScanner::default();
     loop {
         let mut disconnected = false;

@@ -13,6 +13,10 @@ fn default_terminal_font_size() -> f32 {
     16.0
 }
 
+fn default_terminal_scrollback_lines() -> usize {
+    5000
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct RgbColor {
     pub r: u8,
@@ -103,6 +107,8 @@ pub struct AppConfig {
     pub minimize_to_tray: bool,
     #[serde(default = "default_terminal_font_size")]
     pub terminal_font_size: f32,
+    #[serde(default = "default_terminal_scrollback_lines")]
+    pub terminal_scrollback_lines: usize,
     #[serde(default)]
     pub terminal_colors: TerminalColorsConfig,
 }
@@ -115,6 +121,7 @@ impl Default for AppConfig {
             autostart: false,
             minimize_to_tray: false,
             terminal_font_size: default_terminal_font_size(),
+            terminal_scrollback_lines: default_terminal_scrollback_lines(),
             terminal_colors: TerminalColorsConfig::default(),
         }
     }
