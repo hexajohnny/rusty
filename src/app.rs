@@ -242,6 +242,7 @@ struct SshTab {
     scroll_wheel_accum: f32,
     scrollback_max: usize,
     scrollbar_dragging: bool,
+    copy_flash_until: Option<Instant>,
 
     ui_rx: Option<Receiver<UiMessage>>,
     worker_tx: Option<Sender<WorkerMessage>>,
@@ -285,6 +286,7 @@ impl SshTab {
             scroll_wheel_accum: 0.0,
             scrollback_max: 0,
             scrollbar_dragging: false,
+            copy_flash_until: None,
             ui_rx: None,
             worker_tx: None,
             last_sent_size: None,
@@ -344,6 +346,7 @@ impl SshTab {
         self.scroll_wheel_accum = 0.0;
         self.scrollback_max = 0;
         self.scrollbar_dragging = false;
+        self.copy_flash_until = None;
         self.selection = None;
         self.pending_remote_click = None;
         self.pending_auth = None;
@@ -1015,6 +1018,19 @@ impl AppState {
         }
     }
 
+    fn copy_selection_with_flash(
+        ctx: &egui::Context,
+        clipboard: &mut Option<Clipboard>,
+        tab: &mut SshTab,
+        text: String,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        Self::copy_text_to_clipboard(ctx, clipboard, text);
+        tab.copy_flash_until = Some(Instant::now() + Duration::from_millis(150));
+    }
+
     fn key_to_ctrl_byte(key: egui::Key) -> Option<u8> {
         use egui::Key::*;
         let c = match key {
@@ -1169,7 +1185,8 @@ impl AppState {
 
         // Scrollbar interaction (hover-only; click-drag to scroll).
         // We keep this independent from "remote mouse mode" so you can always scroll locally.
-        let scrollbar_w = 10.0;
+        // Wider hit area so it's easy to click-drag.
+        let scrollbar_w = 16.0;
         let scrollbar_rect = Rect::from_min_max(
             Pos2::new(term_rect.right() - scrollbar_w, term_rect.top()),
             Pos2::new(term_rect.right(), term_rect.bottom()),
@@ -1425,7 +1442,7 @@ impl AppState {
                         if let Some(sel) = tab.selection {
                             let text = Self::selection_text(&tab.screen, sel);
                             if !text.is_empty() {
-                                Self::copy_text_to_clipboard(ctx, clipboard, text);
+                                Self::copy_selection_with_flash(ctx, clipboard, tab, text);
                             }
                         } else {
                             // Treat Ctrl+C as SIGINT when nothing is selected.
@@ -1470,7 +1487,7 @@ impl AppState {
                             if let Some(sel) = tab.selection {
                                 let text = Self::selection_text(&tab.screen, sel);
                                 if !text.is_empty() {
-                                    Self::copy_text_to_clipboard(ctx, clipboard, text);
+                                    Self::copy_selection_with_flash(ctx, clipboard, tab, text);
                                 }
                             } else {
                                 // No local selection: behave like a real terminal (SIGINT).
@@ -1690,7 +1707,12 @@ impl AppState {
         sel: TermSelection,
     ) {
         // Slightly stronger than a typical text selection so it's visible over dense ANSI color output.
-        let selection_bg = Color32::from_rgba_unmultiplied(255, 184, 108, 96);
+        let selection_bg = if tab.copy_flash_until.is_some() {
+            // Flash brighter on copy, then selection disappears (handled in the AppState update loop).
+            Color32::from_rgba_unmultiplied(255, 184, 108, 190)
+        } else {
+            Color32::from_rgba_unmultiplied(255, 184, 108, 96)
+        };
         let (rows, cols) = tab.screen.size();
         if rows == 0 || cols == 0 {
             return;
@@ -1787,7 +1809,7 @@ impl AppState {
 
         let with_alpha = |c: Color32, a: u8| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
 
-        let bar_w = 6.0;
+        let bar_w = 8.0;
         let pad = 1.0;
         let track = Rect::from_min_max(
             Pos2::new(rect.right() - bar_w - pad, rect.top() + pad),
@@ -3299,6 +3321,19 @@ impl eframe::App for AppState {
         for tile_id in self.pane_ids() {
             if let Some(tab) = self.pane_mut(tile_id) {
                 tab.poll_messages();
+            }
+        }
+
+        // Copy flash: after a successful copy, briefly flash the selection then clear it.
+        let now = Instant::now();
+        for tile_id in self.pane_ids() {
+            if let Some(tab) = self.pane_mut(tile_id) {
+                if let Some(until) = tab.copy_flash_until {
+                    if now >= until {
+                        tab.copy_flash_until = None;
+                        tab.selection = None;
+                    }
+                }
             }
         }
 
