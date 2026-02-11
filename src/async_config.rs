@@ -33,7 +33,11 @@ impl AsyncConfigSaver {
 
     /// Request a save. This is best-effort and returns immediately.
     pub fn request_save(&self, cfg: AppConfig) {
-        let _ = self.tx.send(Msg::Save(cfg));
+        if self.tx.send(Msg::Save(cfg.clone())).is_err() {
+            // Fallback: if the background saver is unavailable, persist synchronously
+            // so config updates are not silently lost.
+            crate::config::save(&cfg);
+        }
     }
 
     /// Flush any pending save and wait for completion (bounded by a timeout).

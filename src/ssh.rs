@@ -2,7 +2,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use ssh2::{KeyboardInteractivePrompt, Prompt, Session};
@@ -19,7 +19,7 @@ pub const TERM_SCROLLBACK_LEN: usize = 5000;
 #[derive(Debug)]
 pub enum UiMessage {
     Status(String),
-    Screen(vt100::Screen),
+    Screen(Box<vt100::Screen>),
     ScrollbackMax(usize),
     Connected(bool),
     AuthPrompt(AuthPrompt),
@@ -206,6 +206,14 @@ fn compute_scrollback_max(parser: &mut Parser) -> usize {
     max
 }
 
+fn send_screen(ui_tx: &Sender<UiMessage>, parser: &mut Parser) {
+    let _ = ui_tx.send(UiMessage::Screen(Box::new(parser.screen().clone())));
+}
+
+fn send_scrollback_max(ui_tx: &Sender<UiMessage>, parser: &mut Parser) {
+    let _ = ui_tx.send(UiMessage::ScrollbackMax(compute_scrollback_max(parser)));
+}
+
 fn request_auth_responses(
     ui_tx: &Sender<UiMessage>,
     worker_rx: &Receiver<WorkerMessage>,
@@ -381,7 +389,7 @@ fn run_shell(
                         }],
                         log_path,
                     ) {
-                        let pw = responses.get(0).cloned().unwrap_or_default();
+                        let pw = responses.first().cloned().unwrap_or_default();
                         // Empty passphrase is allowed (e.g. unencrypted key); in that case, retrying is pointless.
                         if !pw.is_empty() {
                             if let Err(err) = session.userauth_pubkey_file(username, None, pk, Some(&pw)) {
@@ -449,7 +457,7 @@ fn run_shell(
                 }],
                 log_path,
             )?;
-            let pw = responses.get(0).cloned().unwrap_or_default();
+            let pw = responses.first().cloned().unwrap_or_default();
             if !pw.is_empty() {
                 break pw;
             }
@@ -482,7 +490,7 @@ fn run_shell(
     channel.shell().context("Failed to start shell")?;
     // Keep the session in blocking mode, but with a short timeout so reads don't
     // block forever and starve input handling.
-    session.set_timeout(100);
+    session.set_timeout(30);
 
     let _ = ui_tx.send(UiMessage::Status("Connected successfully".to_string()));
     let _ = ui_tx.send(UiMessage::Connected(true));
@@ -493,14 +501,22 @@ fn run_shell(
     let len = if len == 0 { TERM_SCROLLBACK_LEN } else { len };
     let mut parser = Parser::new(24, 80, len);
     let mut scanner = CsiQueryScanner::default();
+    let mut screen_dirty = true;
+    let mut scrollback_dirty = true;
+    let screen_emit_interval = Duration::from_millis(16);
+    let mut last_screen_emit = Instant::now()
+        .checked_sub(screen_emit_interval)
+        .unwrap_or_else(Instant::now);
     loop {
         let mut disconnected = false;
 
         loop {
             match worker_rx.try_recv() {
                 Ok(WorkerMessage::Input(data)) => {
-                    let _ = channel.write_all(&data);
-                    let _ = channel.flush();
+                    channel
+                        .write_all(&data)
+                        .and_then(|_| channel.flush())
+                        .map_err(|err| anyhow!("Channel write failed: {err}"))?;
                 }
                 Ok(WorkerMessage::Resize {
                     rows,
@@ -509,20 +525,16 @@ fn run_shell(
                     height_px,
                 }) => {
                     // Keep the remote PTY and our local parser in sync.
-                    let _ = channel.request_pty_size(
-                        cols.into(),
-                        rows.into(),
-                        Some(width_px),
-                        Some(height_px),
-                    );
+                    channel
+                        .request_pty_size(cols.into(), rows.into(), Some(width_px), Some(height_px))
+                        .map_err(|err| anyhow!("Failed to resize PTY: {err}"))?;
                     parser.set_size(rows, cols);
-                    let _ = ui_tx.send(UiMessage::Screen(parser.screen().clone()));
-                    let _ = ui_tx.send(UiMessage::ScrollbackMax(compute_scrollback_max(&mut parser)));
+                    screen_dirty = true;
+                    scrollback_dirty = true;
                 }
                 Ok(WorkerMessage::SetScrollback(rows)) => {
                     parser.set_scrollback(rows);
-                    let _ = ui_tx.send(UiMessage::Screen(parser.screen().clone()));
-                    let _ = ui_tx.send(UiMessage::ScrollbackMax(compute_scrollback_max(&mut parser)));
+                    screen_dirty = true;
                 }
                 Ok(WorkerMessage::Disconnect) => {
                     disconnected = true;
@@ -563,8 +575,8 @@ fn run_shell(
                     &mut channel,
                     &read_buf[..n],
                 );
-                let _ = ui_tx.send(UiMessage::Screen(parser.screen().clone()));
-                let _ = ui_tx.send(UiMessage::ScrollbackMax(compute_scrollback_max(&mut parser)));
+                screen_dirty = true;
+                scrollback_dirty = true;
             }
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(err) => {
@@ -573,6 +585,15 @@ fn run_shell(
             }
         }
 
-        thread::sleep(Duration::from_millis(10));
+        if scrollback_dirty {
+            send_scrollback_max(ui_tx, &mut parser);
+            scrollback_dirty = false;
+        }
+
+        if screen_dirty && last_screen_emit.elapsed() >= screen_emit_interval {
+            send_screen(ui_tx, &mut parser);
+            screen_dirty = false;
+            last_screen_emit = Instant::now();
+        }
     }
 }

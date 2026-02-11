@@ -922,7 +922,7 @@ impl AppState {
         if let Some((tab_id, responses)) = send_responses {
             let mut key_pw: Option<String> = None;
             if is_key_passphrase_prompt {
-                key_pw = Some(responses.get(0).cloned().unwrap_or_default());
+                key_pw = Some(responses.first().cloned().unwrap_or_default());
 
                 if auth.remember_key_passphrase {
                     if let (Some(profile_name), Some(pw)) =

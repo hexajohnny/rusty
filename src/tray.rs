@@ -60,7 +60,12 @@ fn menu_action_for(id: &MenuId) -> Option<&'static str> {
 fn apply_direct_menu_action(action: &str) {
     match action {
         "exit" => {
-            std::process::exit(0);
+            if let Ok(guard) = WAKE_CTX.lock() {
+                if let Some(ctx) = guard.as_ref() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ctx.request_repaint();
+                }
+            }
         }
         "show_hide" => {
             if let Ok(guard) = WAKE_CTX.lock() {

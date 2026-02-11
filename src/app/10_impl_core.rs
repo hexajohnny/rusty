@@ -508,7 +508,6 @@ impl AppState {
                         }
                     } else if menu_id == tray.exit_id {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        std::process::exit(0);
                     }
                 }
                 crate::tray::TrayAppEvent::Tray(te) => {

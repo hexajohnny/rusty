@@ -24,13 +24,29 @@ impl eframe::App for AppState {
         self.ensure_tray_icon();
         self.handle_tray_events(ctx);
 
-        ctx.request_repaint_after(Duration::from_millis(16));
+        let any_live_session = self
+            .pane_ids()
+            .into_iter()
+            .any(|id| self.pane(id).map(|t| t.connected || t.connecting).unwrap_or(false));
+        let repaint_ms = if self.hidden_to_tray {
+            200
+        } else if any_live_session || self.auth_dialog.is_some() || self.rename_popup.is_some() {
+            16
+        } else {
+            80
+        };
+        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
         self.update_cursor_blink();
 
         self.ensure_tree_non_empty();
 
         for tile_id in self.pane_ids() {
             if let Some(tab) = self.pane_mut(tile_id) {
+                if let Some(rows) = tab.pending_scrollback.take() {
+                    if let Some(tx) = tab.worker_tx.as_ref() {
+                        let _ = tx.send(WorkerMessage::SetScrollback(rows));
+                    }
+                }
                 tab.poll_messages();
             }
         }

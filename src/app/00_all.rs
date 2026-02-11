@@ -276,6 +276,7 @@ struct SshTab {
     pending_remote_click: Option<PendingRemoteClick>,
 
     pending_auth: Option<ssh::AuthPrompt>,
+    pending_scrollback: Option<usize>,
 }
 
 impl SshTab {
@@ -315,6 +316,7 @@ impl SshTab {
             selection: None,
             pending_remote_click: None,
             pending_auth: None,
+            pending_scrollback: None,
         }
     }
 
@@ -369,25 +371,28 @@ impl SshTab {
         self.selection = None;
         self.pending_remote_click = None;
         self.pending_auth = None;
+        self.pending_scrollback = None;
     }
 
     fn poll_messages(&mut self) {
         let Some(rx) = self.ui_rx.as_ref() else { return };
+        const MAX_MSGS_PER_FRAME: usize = 256;
+        let mut processed = 0usize;
+        let mut latest_screen: Option<Box<vt100::Screen>> = None;
+        let mut latest_scrollback_max: Option<usize> = None;
         loop {
+            if processed >= MAX_MSGS_PER_FRAME {
+                break;
+            }
             match rx.try_recv() {
                 Ok(UiMessage::Status(s)) => {
                     self.last_status = s;
                 }
                 Ok(UiMessage::Screen(screen)) => {
-                    self.screen = screen;
-                    if !self.screen.title().is_empty() {
-                        // Prefer the remote title when set. Keep the id suffix to avoid
-                        // confusing duplicates when opening multiple tabs with the same host.
-                        self.title = format!("{} #{id}", self.screen.title(), id = self.id);
-                    }
+                    latest_screen = Some(screen);
                 }
                 Ok(UiMessage::ScrollbackMax(max)) => {
-                    self.scrollback_max = max;
+                    latest_scrollback_max = Some(max);
                 }
                 Ok(UiMessage::Connected(ok)) => {
                     self.connected = ok;
@@ -406,6 +411,20 @@ impl SshTab {
                     break;
                 }
             }
+            processed += 1;
+        }
+
+        if let Some(screen) = latest_screen {
+            self.screen = *screen;
+            if !self.screen.title().is_empty() {
+                // Prefer the remote title when set. Keep the id suffix to avoid
+                // confusing duplicates when opening multiple tabs with the same host.
+                self.title = format!("{} #{id}", self.screen.title(), id = self.id);
+            }
+        }
+
+        if let Some(max) = latest_scrollback_max {
+            self.scrollback_max = max;
         }
     }
 }

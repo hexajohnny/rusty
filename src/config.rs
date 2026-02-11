@@ -225,7 +225,10 @@ pub fn save(cfg: &AppConfig) {
     if fs::write(&tmp, payload).is_ok() {
         let _ = fs::rename(&tmp, &path).or_else(|_| {
             // If rename fails (e.g. cross-device), fall back.
-            fs::write(&path, fs::read(&tmp).unwrap_or_default()).and_then(|_| fs::remove_file(&tmp))
+            match fs::read(&tmp) {
+                Ok(bytes) => fs::write(&path, bytes).and_then(|_| fs::remove_file(&tmp)),
+                Err(_) => fs::remove_file(&tmp),
+            }
         });
     }
 }

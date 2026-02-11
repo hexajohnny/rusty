@@ -127,9 +127,7 @@ impl AppState {
     }
 
     fn set_scrollback(tab: &mut SshTab, rows: usize) {
-        if let Some(tx) = tab.worker_tx.as_ref() {
-            let _ = tx.send(WorkerMessage::SetScrollback(rows));
-        }
+        tab.pending_scrollback = Some(rows);
     }
 
     fn send_paste_text(tab: &mut SshTab, s: &str) {
@@ -343,8 +341,8 @@ impl AppState {
                 let visible_rows = tab.screen.size().0 as f32;
                 let total_rows = visible_rows + tab.scrollback_max as f32;
                 let track_h = term_rect.height().max(1.0);
-                let handle_h = (track_h * (visible_rows / total_rows))
-                    .clamp(18.0, track_h);
+                let min_thumb_h = 18.0_f32.min(track_h);
+                let handle_h = (track_h * (visible_rows / total_rows)).clamp(min_thumb_h, track_h);
                 let track_min = term_rect.top();
                 let track_max = term_rect.bottom() - handle_h;
                 let y = pos.y.clamp(track_min, track_max.max(track_min));
@@ -364,29 +362,32 @@ impl AppState {
 
         // Local scrollback (mouse wheel / trackpad). This is independent of any remote app state.
         if hovering_term && tab.connected {
-            // Use egui's aggregated deltas (points). Some backends don't always generate `Event::Scroll`.
-            let mut dy = ui.input(|i| i.raw_scroll_delta.y);
-            if dy == 0.0 {
-                dy = ui.input(|i| i.smooth_scroll_delta.y);
-            }
-            if dy == 0.0 {
-                for ev in events.iter() {
-                    if let egui::Event::Scroll(delta) = ev {
-                        dy += delta.y;
-                    }
+            // Prefer per-frame wheel events. `smooth_scroll_delta` introduces inertial drift and
+            // can keep scrolling on repaint ticks even after wheel input has stopped.
+            let mut dy = 0.0f32;
+            for ev in events.iter() {
+                if let egui::Event::Scroll(delta) = ev {
+                    dy += delta.y;
                 }
             }
+            if dy.abs() <= 0.001 {
+                dy = ui.input(|i| i.raw_scroll_delta.y);
+            }
 
-            if dy != 0.0 {
+            if dy.abs() > 0.001 {
                 // Accumulate into rows and apply integer deltas.
                 let step = cell_h.max(1.0);
                 tab.scroll_wheel_accum += dy / step;
-                let rows_delta = tab.scroll_wheel_accum.trunc() as i32;
+                let rows_delta = (tab.scroll_wheel_accum.trunc() as i64).clamp(-256, 256) as i32;
                 if rows_delta != 0 {
                     tab.scroll_wheel_accum -= rows_delta as f32;
-                    let cur = tab.screen.scrollback() as i32;
-                    let next = (cur + rows_delta).max(0) as usize;
-                    Self::set_scrollback(tab, next);
+                    let cur = tab.screen.scrollback() as i64;
+                    let max = tab.scrollback_max as i64;
+                    let delta = rows_delta as i64;
+                    let next = (cur + delta).clamp(0, max) as usize;
+                    if next != tab.screen.scrollback() {
+                        Self::set_scrollback(tab, next);
+                    }
                 }
             }
         }
@@ -727,7 +728,7 @@ impl AppState {
         });
 
         let row_g = &galley.rows[row_idx];
-        let char_idx = row_g.char_at(x) as usize;
+        let char_idx = row_g.char_at(x);
 
         let row_u16 = row_idx as u16;
         let map = Self::row_col_to_char_index_map(screen, row_u16);
@@ -899,7 +900,8 @@ impl AppState {
         cursor_color: Color32,
         ppp: f32,
     ) {
-        if tab.screen.hide_cursor() || !cursor_visible {
+        // Hide the cursor while viewing scrollback, like a normal terminal.
+        if tab.screen.hide_cursor() || !cursor_visible || tab.screen.scrollback() > 0 {
             return;
         }
 
