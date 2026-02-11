@@ -16,6 +16,24 @@ use crate::config;
 use crate::model::ConnectionSettings;
 use crate::ssh::{self, UiMessage, WorkerMessage};
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedTab {
+    id: u64,
+    user_title: Option<String>,
+    color: Option<Color32>,
+    profile_name: Option<String>,
+    settings: ConnectionSettings,
+    scrollback_len: usize,
+    #[serde(default)]
+    autoconnect: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedSession {
+    tree: Tree<PersistedTab>,
+    active_tile: Option<TileId>,
+}
+
 const TERM_FONT_SIZE_DEFAULT: f32 = 16.0;
 const TERM_FONT_SIZE_MIN: f32 = 10.0;
 const TERM_FONT_SIZE_MAX: f32 = 28.0;
@@ -415,6 +433,10 @@ pub struct AppState {
     auth_dialog: Option<AuthDialog>,
 
     style_initialized: bool,
+
+    layout_dirty: bool,
+    last_layout_save: Instant,
+    restored_window: bool,
 }
 
 impl AppState {
@@ -451,32 +473,65 @@ impl AppState {
         }
 
         let mut next_session_id = 1u64;
-        let mut first = SshTab::new(
-            next_session_id,
-            initial_settings,
-            initial_profile_name,
-            config.terminal_scrollback_lines,
-            format!("logs\\tab-{next_session_id}.log"),
-        );
-        next_session_id += 1;
 
-        let autostart_ok = config.autostart
-            && default_profile_idx.is_some()
-            && !settings_dialog.draft.host.trim().is_empty()
-            && !settings_dialog.draft.username.trim().is_empty();
-        if autostart_ok {
-            first.start_connect();
-            settings_dialog.open = false;
-        } else {
-            settings_dialog.open = true;
-            settings_dialog.just_opened = true;
+        // If enabled, restore the previous session layout (splits/tabs) and window geometry.
+        // This restores layout + connection settings, and optionally reconnects panes that were connected.
+        let mut tree: Option<Tree<SshTab>> = None;
+        let mut active_tile: Option<TileId> = None;
+        if config.save_session_layout {
+            if let Some(json) = config.saved_session_layout_json.clone() {
+                if let Ok(restored) = Self::restore_session_tree(&json, config.terminal_scrollback_lines) {
+                    next_session_id = restored.0;
+                    tree = Some(restored.1);
+                    active_tile = restored.2;
+                }
+            }
         }
 
-        let mut tiles = egui_tiles::Tiles::default();
-        let first_tile_id = tiles.insert_pane(first);
-        let root = tiles.insert_tab_tile(vec![first_tile_id]);
-        let tree = Tree::new("ssh_tree", root, tiles);
-        settings_dialog.target_tile = Some(first_tile_id);
+        let restored = tree.and_then(|t| {
+            let pane_id = active_tile
+                .filter(|id| matches!(t.tiles.get(*id), Some(Tile::Pane(_))))
+                .or_else(|| {
+                    t.tiles
+                        .iter()
+                        .find_map(|(id, tile)| matches!(tile, Tile::Pane(_)).then_some(*id))
+                });
+            pane_id.map(|pane_id| (t, pane_id))
+        });
+
+        let (tree, _first_tile_id, active_tile) = if let Some((t, pane_id)) = restored {
+            settings_dialog.target_tile = Some(pane_id);
+            settings_dialog.open = false;
+            (t, pane_id, Some(pane_id))
+        } else {
+            let mut first = SshTab::new(
+                next_session_id,
+                initial_settings,
+                initial_profile_name,
+                config.terminal_scrollback_lines,
+                format!("logs\\tab-{next_session_id}.log"),
+            );
+            next_session_id += 1;
+
+            let autostart_ok = config.autostart
+                && default_profile_idx.is_some()
+                && !settings_dialog.draft.host.trim().is_empty()
+                && !settings_dialog.draft.username.trim().is_empty();
+            if autostart_ok {
+                first.start_connect();
+                settings_dialog.open = false;
+            } else {
+                settings_dialog.open = true;
+                settings_dialog.just_opened = true;
+            }
+
+            let mut tiles = egui_tiles::Tiles::default();
+            let pane_id = tiles.insert_pane(first);
+            let root = tiles.insert_tab_tile(vec![pane_id]);
+            let tree = Tree::new("ssh_tree", root, tiles);
+            settings_dialog.target_tile = Some(pane_id);
+            (tree, pane_id, Some(pane_id))
+        };
 
         Self {
             theme: UiTheme::default(),
@@ -484,7 +539,7 @@ impl AppState {
             config,
             settings_dialog,
             tree,
-            active_tile: Some(first_tile_id),
+            active_tile,
             next_session_id,
             last_cursor_blink: Instant::now(),
             cursor_visible: true,
@@ -496,6 +551,9 @@ impl AppState {
             rename_popup: None,
             auth_dialog: None,
             style_initialized: false,
+            layout_dirty: false,
+            last_layout_save: Instant::now(),
+            restored_window: false,
         }
     }
 
@@ -581,6 +639,168 @@ impl AppState {
         self.tree.root = Some(root);
         self.active_tile = Some(pane_id);
         self.settings_dialog.target_tile = Some(pane_id);
+    }
+
+    fn restore_session_tree(
+        json: &str,
+        default_scrollback_len: usize,
+    ) -> anyhow::Result<(u64, Tree<SshTab>, Option<TileId>)> {
+        let restored: PersistedSession = serde_json::from_str(json)?;
+        let Some(root) = restored.tree.root else {
+            return Err(anyhow::anyhow!("Saved layout had no root"));
+        };
+
+        let mut tiles: Tiles<SshTab> = Tiles::default();
+        let mut max_session_id = 0u64;
+        let mut to_autoconnect: Vec<TileId> = Vec::new();
+
+        for (tile_id, tile) in restored.tree.tiles.iter() {
+            match tile {
+                Tile::Pane(p) => {
+                    max_session_id = max_session_id.max(p.id);
+                    let scrollback_len = if p.scrollback_len == 0 {
+                        default_scrollback_len
+                    } else {
+                        p.scrollback_len
+                    };
+                    let mut tab = SshTab::new(
+                        p.id,
+                        p.settings.clone(),
+                        p.profile_name.clone(),
+                        scrollback_len,
+                        format!("logs\\tab-{}.log", p.id),
+                    );
+                    tab.user_title = p.user_title.clone();
+                    tab.color = p.color;
+                    tab.title = SshTab::title_for(p.id, &tab.settings);
+                    tab.focus_terminal_next_frame = false;
+                    tiles.insert(*tile_id, Tile::Pane(tab));
+                    if p.autoconnect {
+                        to_autoconnect.push(*tile_id);
+                    }
+                }
+                Tile::Container(c) => {
+                    tiles.insert(*tile_id, Tile::Container(c.clone()));
+                }
+            }
+        }
+
+        let mut tree = Tree::new("ssh_tree", root, tiles);
+
+        for id in to_autoconnect {
+            if let Some(Tile::Pane(tab)) = tree.tiles.get_mut(id) {
+                if !tab.settings.host.trim().is_empty() && !tab.settings.username.trim().is_empty() {
+                    tab.start_connect();
+                }
+            }
+        }
+
+        let next_session_id = max_session_id.saturating_add(1).max(1);
+        Ok((next_session_id, tree, restored.active_tile))
+    }
+
+    fn persist_session_tree(&self) -> Option<String> {
+        let root = self.tree.root?;
+        let mut tiles: Tiles<PersistedTab> = Tiles::default();
+
+        for (tile_id, tile) in self.tree.tiles.iter() {
+            match tile {
+                Tile::Pane(tab) => {
+                    let p = PersistedTab {
+                        id: tab.id,
+                        user_title: tab.user_title.clone(),
+                        color: tab.color,
+                        profile_name: tab.profile_name.clone(),
+                        settings: tab.settings.clone(),
+                        scrollback_len: tab.scrollback_len,
+                        autoconnect: tab.connected || tab.connecting,
+                    };
+                    tiles.insert(*tile_id, Tile::Pane(p));
+                }
+                Tile::Container(c) => {
+                    tiles.insert(*tile_id, Tile::Container(c.clone()));
+                }
+            }
+        }
+
+        let session = PersistedSession {
+            tree: Tree::new("ssh_tree", root, tiles),
+            active_tile: self.active_tile,
+        };
+
+        serde_json::to_string(&session).ok()
+    }
+
+    fn maybe_restore_window(&mut self, ctx: &egui::Context) {
+        if self.restored_window {
+            return;
+        }
+        self.restored_window = true;
+
+        if !self.config.save_session_layout {
+            return;
+        }
+        let Some(sw) = self.config.saved_window else {
+            return;
+        };
+
+        // Restore normal geometry first, then maximize if requested.
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(
+            sw.outer_pos[0],
+            sw.outer_pos[1],
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+            sw.inner_size[0].max(100.0),
+            sw.inner_size[1].max(100.0),
+        )));
+        if sw.maximized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+    }
+
+    fn maybe_save_session_layout(&mut self, ctx: &egui::Context) {
+        if !self.config.save_session_layout {
+            return;
+        }
+
+        // Save at most twice per second to avoid excessive disk writes.
+        if !self.layout_dirty && self.last_layout_save.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        if self.last_layout_save.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+
+        // Capture window geometry, but avoid overwriting the saved normal size while maximized/fullscreen.
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        if !fullscreen {
+            if let (Some(outer), Some(inner)) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect)) {
+                if !maximized {
+                    self.config.saved_window = Some(config::SavedWindow {
+                        outer_pos: [outer.min.x, outer.min.y],
+                        inner_size: [inner.width(), inner.height()],
+                        maximized: false,
+                    });
+                } else if let Some(mut sw) = self.config.saved_window {
+                    sw.maximized = true;
+                    self.config.saved_window = Some(sw);
+                } else {
+                    self.config.saved_window = Some(config::SavedWindow {
+                        outer_pos: [outer.min.x, outer.min.y],
+                        inner_size: [inner.width(), inner.height()],
+                        maximized: true,
+                    });
+                }
+            }
+        }
+
+        if let Some(json) = self.persist_session_tree() {
+            self.config.saved_session_layout_json = Some(json);
+            config::save(&self.config);
+            self.layout_dirty = false;
+            self.last_layout_save = Instant::now();
+        }
     }
 
     fn create_pane(
@@ -2076,6 +2296,23 @@ impl AppState {
             egui::RichText::new("When enabled, the minimize button hides Rusty to the system tray.")
                 .color(theme.muted),
         );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        let before = self.config.save_session_layout;
+        ui.checkbox(&mut self.config.save_session_layout, "Save session layout");
+        if self.config.save_session_layout != before {
+            self.layout_dirty = true;
+            // Save immediately so next startup uses the new preference.
+            config::save(&self.config);
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Remembers splits/tabs and window position/size between launches.")
+                .color(theme.muted),
+        );
     }
 
     fn draw_settings_page_terminal_colors(&mut self, ui: &mut egui::Ui) {
@@ -3304,6 +3541,8 @@ impl eframe::App for AppState {
             self.style_initialized = true;
         }
 
+        self.maybe_restore_window(ctx);
+
         // Tray integration (created lazily when enabled).
         // If tray minimize was turned off while hidden, bring the window back.
         if !self.config.minimize_to_tray && self.hidden_to_tray {
@@ -3539,6 +3778,7 @@ impl eframe::App for AppState {
                     base_pane_id,
                 } => {
                     let _ = self.add_new_pane_to_tabs(tabs_container_id, base_pane_id);
+                    self.layout_dirty = true;
                 }
                 TilesAction::NewTabWithSettings {
                     tabs_container_id,
@@ -3547,12 +3787,14 @@ impl eframe::App for AppState {
                     profile_name,
                 } => {
                     let _ = self.add_new_pane_to_tabs_with_settings(tabs_container_id, settings, color, profile_name);
+                    self.layout_dirty = true;
                 }
                 TilesAction::TabActivated(tile_id) => {
                     if matches!(self.tree.tiles.get(tile_id), Some(Tile::Pane(_))) {
                         self.active_tile = Some(tile_id);
                         self.settings_dialog.target_tile = Some(tile_id);
                         self.set_focus_next_frame(tile_id);
+                        self.layout_dirty = true;
                     }
                 }
                 TilesAction::Connect(tile_id) => {
@@ -3617,15 +3859,20 @@ impl eframe::App for AppState {
                 TilesAction::SetColor { pane_id, color } => {
                     if let Some(tab) = self.pane_mut(pane_id) {
                         tab.color = color;
+                        self.layout_dirty = true;
                     }
                 }
                 TilesAction::Split { pane_id, dir } => {
                     let _ = self.split_pane(pane_id, dir);
+                    self.layout_dirty = true;
                 }
                 TilesAction::Close(tile_id) => {
                     self.close_pane(tile_id);
+                    self.layout_dirty = true;
                 }
                 TilesAction::Exit => {
+                    self.layout_dirty = true;
+                    self.maybe_save_session_layout(ctx);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
@@ -3682,6 +3929,7 @@ impl eframe::App for AppState {
         if let Some((tile_id, name)) = rename_action {
             if let Some(tab) = self.pane_mut(tile_id) {
                 tab.user_title = if name.is_empty() { None } else { Some(name) };
+                self.layout_dirty = true;
             }
         }
 
@@ -3698,6 +3946,8 @@ impl eframe::App for AppState {
 
         self.draw_settings_dialog(ctx);
         self.draw_auth_dialog(ctx);
+
+        self.maybe_save_session_layout(ctx);
 
         self.clipboard = clipboard;
     }

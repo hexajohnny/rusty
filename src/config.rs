@@ -18,6 +18,14 @@ fn default_terminal_scrollback_lines() -> usize {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct SavedWindow {
+    pub outer_pos: [f32; 2],
+    pub inner_size: [f32; 2],
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct RgbColor {
     pub r: u8,
     pub g: u8,
@@ -110,6 +118,12 @@ pub struct AppConfig {
     #[serde(default = "default_terminal_scrollback_lines")]
     pub terminal_scrollback_lines: usize,
     #[serde(default)]
+    pub save_session_layout: bool,
+    #[serde(default)]
+    pub saved_session_layout_json: Option<String>,
+    #[serde(default)]
+    pub saved_window: Option<SavedWindow>,
+    #[serde(default)]
     pub terminal_colors: TerminalColorsConfig,
 }
 
@@ -122,6 +136,9 @@ impl Default for AppConfig {
             minimize_to_tray: false,
             terminal_font_size: default_terminal_font_size(),
             terminal_scrollback_lines: default_terminal_scrollback_lines(),
+            save_session_layout: false,
+            saved_session_layout_json: None,
+            saved_window: None,
             terminal_colors: TerminalColorsConfig::default(),
         }
     }

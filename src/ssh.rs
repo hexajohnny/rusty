@@ -391,6 +391,18 @@ fn run_shell(
                     }
                 }
             }
+
+            // Some servers require multiple auth methods (e.g. publickey + password/OTP).
+            // In that case, pubkey can succeed but the session is not fully authenticated yet.
+            if !session.authenticated() {
+                logger::log_line(
+                    log_path,
+                    "Private key accepted, but server requires additional authentication.",
+                );
+                let _ = ui_tx.send(UiMessage::Status(
+                    "Additional authentication required (server policy)".to_string(),
+                ));
+            }
         }
     }
 
@@ -420,7 +432,9 @@ fn run_shell(
         }
     }
 
-    if !session.authenticated() && supports_pass {
+    // Last resort: if the server supports password but not keyboard-interactive, we must
+    // ask the user explicitly for a password (the server cannot "prompt" in the shell).
+    if !session.authenticated() && supports_pass && !supports_kbd {
         // If the user didn't provide a password up front, ask for it now and try password auth.
         logger::log_line(log_path, "Password needed; prompting user.");
         let pw = loop {
