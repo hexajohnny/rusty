@@ -43,6 +43,7 @@ Rusty is a Windows desktop SSH client built in Rust with an embedded, tabbed ter
   - Default profile + optional autostart on launch.
 - Appearance:
   - Terminal font size (persists across restarts).
+  - “Save session layout” (persists tabs/splits and window position/size between launches).
   - “Minimize to tray” option.
 - Terminal Colors:
   - Background/foreground
