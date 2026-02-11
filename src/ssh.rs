@@ -573,6 +573,5 @@ fn run_shell(
             }
         }
 
-        thread::sleep(Duration::from_millis(10));
     }
 }
