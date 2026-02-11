@@ -5,6 +5,9 @@ impl eframe::App for AppState {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Allow tray callbacks to wake the app even while the viewport is hidden.
+        crate::tray::set_wake_ctx(ctx.clone());
+
         if !self.style_initialized {
             self.apply_global_style(ctx);
             self.style_initialized = true;

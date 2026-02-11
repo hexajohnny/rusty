@@ -431,19 +431,21 @@ impl AppState {
         if !self.config.minimize_to_tray {
             self.tray = None;
             self.hidden_to_tray = false;
+            crate::tray::set_hidden_to_tray_state(false);
             return;
         }
 
         if self.tray.is_none() {
             self.tray = crate::tray::create_tray().ok();
             if let Some(tray) = self.tray.as_ref() {
-                // Start with a "Hide" label when visible.
-                tray.show_hide_item.set_text("Hide Rusty");
+                // Keep this as an idempotent action label.
+                tray.show_hide_item.set_text("Show Rusty");
             }
         }
     }
 
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        crate::tray::capture_foreground_hwnd();
         self.ensure_tray_icon();
         if self.tray.is_none() {
             // If tray creation failed, fall back to a normal minimize.
@@ -451,20 +453,27 @@ impl AppState {
             return;
         }
 
+        // Minimize first, then hide so we avoid some backends getting "stuck" invisible.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         self.hidden_to_tray = true;
+        crate::tray::set_hidden_to_tray_state(true);
         if let Some(tray) = self.tray.as_ref() {
             tray.show_hide_item.set_text("Show Rusty");
         }
         // Keep the app responsive to tray events even while hidden.
         ctx.request_repaint_after(Duration::from_millis(200));
+        ctx.request_repaint();
     }
 
     fn show_from_tray(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        // Un-minimize first (important for some platforms where hidden+minimized windows won't show)
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        // Then make visible and focus
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         self.hidden_to_tray = false;
+        crate::tray::set_hidden_to_tray_state(false);
 
         // Force a fresh PTY resize on restore, in case the window was hidden/minimized with a
         // transient tiny size and the terminal would otherwise stay "blank" until output arrives.
@@ -474,25 +483,32 @@ impl AppState {
             }
         }
         ctx.request_repaint();
+        ctx.request_repaint_after(Duration::from_millis(16));
 
         if let Some(tray) = self.tray.as_ref() {
-            tray.show_hide_item.set_text("Hide Rusty");
+            tray.show_hide_item.set_text("Show Rusty");
         }
     }
 
     fn handle_tray_events(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.tray_events.try_recv() {
             match ev {
-                crate::tray::TrayAppEvent::Menu(id) => {
+                crate::tray::TrayAppEvent::Menu(menu_id) => {
                     let Some(tray) = self.tray.as_ref() else { continue };
-                    if id == tray.show_hide_id {
-                        if self.hidden_to_tray {
-                            self.show_from_tray(ctx);
-                        } else {
-                            self.hide_to_tray(ctx);
+                    if menu_id == tray.show_hide_id {
+                        let was_hidden = self.hidden_to_tray;
+                        self.hidden_to_tray = crate::tray::hidden_to_tray_state();
+                        tray.show_hide_item.set_text("Show Rusty");
+                        if !self.hidden_to_tray && was_hidden {
+                            for id in self.pane_ids() {
+                                if let Some(tab) = self.pane_mut(id) {
+                                    tab.last_sent_size = None;
+                                }
+                            }
                         }
-                    } else if id == tray.exit_id {
+                    } else if menu_id == tray.exit_id {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        std::process::exit(0);
                     }
                 }
                 crate::tray::TrayAppEvent::Tray(te) => {
@@ -507,6 +523,7 @@ impl AppState {
                     }
                 }
             }
+            ctx.request_repaint();
         }
 
         if self.hidden_to_tray {
