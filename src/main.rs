@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod async_config;
 mod config;
 mod crypto;
 mod logger;
