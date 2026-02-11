@@ -42,7 +42,7 @@ impl eframe::App for AppState {
 
         for tile_id in self.pane_ids() {
             if let Some(tab) = self.pane_mut(tile_id) {
-                if let Some(rows) = tab.pending_scrollback.take() {
+                if let Some(rows) = tab.pending_scrollback {
                     if let Some(tx) = tab.worker_tx.as_ref() {
                         let _ = tx.send(WorkerMessage::SetScrollback(rows));
                     }
@@ -59,6 +59,7 @@ impl eframe::App for AppState {
                     if now >= until {
                         tab.copy_flash_until = None;
                         tab.selection = None;
+                        tab.abs_selection = None;
                     }
                 }
             }

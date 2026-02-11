@@ -176,6 +176,19 @@ impl TermSelection {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TermAbsSelection {
+    anchor: (i64, u16), // (absolute_row, col)
+    cursor: (i64, u16), // (absolute_row, col)
+    dragging: bool,
+}
+
+impl TermAbsSelection {
+    fn is_empty(&self) -> bool {
+        self.anchor == self.cursor
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PendingRemoteClick {
     start_pos: Pos2,
@@ -273,10 +286,12 @@ struct SshTab {
     log_path: String,
 
     selection: Option<TermSelection>,
+    abs_selection: Option<TermAbsSelection>,
     pending_remote_click: Option<PendingRemoteClick>,
 
     pending_auth: Option<ssh::AuthPrompt>,
     pending_scrollback: Option<usize>,
+    last_selection_autoscroll: Instant,
 }
 
 impl SshTab {
@@ -314,9 +329,11 @@ impl SshTab {
             focus_terminal_next_frame: false,
             log_path,
             selection: None,
+            abs_selection: None,
             pending_remote_click: None,
             pending_auth: None,
             pending_scrollback: None,
+            last_selection_autoscroll: Instant::now(),
         }
     }
 
@@ -369,9 +386,11 @@ impl SshTab {
         self.scrollbar_dragging = false;
         self.copy_flash_until = None;
         self.selection = None;
+        self.abs_selection = None;
         self.pending_remote_click = None;
         self.pending_auth = None;
         self.pending_scrollback = None;
+        self.last_selection_autoscroll = Instant::now();
     }
 
     fn poll_messages(&mut self) {
@@ -416,6 +435,13 @@ impl SshTab {
 
         if let Some(screen) = latest_screen {
             self.screen = *screen;
+            if let Some(target) = self.pending_scrollback {
+                let clamped = target.min(self.scrollback_max);
+                self.screen.set_scrollback(clamped);
+                if self.screen.scrollback() == clamped {
+                    self.pending_scrollback = None;
+                }
+            }
             if !self.screen.title().is_empty() {
                 // Prefer the remote title when set. Keep the id suffix to avoid
                 // confusing duplicates when opening multiple tabs with the same host.
@@ -425,6 +451,16 @@ impl SshTab {
 
         if let Some(max) = latest_scrollback_max {
             self.scrollback_max = max;
+            if let Some(target) = self.pending_scrollback {
+                let clamped = target.min(max);
+                if clamped != target {
+                    self.pending_scrollback = Some(clamped);
+                }
+                self.screen.set_scrollback(clamped);
+                if self.screen.scrollback() == clamped {
+                    self.pending_scrollback = None;
+                }
+            }
         }
     }
 }

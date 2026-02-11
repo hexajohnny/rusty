@@ -134,7 +134,7 @@ impl Screen {
         self.grid().scrollback()
     }
 
-    pub(crate) fn set_scrollback(&mut self, rows: usize) {
+    pub fn set_scrollback(&mut self, rows: usize) {
         self.grid_mut().set_scrollback(rows);
     }
 

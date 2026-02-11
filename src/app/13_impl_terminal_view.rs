@@ -105,7 +105,12 @@ impl AppState {
             let job = Self::screen_to_layout_job(&tab.screen, font_id, &term_theme);
             let galley = ui.fonts(|fonts| fonts.layout_job(job));
             painter.galley(origin, galley.clone(), Color32::WHITE);
-            if let Some(sel) = tab.selection {
+            let draw_sel = if let Some(sel) = tab.abs_selection {
+                Self::visible_selection_from_abs(tab, sel)
+            } else {
+                tab.selection
+            };
+            if let Some(sel) = draw_sel {
                 // Draw selection *after* the galley so it stays visible even when ANSI background
                 // colors are present.
                 Self::draw_selection_galley(&painter, tab, origin, &galley, sel);
@@ -136,7 +141,7 @@ impl AppState {
             .input(|i| i.pointer.hover_pos())
             .map(|pos| rect.contains(pos))
             .unwrap_or(false);
-        if hovering_term && tab.scrollback_max > 0 {
+        if (hovering_term || tab.scrollbar_dragging) && tab.scrollback_max > 0 {
             let visible_rows = tab.screen.size().0;
             Self::draw_scrollback_bar(
                 &painter,

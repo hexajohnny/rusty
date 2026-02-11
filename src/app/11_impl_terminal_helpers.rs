@@ -1,4 +1,10 @@
 impl AppState {
+    fn visible_cell_to_abs(tab: &SshTab, row: u16, col: u16) -> (i64, u16) {
+        let top_abs = (tab.scrollback_max as i64 - tab.screen.scrollback() as i64).max(0);
+        let abs_row = top_abs + row as i64;
+        (abs_row, col)
+    }
+
     fn cell_metrics(ctx: &egui::Context, font_id: &FontId) -> (f32, f32) {
         let ppp = ctx.pixels_per_point();
         ctx.fonts(|fonts| {
@@ -127,7 +133,9 @@ impl AppState {
     }
 
     fn set_scrollback(tab: &mut SshTab, rows: usize) {
-        tab.pending_scrollback = Some(rows);
+        let target = rows.min(tab.scrollback_max);
+        tab.screen.set_scrollback(target);
+        tab.pending_scrollback = Some(target);
     }
 
     fn send_paste_text(tab: &mut SshTab, s: &str) {
@@ -325,13 +333,20 @@ impl AppState {
             Pos2::new(term_rect.right() - scrollbar_w, term_rect.top()),
             Pos2::new(term_rect.right(), term_rect.bottom()),
         );
+        let scrollbar_id = Id::new(("terminal_scrollbar", tab.id));
+        let scrollbar_response = ui.interact(scrollbar_rect, scrollbar_id, Sense::click_and_drag());
         let hovering_scrollbar = pointer_pos
             .map(|p| scrollbar_rect.contains(p))
-            .unwrap_or(false);
-        if primary_pressed && hovering_scrollbar && tab.connected && tab.scrollback_max > 0 {
+            .unwrap_or(false)
+            || scrollbar_response.hovered();
+        if (scrollbar_response.drag_started() || (primary_pressed && hovering_scrollbar))
+            && tab.connected
+            && tab.scrollback_max > 0
+        {
             tab.scrollbar_dragging = true;
             response.request_focus();
         }
+        let was_scrollbar_dragging = tab.scrollbar_dragging;
         if primary_released {
             tab.scrollbar_dragging = false;
         }
@@ -404,7 +419,7 @@ impl AppState {
             Pos2::new(x, y)
         };
 
-        if primary_pressed {
+        if primary_pressed && !hovering_scrollbar {
             if let Some(pos) = pointer_pos {
                 if term_rect.contains(pos) {
                     response.request_focus();
@@ -427,11 +442,18 @@ impl AppState {
                                 cursor: (row, col),
                                 dragging: true,
                             });
+                            let abs = Self::visible_cell_to_abs(tab, row, col);
+                            tab.abs_selection = Some(TermAbsSelection {
+                                anchor: abs,
+                                cursor: abs,
+                                dragging: true,
+                            });
                         }
                     } else if allow_remote_mouse {
                         // Remote mouse is enabled. Treat this as a remote click unless the user drags,
                         // in which case we switch into local selection mode.
                         tab.selection = None;
+                        tab.abs_selection = None;
                         if let Some((row, col)) = Self::pos_to_cell(
                             pos,
                             origin,
@@ -453,14 +475,15 @@ impl AppState {
                 } else {
                     // Clicking outside clears selection and any pending click.
                     tab.selection = None;
+                    tab.abs_selection = None;
                     tab.pending_remote_click = None;
                 }
             }
         }
 
-        if primary_down {
-            if let Some(pos) = pointer_pos {
-                let pos = clamp_pos_to_grid(pos);
+        if primary_down && !tab.scrollbar_dragging {
+            if let Some(raw_pos) = pointer_pos {
+                let pos = clamp_pos_to_grid(raw_pos);
                 if let Some(sel) = tab.selection.as_mut() {
                     if sel.dragging {
                         if let Some((row, col)) = Self::pos_to_cell(
@@ -474,6 +497,11 @@ impl AppState {
                             screen_cols,
                         ) {
                             sel.cursor = (row, col);
+                            let abs_cursor = Self::visible_cell_to_abs(tab, row, col);
+                            if let Some(abs_sel) = tab.abs_selection.as_mut() {
+                                abs_sel.cursor = abs_cursor;
+                                abs_sel.dragging = true;
+                            }
                         }
                     }
                 } else if allow_remote_mouse {
@@ -496,7 +524,62 @@ impl AppState {
                                     cursor: (row, col),
                                     dragging: true,
                                 });
+                                let abs_anchor =
+                                    Self::visible_cell_to_abs(tab, pending.start_cell.0, pending.start_cell.1);
+                                let abs_cursor = Self::visible_cell_to_abs(tab, row, col);
+                                tab.abs_selection = Some(TermAbsSelection {
+                                    anchor: abs_anchor,
+                                    cursor: abs_cursor,
+                                    dragging: true,
+                                });
                                 tab.pending_remote_click = None;
+                            }
+                        }
+                    }
+                }
+
+                // Auto-scroll while selecting beyond the viewport edge.
+                if tab.connected && tab.scrollback_max > 0 {
+                    let selection_dragging = tab.selection.map(|s| s.dragging).unwrap_or(false);
+                    if selection_dragging {
+                        let dist_top = (term_rect.top() - raw_pos.y).max(0.0);
+                        let dist_bottom = (raw_pos.y - term_rect.bottom()).max(0.0);
+                        let mut step: i32 = 0;
+                        if dist_top > 0.0 {
+                            let boost = (dist_top / (cell_h * 2.5)).floor() as i32;
+                            step = (1 + boost).clamp(1, 4);
+                        } else if dist_bottom > 0.0 {
+                            let boost = (dist_bottom / (cell_h * 2.5)).floor() as i32;
+                            step = -(1 + boost).clamp(1, 4);
+                        }
+
+                        if step != 0
+                            && tab.last_selection_autoscroll.elapsed() >= Duration::from_millis(35)
+                        {
+                            tab.last_selection_autoscroll = Instant::now();
+                            let cur = tab.screen.scrollback() as i64;
+                            let max = tab.scrollback_max as i64;
+                            let next = (cur + step as i64).clamp(0, max) as usize;
+                            if next != tab.screen.scrollback() {
+                                let mut cursor_after: Option<(u16, u16)> = None;
+                                if let Some(sel) = tab.selection.as_mut() {
+                                    if step > 0 {
+                                        sel.cursor.0 = 0;
+                                    } else if screen_rows > 0 {
+                                        sel.cursor.0 = screen_rows.saturating_sub(1);
+                                    }
+                                    cursor_after = Some(sel.cursor);
+                                }
+
+                                Self::set_scrollback(tab, next);
+
+                                if let Some((row, col)) = cursor_after {
+                                    let abs_cursor = Self::visible_cell_to_abs(tab, row, col);
+                                    if let Some(abs_sel) = tab.abs_selection.as_mut() {
+                                        abs_sel.cursor = abs_cursor;
+                                        abs_sel.dragging = true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -504,14 +587,20 @@ impl AppState {
             }
         }
 
-        if primary_released {
+        if primary_released && !was_scrollbar_dragging {
             // End local selection if active.
             if let Some(sel) = tab.selection.as_mut() {
                 if sel.dragging {
                     sel.dragging = false;
-                    if sel.is_empty() {
-                        tab.selection = None;
-                    }
+                }
+                if sel.is_empty() {
+                    tab.selection = None;
+                }
+                if let Some(abs_sel) = tab.abs_selection.as_mut() {
+                    abs_sel.dragging = false;
+                }
+                if tab.abs_selection.map(|s| s.is_empty()).unwrap_or(false) {
+                    tab.abs_selection = None;
                 }
                 // Local selection consumes the gesture: do not send remote click.
                 tab.pending_remote_click = None;
@@ -576,8 +665,14 @@ impl AppState {
             for ev in events.iter() {
                 match ev {
                     egui::Event::Copy => {
-                        if let Some(sel) = tab.selection {
-                            let text = Self::selection_text(&tab.screen, sel);
+                        if tab.selection.is_some() || tab.abs_selection.is_some() {
+                            let text = if let Some(abs_sel) = tab.abs_selection {
+                                Self::selection_text_abs(&tab.screen, tab.scrollback_max, abs_sel)
+                            } else if let Some(sel) = tab.selection {
+                                Self::selection_text(&tab.screen, sel)
+                            } else {
+                                String::new()
+                            };
                             if !text.is_empty() {
                                 Self::copy_selection_with_flash(ctx, clipboard, tab, text);
                             }
@@ -602,7 +697,9 @@ impl AppState {
                     } => {
                         // Copy selection to clipboard (terminal-style shortcut).
                         if modifiers.ctrl && modifiers.shift && *key == egui::Key::C {
-                            let text = if let Some(sel) = tab.selection {
+                            let text = if let Some(abs_sel) = tab.abs_selection {
+                                Self::selection_text_abs(&tab.screen, tab.scrollback_max, abs_sel)
+                            } else if let Some(sel) = tab.selection {
                                 Self::selection_text(&tab.screen, sel)
                             } else {
                                 tab.screen.contents()
@@ -621,8 +718,14 @@ impl AppState {
                             if has_copy_event {
                                 continue;
                             }
-                            if let Some(sel) = tab.selection {
-                                let text = Self::selection_text(&tab.screen, sel);
+                            if tab.selection.is_some() || tab.abs_selection.is_some() {
+                                let text = if let Some(abs_sel) = tab.abs_selection {
+                                    Self::selection_text_abs(&tab.screen, tab.scrollback_max, abs_sel)
+                                } else if let Some(sel) = tab.selection {
+                                    Self::selection_text(&tab.screen, sel)
+                                } else {
+                                    String::new()
+                                };
                                 if !text.is_empty() {
                                     Self::copy_selection_with_flash(ctx, clipboard, tab, text);
                                 }
@@ -834,6 +937,119 @@ impl AppState {
         }
 
         out
+    }
+
+    fn row_segment_text(screen: &vt100::Screen, row: u16, start_col: u16, end_col: u16) -> String {
+        if start_col > end_col {
+            return String::new();
+        }
+
+        let mut line = String::new();
+        for col in start_col..=end_col {
+            if let Some(cell) = screen.cell(row, col) {
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                if cell.has_contents() {
+                    line.push_str(&cell.contents());
+                } else {
+                    line.push(' ');
+                }
+            } else {
+                line.push(' ');
+            }
+        }
+        line
+    }
+
+    fn selection_text_abs(
+        screen: &vt100::Screen,
+        max_scrollback: usize,
+        sel: TermAbsSelection,
+    ) -> String {
+        let (rows, cols) = screen.size();
+        if rows == 0 || cols == 0 {
+            return String::new();
+        }
+
+        let max_abs_row = max_scrollback as i64 + rows as i64 - 1;
+        if max_abs_row < 0 {
+            return String::new();
+        }
+
+        let (mut sr, mut sc) = sel.anchor;
+        let (mut er, mut ec) = sel.cursor;
+        if (sr, sc) > (er, ec) {
+            std::mem::swap(&mut sr, &mut er);
+            std::mem::swap(&mut sc, &mut ec);
+        }
+
+        sr = sr.clamp(0, max_abs_row);
+        er = er.clamp(0, max_abs_row);
+        sc = sc.min(cols.saturating_sub(1));
+        ec = ec.min(cols.saturating_sub(1));
+
+        let mut out = String::new();
+        let mut scn = screen.clone();
+        for abs_row in sr..=er {
+            let start_col = if abs_row == sr { sc } else { 0 };
+            let end_col = if abs_row == er { ec } else { cols.saturating_sub(1) };
+            if start_col > end_col {
+                continue;
+            }
+
+            // Map absolute row -> viewport by setting an appropriate scrollback offset.
+            let desired_scrollback = (max_scrollback as i64 - abs_row).max(0) as usize;
+            scn.set_scrollback(desired_scrollback);
+            let top_abs = max_scrollback as i64 - scn.scrollback() as i64;
+            let view_row = (abs_row - top_abs).clamp(0, rows as i64 - 1) as u16;
+
+            let line = Self::row_segment_text(&scn, view_row, start_col, end_col);
+            out.push_str(line.trim_end_matches(' '));
+            if abs_row != er {
+                out.push('\n');
+            }
+        }
+
+        out
+    }
+
+    fn visible_selection_from_abs(tab: &SshTab, sel: TermAbsSelection) -> Option<TermSelection> {
+        let (rows, cols) = tab.screen.size();
+        if rows == 0 || cols == 0 {
+            return None;
+        }
+
+        let mut a = sel.anchor;
+        let mut b = sel.cursor;
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+
+        let top_abs = (tab.scrollback_max as i64 - tab.screen.scrollback() as i64).max(0);
+        let bottom_abs = top_abs + rows as i64 - 1;
+        if b.0 < top_abs || a.0 > bottom_abs {
+            return None;
+        }
+
+        let start_abs_row = a.0.max(top_abs);
+        let end_abs_row = b.0.min(bottom_abs);
+        let start_row = (start_abs_row - top_abs) as u16;
+        let end_row = (end_abs_row - top_abs) as u16;
+
+        let start_col = if a.0 < top_abs { 0 } else { a.1 }.min(cols.saturating_sub(1));
+        let end_col = if b.0 > bottom_abs {
+            cols.saturating_sub(1)
+        } else {
+            b.1
+        }
+        .min(cols.saturating_sub(1));
+
+        Some(TermSelection {
+            anchor: (start_row, start_col),
+            cursor: (end_row, end_col),
+            dragging: sel.dragging,
+        })
     }
 
     fn draw_selection_galley(
