@@ -2,6 +2,8 @@
 
 Rusty is a Windows desktop SSH client built in Rust with an embedded, tabbed terminal and a dockable layout (via `egui_tiles`).
 
+![Rusty Screenshot](misc/example.png)
+
 ## Features
 
 ### SSH
@@ -77,4 +79,3 @@ cargo build --release
 - Port forwarding (`-L/-R/-D`) and SOCKS proxy.
 - SFTP/SCP file transfer UI.
 - Jump hosts / ProxyCommand.
-
