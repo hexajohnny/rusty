@@ -11,8 +11,6 @@ Rusty is a Windows desktop SSH client built in Rust with an embedded, tabbed ter
 - Private-key login from a file path in each profile.
 - Key passphrase prompt when needed, with optional per-profile passphrase saving.
 - Keyboard-interactive auth (server prompts like password, OTP, etc.).
-- ssh-agent auth attempt (Windows OpenSSH agent pipe).
-- Automatic fallback through auth methods when one fails.
 - Interactive PTY shell session with `TERM=xterm-256color`.
 - Idle session keepalive (20s interval, no inactivity timeout).
 - Connection/session logs written to `logs/tab-<id>.log`.
