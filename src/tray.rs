@@ -74,6 +74,22 @@ fn direct_show_from_tray() {
 }
 
 fn direct_exit_from_tray() {
+    // Safety net: some hidden-window states ignore close commands.
+    // Force-exit shortly after requesting graceful shutdown so tray Exit is reliable.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        std::process::exit(0);
+    });
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = native_show_window();
+        // Close the native window directly so exit works even while fully hidden to tray.
+        if native_close_window() {
+            return;
+        }
+    }
+
     if let Ok(guard) = WAKE_CTX.lock() {
         if let Some(ctx) = guard.as_ref() {
             // Ensure the viewport is in a closable state on backends that ignore
@@ -119,6 +135,7 @@ fn find_process_window() -> Option<isize> {
     struct SearchCtx {
         pid: u32,
         hwnd: isize,
+        fallback: isize,
     }
 
     unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -126,11 +143,15 @@ fn find_process_window() -> Option<isize> {
         let mut win_pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut win_pid);
         if win_pid == ctx.pid && GetWindow(hwnd, GW_OWNER) == 0 {
+            // Keep the first top-level window as a fallback, even if title is empty/mismatched.
+            if ctx.fallback == 0 {
+                ctx.fallback = hwnd;
+            }
             let mut title_buf = [0u16; 256];
             let title_len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
             if title_len > 0 {
                 let title = String::from_utf16_lossy(&title_buf[..title_len as usize]);
-                if title.starts_with("Rusty - v") {
+                if title.starts_with("Rusty - v") || title.starts_with("Rusty") {
                     ctx.hwnd = hwnd;
                     return 0;
                 }
@@ -142,11 +163,16 @@ fn find_process_window() -> Option<isize> {
     let mut ctx = SearchCtx {
         pid: std::process::id(),
         hwnd: 0,
+        fallback: 0,
     };
     unsafe {
         EnumWindows(Some(enum_windows_cb), &mut ctx as *mut SearchCtx as LPARAM);
     }
-    (ctx.hwnd != 0).then_some(ctx.hwnd)
+    if ctx.hwnd != 0 {
+        Some(ctx.hwnd)
+    } else {
+        (ctx.fallback != 0).then_some(ctx.fallback)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -170,6 +196,22 @@ fn native_show_window() -> bool {
         let _ = SetForegroundWindow(hwnd);
     }
     true
+}
+
+#[cfg(target_os = "windows")]
+fn native_close_window() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+
+    let cached = MAIN_HWND.load(Ordering::Relaxed);
+    let hwnd = if cached != 0 {
+        cached
+    } else if let Some(found) = find_process_window() {
+        found
+    } else {
+        return false;
+    };
+
+    unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 }
 }
 
 pub fn install_handlers() -> Receiver<TrayAppEvent> {

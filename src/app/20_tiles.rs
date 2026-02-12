@@ -215,7 +215,13 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                 ui.painter().rect_filled(r, 0.0, fill);
             }
 
-            let text_color = contrast_text_color(fill);
+            let text_color = match tiles.get(tile_id) {
+                Some(Tile::Pane(pane)) => pane
+                    .color
+                    .map(contrast_text_color)
+                    .unwrap_or_else(|| contrast_text_color(fill)),
+                _ => contrast_text_color(fill),
+            };
             ui.painter().galley(
                 egui::Align2::CENTER_CENTER
                     .align_size_within_rect(galley.size(), paint_rect)
@@ -267,6 +273,7 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                 let mut color_menu_open = ui
                     .data_mut(|d| d.get_temp::<bool>(open_id))
                     .unwrap_or(false);
+                let mut picked_color: Option<Option<Color32>> = None;
 
                 let color_btn = ui.button("Change Tab Color >");
                 if color_btn.hovered() {
@@ -295,12 +302,7 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                             .inner_margin(egui::Margin::same(6.0))
                             .show(ui, |ui| {
                                 if ui.button("Default").clicked() {
-                                    self.actions.push(TilesAction::SetColor {
-                                        pane_id: tile_id,
-                                        color: None,
-                                    });
-                                    color_menu_open = false;
-                                    ui.close_menu();
+                                    picked_color = Some(None);
                                 }
                                 ui.separator();
 
@@ -315,17 +317,15 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                                         )
                                         .clicked()
                                     {
-                                        self.actions.push(TilesAction::SetColor {
-                                            pane_id: tile_id,
-                                            color: Some(color),
-                                        });
-                                        color_menu_open = false;
-                                        ui.close_menu();
+                                        picked_color = Some(Some(color));
                                     }
                                 }
                             });
                     });
-                    color_panel_hovered = panel.response.hovered();
+                    color_panel_hovered = ui
+                        .input(|i| i.pointer.hover_pos())
+                        .map(|p| panel.response.rect.contains(p))
+                        .unwrap_or(false);
                 }
 
                 if !color_btn.hovered() && !color_panel_hovered {
@@ -344,6 +344,15 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                         d.remove::<bool>(open_id);
                     }
                 });
+
+                if let Some(color) = picked_color {
+                    self.actions.push(TilesAction::SetColor {
+                        pane_id: tile_id,
+                        color,
+                    });
+                    ui.data_mut(|d| d.remove::<bool>(open_id));
+                    ui.close_menu();
+                }
 
                 ui.separator();
                 if ui.button("Split Right").clicked() {
