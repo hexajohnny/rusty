@@ -17,6 +17,19 @@ fn default_terminal_scrollback_lines() -> usize {
     5000
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UiThemeMode {
+    Dark,
+    Light,
+}
+
+impl Default for UiThemeMode {
+    fn default() -> Self {
+        Self::Dark
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct SavedWindow {
     pub outer_pos: [f32; 2],
@@ -112,7 +125,13 @@ pub struct AppConfig {
     pub default_profile: Option<String>,
     pub autostart: bool,
     #[serde(default)]
+    pub ui_theme_mode: UiThemeMode,
+    #[serde(default)]
+    pub ui_theme_file: Option<String>,
+    #[serde(default)]
     pub minimize_to_tray: bool,
+    #[serde(default)]
+    pub focus_shade: bool,
     #[serde(default = "default_terminal_font_size")]
     pub terminal_font_size: f32,
     #[serde(default = "default_terminal_scrollback_lines")]
@@ -133,7 +152,10 @@ impl Default for AppConfig {
             profiles: Vec::new(),
             default_profile: None,
             autostart: false,
+            ui_theme_mode: UiThemeMode::Dark,
+            ui_theme_file: None,
             minimize_to_tray: false,
+            focus_shade: false,
             terminal_font_size: default_terminal_font_size(),
             terminal_scrollback_lines: default_terminal_scrollback_lines(),
             save_session_layout: false,
@@ -155,8 +177,17 @@ pub struct ConnectionProfile {
 
 fn config_dir() -> Option<PathBuf> {
     // Prefer a stable per-user location.
-    // Example: %APPDATA%\RustySSH\config.json
-    std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("RustySSH"))
+    // Example: %APPDATA%\Rusty\config.json
+    std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("Rusty"))
+}
+
+fn legacy_config_dir() -> Option<PathBuf> {
+    // Legacy app-data path from previous builds.
+    std::env::var_os("APPDATA").map(|p| {
+        let mut legacy_name = String::from("Rusty");
+        legacy_name.push_str("SSH");
+        PathBuf::from(p).join(legacy_name)
+    })
 }
 
 pub fn config_path() -> PathBuf {
@@ -168,8 +199,19 @@ pub fn config_path() -> PathBuf {
 
 pub fn load() -> AppConfig {
     let path = config_path();
-    let Ok(bytes) = fs::read(&path) else {
-        return AppConfig::default();
+    let (bytes, loaded_from_path) = if let Ok(bytes) = fs::read(&path) {
+        (bytes, path.clone())
+    } else {
+        let legacy = legacy_config_dir()
+            .map(|dir| dir.join("config.json"))
+            .filter(|p| p != &path);
+        match legacy {
+            Some(legacy_path) => match fs::read(&legacy_path) {
+                Ok(bytes) => (bytes, legacy_path),
+                Err(_) => return AppConfig::default(),
+            },
+            None => return AppConfig::default(),
+        }
     };
 
     let parsed = if bytes.starts_with(CFG_MAGIC_PREFIX.as_bytes()) {
@@ -187,8 +229,9 @@ pub fn load() -> AppConfig {
 
     let Some(cfg) = parsed else { return AppConfig::default() };
 
-    // Best-effort migration: if config was plaintext, rewrite it encrypted.
-    if !bytes.starts_with(CFG_MAGIC_PREFIX.as_bytes()) {
+    // Best-effort migration: rewrite plaintext configs encrypted, and migrate from the legacy
+    // directory to the current one.
+    if !bytes.starts_with(CFG_MAGIC_PREFIX.as_bytes()) || loaded_from_path != path {
         save(&cfg);
     }
 

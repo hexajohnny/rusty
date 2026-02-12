@@ -23,7 +23,7 @@ fn main() -> eframe::Result<()> {
     }
     native_options.viewport = viewport;
     eframe::run_native(
-        concat!("Rusty SSH - v", env!("CARGO_PKG_VERSION")),
+        concat!("Rusty - v", env!("CARGO_PKG_VERSION")),
         native_options,
         Box::new(|_cc| Box::new(app::AppState::new())),
     )

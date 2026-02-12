@@ -10,6 +10,7 @@ impl AppState {
         cursor_visible: bool,
         term_font_size: f32,
         allow_resize: bool,
+        focus_shade: bool,
     ) {
         let avail = ui.available_size();
         let (rect, _) = ui.allocate_exact_size(avail, Sense::hover());
@@ -122,6 +123,8 @@ impl AppState {
             // Minimal empty state.
             let text = if tab.connecting {
                 "Connecting..."
+            } else if !tab.last_status.trim().is_empty() {
+                tab.last_status.trim()
             } else {
                 "Not connected"
             };
@@ -153,6 +156,14 @@ impl AppState {
             );
         }
 
+        if focus_shade && !is_active && !response.has_focus() {
+            painter.rect_filled(
+                rect,
+                rounding,
+                Color32::from_rgba_unmultiplied(128, 128, 128, 51),
+            );
+        }
+
         // Active-pane affordance: subtle border/glow so it's obvious which terminal is "current".
         if is_active || response.has_focus() {
             let c = theme.accent;
@@ -164,5 +175,6 @@ impl AppState {
             painter.rect_stroke(r1, 6.0, glow);
             painter.rect_stroke(r0, 6.0, stroke);
         }
+
     }
 }

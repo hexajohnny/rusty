@@ -327,11 +327,15 @@ impl AppState {
 
         // Scrollbar interaction (hover-only; click-drag to scroll).
         // We keep this independent from "remote mouse mode" so you can always scroll locally.
-        // Wider hit area so it's easy to click-drag.
-        let scrollbar_w = 16.0;
+        // Keep the hit area wider and slightly inset from the right window edge so resize grips
+        // do not steal pointer hover/clicks.
+        let scrollbar_w = 22.0;
+        let scrollbar_edge_inset = 8.0;
+        let scrollbar_right = (term_rect.right() - scrollbar_edge_inset).max(term_rect.left());
+        let scrollbar_left = (scrollbar_right - scrollbar_w).max(term_rect.left());
         let scrollbar_rect = Rect::from_min_max(
-            Pos2::new(term_rect.right() - scrollbar_w, term_rect.top()),
-            Pos2::new(term_rect.right(), term_rect.bottom()),
+            Pos2::new(scrollbar_left, term_rect.top()),
+            Pos2::new(scrollbar_right, term_rect.bottom()),
         );
         let scrollbar_id = Id::new(("terminal_scrollbar", tab.id));
         let scrollbar_response = ui.interact(scrollbar_rect, scrollbar_id, Sense::click_and_drag());
@@ -422,7 +426,6 @@ impl AppState {
         if primary_pressed && !hovering_scrollbar {
             if let Some(pos) = pointer_pos {
                 if term_rect.contains(pos) {
-                    response.request_focus();
                     let pos = clamp_pos_to_grid(pos);
 
                     if local_select_enabled {
@@ -1163,11 +1166,14 @@ impl AppState {
 
         let with_alpha = |c: Color32, a: u8| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
 
-        let bar_w = 8.0;
-        let pad = 1.0;
+        let bar_w = 12.0;
+        let edge_inset = 8.0;
+        let pad = 2.0;
+        let track_right = (rect.right() - edge_inset - pad).max(rect.left());
+        let track_left = (track_right - bar_w).max(rect.left());
         let track = Rect::from_min_max(
-            Pos2::new(rect.right() - bar_w - pad, rect.top() + pad),
-            Pos2::new(rect.right() - pad, rect.bottom() - pad),
+            Pos2::new(track_left, rect.top() + pad),
+            Pos2::new(track_right, rect.bottom() - pad),
         );
 
         let total_rows = visible_rows as f32 + max_scrollback as f32;

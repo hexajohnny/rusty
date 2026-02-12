@@ -57,38 +57,41 @@ fn menu_action_for(id: &MenuId) -> Option<&'static str> {
     }
 }
 
-fn apply_direct_menu_action(action: &str) {
-    match action {
-        "exit" => {
-            if let Ok(guard) = WAKE_CTX.lock() {
-                if let Some(ctx) = guard.as_ref() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    ctx.request_repaint();
-                }
+fn direct_show_from_tray() {
+    if let Ok(guard) = WAKE_CTX.lock() {
+        if let Some(ctx) = guard.as_ref() {
+            #[cfg(target_os = "windows")]
+            {
+                let _ = native_show_window();
             }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            HIDDEN_TO_TRAY.store(false, Ordering::Relaxed);
+            ctx.request_repaint();
         }
-        "show_hide" => {
-            if let Ok(guard) = WAKE_CTX.lock() {
-                if let Some(ctx) = guard.as_ref() {
-                    // "Show Rusty" is idempotent: always show/restore.
-                    #[cfg(target_os = "windows")]
-                    {
-                        let _ = native_show_window();
-                    }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    HIDDEN_TO_TRAY.store(false, Ordering::Relaxed);
-                    ctx.request_repaint();
-                }
-            }
-        }
-        _ => {}
     }
 }
 
-pub fn hidden_to_tray_state() -> bool {
-    HIDDEN_TO_TRAY.load(Ordering::Relaxed)
+fn direct_exit_from_tray() {
+    if let Ok(guard) = WAKE_CTX.lock() {
+        if let Some(ctx) = guard.as_ref() {
+            // Ensure the viewport is in a closable state on backends that ignore
+            // close while fully hidden/minimized.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn apply_direct_menu_action(action: &str) {
+    match action {
+        "show_hide" => direct_show_from_tray(),
+        "exit" => direct_exit_from_tray(),
+        _ => {}
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -110,7 +113,7 @@ pub fn capture_foreground_hwnd() {}
 fn find_process_window() -> Option<isize> {
     use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindow, GetWindowTextW, GetWindowThreadProcessId, GW_OWNER,
+        EnumWindows, GW_OWNER, GetWindow, GetWindowTextW, GetWindowThreadProcessId,
     };
 
     struct SearchCtx {
@@ -127,7 +130,7 @@ fn find_process_window() -> Option<isize> {
             let title_len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
             if title_len > 0 {
                 let title = String::from_utf16_lossy(&title_buf[..title_len as usize]);
-                if title.starts_with("Rusty SSH - v") {
+                if title.starts_with("Rusty - v") {
                     ctx.hwnd = hwnd;
                     return 0;
                 }
@@ -149,7 +152,7 @@ fn find_process_window() -> Option<isize> {
 #[cfg(target_os = "windows")]
 fn native_show_window() -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SetForegroundWindow, ShowWindowAsync, SW_RESTORE, SW_SHOW,
+        SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindowAsync,
     };
 
     let cached = MAIN_HWND.load(Ordering::Relaxed);
@@ -182,6 +185,15 @@ pub fn install_handlers() -> Receiver<TrayAppEvent> {
 
         let tx_tray = CHANNEL.0.clone();
         TrayIconEvent::set_event_handler(Some(move |ev: TrayIconEvent| {
+            if let TrayIconEvent::Click {
+                button: tray_icon::MouseButton::Left,
+                button_state: tray_icon::MouseButtonState::Up,
+                ..
+            } = ev
+            {
+                // Single left-click should restore/raise immediately.
+                direct_show_from_tray();
+            }
             let _ = tx_tray.send(TrayAppEvent::Tray(ev));
             wake_app();
         }));
@@ -198,6 +210,12 @@ pub struct TrayState {
     pub exit_item: MenuItem,
     pub show_hide_id: MenuId,
     pub exit_id: MenuId,
+}
+
+impl TrayState {
+    pub fn set_visible(&self, visible: bool) {
+        let _ = self.tray.set_visible(visible);
+    }
 }
 
 fn load_tray_icon() -> anyhow::Result<Icon> {
@@ -227,10 +245,12 @@ pub fn create_tray() -> anyhow::Result<TrayState> {
 
     let icon = load_tray_icon()?;
     let tray = TrayIconBuilder::new()
-        .with_tooltip("Rusty SSH")
+        .with_tooltip("Rusty")
         .with_menu(Box::new(menu))
         .with_icon(icon)
         .build()?;
+    // Tray icon should only be visible when the app is hidden/minimized to tray.
+    let _ = tray.set_visible(false);
 
     if let Ok(mut guard) = MENU_IDS.lock() {
         *guard = Some((show_hide_item.id().clone(), exit_item.id().clone()));

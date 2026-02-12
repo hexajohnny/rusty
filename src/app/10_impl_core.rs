@@ -16,6 +16,8 @@ impl AppState {
         }
 
         let mut settings_dialog = SettingsDialog::closed();
+        let (theme, theme_source) =
+            load_ui_theme(config.ui_theme_mode, config.ui_theme_file.as_deref());
         let mut initial_settings = ConnectionSettings::default();
         let mut initial_profile_name: Option<String> = None;
         if let Some(idx) = default_profile_idx {
@@ -40,7 +42,9 @@ impl AppState {
         let mut active_tile: Option<TileId> = None;
         if config.save_session_layout {
             if let Some(json) = config.saved_session_layout_json.clone() {
-                if let Ok(restored) = Self::restore_session_tree(&json, config.terminal_scrollback_lines) {
+                if let Ok(restored) =
+                    Self::restore_session_tree(&json, config.terminal_scrollback_lines, &config)
+                {
                     next_session_id = restored.0;
                     tree = Some(restored.1);
                     active_tile = restored.2;
@@ -59,7 +63,7 @@ impl AppState {
             pane_id.map(|pane_id| (t, pane_id))
         });
 
-        let (tree, _first_tile_id, active_tile) = if let Some((t, pane_id)) = restored {
+        let (tree, _first_tile_id, _initial_active_tile) = if let Some((t, pane_id)) = restored {
             settings_dialog.target_tile = Some(pane_id);
             settings_dialog.open = false;
             (t, pane_id, Some(pane_id))
@@ -94,13 +98,15 @@ impl AppState {
         };
 
         Self {
-            theme: UiTheme::default(),
+            theme,
+            theme_source,
             term_theme: TermTheme::from_config(&config.terminal_colors),
             config,
             config_saver,
             settings_dialog,
             tree,
-            active_tile,
+            // Start without a focused/active pane; user interaction picks one.
+            active_tile: None,
             next_session_id,
             last_cursor_blink: Instant::now(),
             cursor_visible: true,
@@ -121,7 +127,10 @@ impl AppState {
     fn apply_global_style(&self, ctx: &egui::Context) {
         // Ensure default widget visuals and window title bars are readable against our dark theme.
         let mut style = (*ctx.style()).clone();
-        style.visuals = egui::Visuals::dark();
+        style.visuals = match self.config.ui_theme_mode {
+            config::UiThemeMode::Dark => egui::Visuals::dark(),
+            config::UiThemeMode::Light => egui::Visuals::light(),
+        };
         style.visuals.override_text_color = Some(self.theme.fg);
         style.visuals.panel_fill = self.theme.bg;
         style.visuals.window_fill = adjust_color(self.theme.top_bg, 0.06);
@@ -176,6 +185,31 @@ impl AppState {
         })
     }
 
+    fn cog_target_tile(&self) -> Option<TileId> {
+        let valid_pane = |id: TileId| matches!(self.tree.tiles.get(id), Some(Tile::Pane(_)));
+
+        if let Some(id) = self.settings_dialog.target_tile {
+            if valid_pane(id) {
+                return Some(id);
+            }
+        }
+        if let Some(id) = self.active_tile {
+            if valid_pane(id) {
+                return Some(id);
+            }
+        }
+
+        if let Some(id) = self.pane_ids().into_iter().find(|id| {
+            self.pane(*id)
+                .map(|t| t.connected || t.connecting)
+                .unwrap_or(false)
+        }) {
+            return Some(id);
+        }
+
+        self.first_pane_id()
+    }
+
     fn pane(&self, tile_id: TileId) -> Option<&SshTab> {
         match self.tree.tiles.get(tile_id) {
             Some(Tile::Pane(pane)) => Some(pane),
@@ -205,6 +239,7 @@ impl AppState {
     fn restore_session_tree(
         json: &str,
         default_scrollback_len: usize,
+        cfg: &config::AppConfig,
     ) -> anyhow::Result<(u64, Tree<SshTab>, Option<TileId>)> {
         let restored: PersistedSession = serde_json::from_str(json)?;
         let Some(root) = restored.tree.root else {
@@ -224,9 +259,16 @@ impl AppState {
                     } else {
                         p.scrollback_len
                     };
+                    let settings = p
+                        .profile_name
+                        .as_deref()
+                        .and_then(|name| config::find_profile_index(cfg, name))
+                        .and_then(|i| cfg.profiles.get(i))
+                        .map(config::write_profile_settings)
+                        .unwrap_or_else(|| p.settings.clone());
                     let mut tab = SshTab::new(
                         p.id,
-                        p.settings.clone(),
+                        settings,
                         p.profile_name.clone(),
                         scrollback_len,
                         format!("logs\\tab-{}.log", p.id),
@@ -429,6 +471,9 @@ impl AppState {
 
     fn ensure_tray_icon(&mut self) {
         if !self.config.minimize_to_tray {
+            if let Some(tray) = self.tray.as_ref() {
+                tray.set_visible(false);
+            }
             self.tray = None;
             self.hidden_to_tray = false;
             crate::tray::set_hidden_to_tray_state(false);
@@ -440,6 +485,7 @@ impl AppState {
             if let Some(tray) = self.tray.as_ref() {
                 // Keep this as an idempotent action label.
                 tray.show_hide_item.set_text("Show Rusty");
+                tray.set_visible(false);
             }
         }
     }
@@ -460,6 +506,7 @@ impl AppState {
         crate::tray::set_hidden_to_tray_state(true);
         if let Some(tray) = self.tray.as_ref() {
             tray.show_hide_item.set_text("Show Rusty");
+            tray.set_visible(true);
         }
         // Keep the app responsive to tray events even while hidden.
         ctx.request_repaint_after(Duration::from_millis(200));
@@ -487,6 +534,7 @@ impl AppState {
 
         if let Some(tray) = self.tray.as_ref() {
             tray.show_hide_item.set_text("Show Rusty");
+            tray.set_visible(false);
         }
     }
 
@@ -494,29 +542,56 @@ impl AppState {
         while let Ok(ev) = self.tray_events.try_recv() {
             match ev {
                 crate::tray::TrayAppEvent::Menu(menu_id) => {
-                    let Some(tray) = self.tray.as_ref() else { continue };
-                    if menu_id == tray.show_hide_id {
-                        let was_hidden = self.hidden_to_tray;
-                        self.hidden_to_tray = crate::tray::hidden_to_tray_state();
-                        tray.show_hide_item.set_text("Show Rusty");
-                        if !self.hidden_to_tray && was_hidden {
+                    let show_hide_id = self.tray.as_ref().map(|t| t.show_hide_id.clone());
+                    let exit_id = self.tray.as_ref().map(|t| t.exit_id.clone());
+
+                    if show_hide_id.as_ref().is_some_and(|id| menu_id == *id) {
+                        if self.hidden_to_tray {
+                            self.show_from_tray(ctx);
+                        } else {
+                            // Idempotent "show/raise" behavior.
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            ctx.request_repaint();
+                        }
+                        if !self.hidden_to_tray {
                             for id in self.pane_ids() {
                                 if let Some(tab) = self.pane_mut(id) {
                                     tab.last_sent_size = None;
                                 }
                             }
                         }
-                    } else if menu_id == tray.exit_id {
+                        if let Some(tray) = self.tray.as_ref() {
+                            tray.show_hide_item.set_text("Show Rusty");
+                        }
+                    } else if exit_id.as_ref().is_some_and(|id| menu_id == *id) {
+                        if self.hidden_to_tray {
+                            // Ensure the viewport is restorable before close on platforms that
+                            // ignore close for fully hidden windows.
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        }
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
                 crate::tray::TrayAppEvent::Tray(te) => {
-                    if let tray_icon::TrayIconEvent::DoubleClick { button, .. } = te {
-                        if button == tray_icon::MouseButton::Left {
+                    if let tray_icon::TrayIconEvent::Click {
+                        button,
+                        button_state,
+                        ..
+                    } = te
+                    {
+                        // Single left-click should immediately restore/raise.
+                        if button == tray_icon::MouseButton::Left
+                            && button_state == tray_icon::MouseButtonState::Up
+                        {
                             if self.hidden_to_tray {
                                 self.show_from_tray(ctx);
-                            } else if self.config.minimize_to_tray {
-                                self.hide_to_tray(ctx);
+                            } else {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                             }
                         }
                     }

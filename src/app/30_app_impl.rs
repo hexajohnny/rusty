@@ -79,17 +79,28 @@ impl eframe::App for AppState {
             }
 
             for id in candidates {
-                let Some(tab) = self.pane_mut(id) else { continue };
-                if let Some(p) = tab.pending_auth.take() {
+                let pending = {
+                    let Some(tab) = self.pane_mut(id) else { continue };
+                    tab.pending_auth
+                        .take()
+                        .map(|p| (p, tab.profile_name.clone()))
+                };
+                if let Some((p, profile_name)) = pending {
                     let n = p.prompts.len();
+                    let remember_key_passphrase = profile_name
+                        .as_deref()
+                        .and_then(|name| config::find_profile_index(&self.config, name))
+                        .and_then(|i| self.config.profiles.get(i))
+                        .map(|p| p.remember_key_passphrase)
+                        .unwrap_or(false);
                     self.auth_dialog = Some(AuthDialog {
                         tile_id: id,
-                        profile_name: tab.profile_name.clone(),
+                        profile_name,
                         instructions: p.instructions,
                         prompts: p.prompts,
                         responses: vec![String::new(); n],
                         just_opened: true,
-                        remember_key_passphrase: false,
+                        remember_key_passphrase,
                     });
                     break;
                 }
@@ -182,7 +193,7 @@ impl eframe::App for AppState {
                             }
                         }
 
-                        let target = self.active_tile.or_else(|| self.first_pane_id());
+                        let target = self.cog_target_tile();
                         let (connecting, connected) = target
                             .and_then(|id| self.pane(id))
                             .map(|t| (t.connecting, t.connected))
@@ -231,6 +242,7 @@ impl eframe::App for AppState {
             cursor_visible,
             term_font_size,
             !self.hidden_to_tray,
+            self.config.focus_shade,
             self.config
                 .profiles
                 .iter()

@@ -41,6 +41,7 @@ struct SshTilesBehavior<'a> {
     cursor_visible: bool,
     term_font_size: f32,
     allow_resize: bool,
+    focus_shade: bool,
     profiles: Vec<(String, ConnectionSettings)>,
     clipboard: &'a mut Option<Clipboard>,
     actions: Vec<TilesAction>,
@@ -54,6 +55,7 @@ impl<'a> SshTilesBehavior<'a> {
         cursor_visible: bool,
         term_font_size: f32,
         allow_resize: bool,
+        focus_shade: bool,
         profiles: Vec<(String, ConnectionSettings)>,
         clipboard: &'a mut Option<Clipboard>,
         active_tile: Option<TileId>,
@@ -64,6 +66,7 @@ impl<'a> SshTilesBehavior<'a> {
             cursor_visible,
             term_font_size,
             allow_resize,
+            focus_shade,
             profiles,
             clipboard,
             actions: Vec::new(),
@@ -101,6 +104,7 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
             self.cursor_visible,
             self.term_font_size,
             self.allow_resize,
+            self.focus_shade,
         );
         UiResponse::None
     }
@@ -229,40 +233,115 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
             _ => response,
         };
 
-        if matches!(tiles.get(tile_id), Some(Tile::Pane(_))) {
+        let pane_connection = match tiles.get(tile_id) {
+            Some(Tile::Pane(pane)) => Some((pane.connecting, pane.connected)),
+            _ => None,
+        };
+
+        if pane_connection.is_some() {
             response.context_menu(|ui: &mut egui::Ui| {
+                if let Some((connecting, connected)) = pane_connection {
+                    if connecting || connected {
+                        if ui.button("Disconnect").clicked() {
+                            self.actions.push(TilesAction::ToggleConnect(tile_id));
+                            ui.close_menu();
+                        }
+                    } else if ui.button("Connect").clicked() {
+                        self.actions.push(TilesAction::Connect(tile_id));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                }
+
                 if ui.button("Rename Tab").clicked() {
                     self.actions.push(TilesAction::Rename(tile_id));
                     ui.close_menu();
                 }
 
-                ui.menu_button("Change Tab Color", |ui: &mut egui::Ui| {
-                    if ui.button("Default").clicked() {
-                        self.actions.push(TilesAction::SetColor {
-                            pane_id: tile_id,
-                            color: None,
-                        });
-                        ui.close_menu();
-                    }
-                    ui.separator();
+                let hover_delay_sec = 0.18_f64;
+                let now = ui.input(|i| i.time);
+                let hover_since_id = ui.make_persistent_id(("tab_color_hover_since", tile_id));
+                let open_id = ui.make_persistent_id(("tab_color_open", tile_id));
 
-                    for (name, color) in TAB_COLOR_PRESETS {
-                        let t = contrast_text_color(color);
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new(name).color(t))
-                                    .fill(color)
-                                    .rounding(egui::Rounding::same(6.0))
-                                    .min_size(Vec2::new(160.0, 0.0)),
-                            )
-                            .clicked()
-                        {
-                            self.actions.push(TilesAction::SetColor {
-                                pane_id: tile_id,
-                                color: Some(color),
+                let mut hover_since = ui.data_mut(|d| d.get_temp::<f64>(hover_since_id));
+                let mut color_menu_open = ui
+                    .data_mut(|d| d.get_temp::<bool>(open_id))
+                    .unwrap_or(false);
+
+                let color_btn = ui.button("Change Tab Color >");
+                if color_btn.hovered() {
+                    if hover_since.is_none() {
+                        hover_since = Some(now);
+                    }
+                    if now - hover_since.unwrap_or(now) >= hover_delay_sec {
+                        color_menu_open = true;
+                    }
+                } else {
+                    hover_since = None;
+                }
+
+                if color_btn.clicked() {
+                    color_menu_open = true;
+                }
+
+                let mut color_panel_hovered = false;
+                if color_menu_open {
+                    let panel = ui.scope(|ui| {
+                        ui.add_space(2.0);
+                        egui::Frame::none()
+                            .fill(adjust_color(self.theme.top_bg, 0.08))
+                            .stroke(Stroke::new(1.0, self.theme.top_border))
+                            .rounding(egui::Rounding::same(6.0))
+                            .inner_margin(egui::Margin::same(6.0))
+                            .show(ui, |ui| {
+                                if ui.button("Default").clicked() {
+                                    self.actions.push(TilesAction::SetColor {
+                                        pane_id: tile_id,
+                                        color: None,
+                                    });
+                                    color_menu_open = false;
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+
+                                for (name, color) in TAB_COLOR_PRESETS {
+                                    let t = contrast_text_color(color);
+                                    if ui
+                                        .add(
+                                            egui::Button::new(egui::RichText::new(name).color(t))
+                                                .fill(color)
+                                                .rounding(egui::Rounding::same(6.0))
+                                                .min_size(Vec2::new(160.0, 0.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.actions.push(TilesAction::SetColor {
+                                            pane_id: tile_id,
+                                            color: Some(color),
+                                        });
+                                        color_menu_open = false;
+                                        ui.close_menu();
+                                    }
+                                }
                             });
-                            ui.close_menu();
-                        }
+                    });
+                    color_panel_hovered = panel.response.hovered();
+                }
+
+                if !color_btn.hovered() && !color_panel_hovered {
+                    color_menu_open = false;
+                }
+
+                ui.data_mut(|d| {
+                    if let Some(t) = hover_since {
+                        d.insert_temp(hover_since_id, t);
+                    } else {
+                        d.remove::<f64>(hover_since_id);
+                    }
+                    if color_menu_open {
+                        d.insert_temp(open_id, true);
+                    } else {
+                        d.remove::<bool>(open_id);
                     }
                 });
 

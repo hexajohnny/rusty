@@ -6,8 +6,8 @@ fn main() {
         // Populate Windows version info so the binary has sensible metadata in Explorer.
         res.set("CompanyName", "hexajohnny");
         res.set("LegalCopyright", "Copyright (c) hexajohnny");
-        res.set("FileDescription", "Rusty SSH");
-        res.set("ProductName", "Rusty SSH");
+        res.set("FileDescription", "Rusty");
+        res.set("ProductName", "Rusty");
         res.compile().unwrap();
     }
 }

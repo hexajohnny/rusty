@@ -7,7 +7,10 @@ impl AppState {
     }
 
     fn open_settings_dialog_for_tile(&mut self, tile_id: TileId) {
-        let Some(settings) = self.pane(tile_id).map(|t| t.settings.clone()) else {
+        let Some((settings, tab_profile_name)) = self
+            .pane(tile_id)
+            .map(|t| (t.settings.clone(), t.profile_name.clone()))
+        else {
             return;
         };
 
@@ -21,8 +24,14 @@ impl AppState {
             self.settings_dialog.page = SettingsPage::ProfilesAndAccount;
         }
 
-        // Best-effort: preselect a matching profile (host/port/user).
-        if let Some((idx, p)) = self
+        // Prefer the tab's explicit profile link when present.
+        let explicit_profile = tab_profile_name
+            .as_deref()
+            .and_then(|name| config::find_profile_index(&self.config, name))
+            .and_then(|idx| self.config.profiles.get(idx).cloned().map(|p| (idx, p)));
+
+        // Fallback: best-effort match by endpoint identity.
+        let endpoint_profile = self
             .config
             .profiles
             .iter()
@@ -32,11 +41,14 @@ impl AppState {
                     && p.settings.port == settings.port
                     && p.settings.username.trim() == settings.username.trim()
             })
-        {
+            .map(|(idx, p)| (idx, p.clone()));
+
+        if let Some((idx, p)) = explicit_profile.or(endpoint_profile) {
             self.settings_dialog.selected_profile = Some(idx);
             self.settings_dialog.profile_name = p.name.clone();
             self.settings_dialog.remember_password = p.remember_password;
             self.settings_dialog.remember_key_passphrase = p.remember_key_passphrase;
+            self.settings_dialog.draft = config::write_profile_settings(&p);
         } else {
             self.settings_dialog.selected_profile = None;
             self.settings_dialog.profile_name.clear();
@@ -78,6 +90,26 @@ impl AppState {
         }
 
         self.config_saver.request_save(self.config.clone());
+
+        let updated_settings = self.settings_dialog.draft.clone();
+        let target_tile = self.settings_dialog.target_tile;
+        let pane_ids = self.pane_ids();
+        for tile_id in pane_ids {
+            if let Some(tab) = self.pane_mut(tile_id) {
+                let linked = tab
+                    .profile_name
+                    .as_deref()
+                    .map(|n| n.eq_ignore_ascii_case(&name))
+                    .unwrap_or(false);
+                let is_target = Some(tile_id) == target_tile;
+                if linked || is_target {
+                    // Keep linked tabs (and the settings target tab) aligned with profile edits.
+                    tab.profile_name = Some(name.clone());
+                    tab.settings = updated_settings.clone();
+                    tab.title = SshTab::title_for(tab.id, &tab.settings);
+                }
+            }
+        }
     }
 
     fn delete_selected_profile(&mut self) {
@@ -172,6 +204,112 @@ impl AppState {
 
     fn draw_settings_page_appearance(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
+        let ctx = ui.ctx().clone();
+
+        ui.label("UI color scheme");
+        let before_mode = self.config.ui_theme_mode;
+        let before_theme_file = self.config.ui_theme_file.clone();
+        let mut reload_requested = false;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.config.ui_theme_mode, config::UiThemeMode::Dark, "Dark");
+            ui.selectable_value(&mut self.config.ui_theme_mode, config::UiThemeMode::Light, "Light");
+            if ui.button("Reload Theme File").clicked() {
+                reload_requested = true;
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.label("Theme file (.thm)");
+        let mode_file = default_theme_file_name(self.config.ui_theme_mode).to_string();
+        let available_theme_files = available_theme_file_names();
+        let selected_theme_text = match self.config.ui_theme_file.as_deref() {
+            Some(name) => {
+                if available_theme_files
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(name))
+                {
+                    name.to_string()
+                } else {
+                    format!("{name} (missing)")
+                }
+            }
+            None => format!("Mode default ({mode_file})"),
+        };
+        let mut chosen_theme_file = self.config.ui_theme_file.clone();
+        egui::ComboBox::from_id_source("ui_theme_file_combo")
+            .selected_text(selected_theme_text)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                let mode_label = format!("Mode default ({mode_file})");
+                if ui
+                    .selectable_label(chosen_theme_file.is_none(), mode_label)
+                    .clicked()
+                {
+                    chosen_theme_file = None;
+                }
+
+                for file in &available_theme_files {
+                    let selected = chosen_theme_file
+                        .as_deref()
+                        .map(|s| s.eq_ignore_ascii_case(file))
+                        .unwrap_or(false);
+                    if ui.selectable_label(selected, file).clicked() {
+                        chosen_theme_file = Some(file.clone());
+                    }
+                }
+            });
+        self.config.ui_theme_file = chosen_theme_file;
+
+        let mode_changed = self.config.ui_theme_mode != before_mode;
+        let theme_file_changed = self.config.ui_theme_file != before_theme_file;
+        if mode_changed || theme_file_changed || reload_requested {
+            let (new_theme, source) =
+                load_ui_theme(self.config.ui_theme_mode, self.config.ui_theme_file.as_deref());
+            self.theme = new_theme;
+            self.theme_source = source;
+            self.apply_global_style(&ctx);
+            self.style_initialized = true;
+            if mode_changed || theme_file_changed {
+                self.config_saver.request_save(self.config.clone());
+            }
+        }
+
+        if let Some(path) = self.theme_source.as_ref() {
+            ui.label(
+                egui::RichText::new(format!("Loaded from {}", path.display()))
+                    .color(theme.muted)
+                    .size(12.0),
+            );
+        } else {
+            let msg = if let Some(file) = self.config.ui_theme_file.as_deref() {
+                format!("Using built-in fallback (theme file '{file}' not found or invalid).")
+            } else {
+                format!(
+                    "Using built-in fallback (missing ./theme/{mode_file} near the executable)."
+                )
+            };
+            ui.label(egui::RichText::new(msg).color(theme.muted).size(12.0));
+        }
+
+        ui.add_space(8.0);
+        let before_focus_shade = self.config.focus_shade;
+        ui.checkbox(
+            &mut self.config.focus_shade,
+            "Focus shade (dim inactive terminals)",
+        );
+        if self.config.focus_shade != before_focus_shade {
+            self.config_saver.request_save(self.config.clone());
+        }
+        ui.label(
+            egui::RichText::new("Applies a 20% gray overlay to non-active terminal panes.")
+                .color(theme.muted)
+                .size(12.0),
+        );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(10.0);
+
         self.config.terminal_font_size = self
             .config
             .terminal_font_size
@@ -382,10 +520,18 @@ impl AppState {
             .show(ui, |ui| {
             let mut load_idx: Option<usize> = None;
             let mut delete_idx: Option<usize> = None;
+            let mut set_default_idx: Option<usize> = None;
+            let mut clear_default = false;
             for (i, p) in self.config.profiles.iter().enumerate() {
                 let selected = self.settings_dialog.selected_profile == Some(i);
                 let label = config::profile_display_name(p, &self.config);
                 let text_color = if selected { Color32::from_rgb(20, 20, 20) } else { theme.fg };
+                let is_default = self
+                    .config
+                    .default_profile
+                    .as_deref()
+                    .map(|d| d.eq_ignore_ascii_case(&p.name))
+                    .unwrap_or(false);
                 let resp = ui.add(egui::SelectableLabel::new(
                     selected,
                     egui::RichText::new(label).color(text_color),
@@ -394,6 +540,16 @@ impl AppState {
                     load_idx = Some(i);
                 }
                 resp.context_menu(|ui: &mut egui::Ui| {
+                    if is_default {
+                        if ui.button("Clear Default Profile").clicked() {
+                            clear_default = true;
+                            ui.close_menu();
+                        }
+                    } else if ui.button("Set As Default Profile").clicked() {
+                        set_default_idx = Some(i);
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Delete Profile").clicked() {
                         delete_idx = Some(i);
                         ui.close_menu();
@@ -402,6 +558,18 @@ impl AppState {
             }
             if self.config.profiles.is_empty() {
                 ui.label(egui::RichText::new("No profiles yet.").color(theme.muted));
+            }
+
+            if clear_default {
+                self.config.default_profile = None;
+                self.config_saver.request_save(self.config.clone());
+            }
+
+            if let Some(i) = set_default_idx {
+                if let Some(profile) = self.config.profiles.get(i) {
+                    self.config.default_profile = Some(profile.name.clone());
+                    self.config_saver.request_save(self.config.clone());
+                }
             }
 
             if let Some(i) = delete_idx {

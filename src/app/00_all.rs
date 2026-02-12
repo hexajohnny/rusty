@@ -1,5 +1,6 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
+use std::{fs, path::PathBuf};
 
 use arboard::Clipboard;
 use egui_tiles::{
@@ -47,7 +48,7 @@ const TITLE_PAD_X: f32 = 10.0;
 const CONTENT_PAD: f32 = 0.0;
 const RESIZE_MARGIN: f32 = 6.0;
 
-const APP_TITLE_TEXT: &str = concat!("Rusty SSH - v", env!("CARGO_PKG_VERSION"));
+const APP_TITLE_TEXT: &str = concat!("Rusty - v", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Copy)]
 struct UiTheme {
@@ -174,6 +175,167 @@ impl TermSelection {
             (self.cursor, self.anchor)
         }
     }
+}
+
+impl UiTheme {
+    fn light_default() -> Self {
+        Self {
+            bg: Color32::from_rgb(244, 246, 249),
+            fg: Color32::from_rgb(28, 34, 42),
+            top_bg: Color32::from_rgb(231, 235, 241),
+            top_border: Color32::from_rgb(170, 178, 190),
+            accent: Color32::from_rgb(196, 120, 20),
+            muted: Color32::from_rgb(102, 112, 124),
+        }
+    }
+}
+
+fn parse_theme_rgb(value: &str) -> Option<Color32> {
+    let s = value.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(Color32::from_rgb(r, g, b));
+        }
+    }
+
+    let mut parts = s.split(',').map(|p| p.trim().parse::<u8>().ok());
+    let r = parts.next().flatten()?;
+    let g = parts.next().flatten()?;
+    let b = parts.next().flatten()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(Color32::from_rgb(r, g, b))
+}
+
+fn default_theme_file_name(mode: config::UiThemeMode) -> &'static str {
+    match mode {
+        config::UiThemeMode::Dark => "Dark.thm",
+        config::UiThemeMode::Light => "Light.thm",
+    }
+}
+
+fn theme_dir_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.join("theme"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("theme");
+        if !dirs.iter().any(|p| p == &candidate) {
+            dirs.push(candidate);
+        }
+    }
+    dirs
+}
+
+fn theme_file_paths_for_name(file_name: &str) -> Vec<PathBuf> {
+    theme_dir_paths()
+        .into_iter()
+        .map(|dir| dir.join(file_name))
+        .collect()
+}
+
+fn normalize_theme_file_name(file: Option<&str>) -> Option<String> {
+    let raw = file?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let file_name = std::path::Path::new(raw).file_name()?.to_string_lossy().to_string();
+    if file_name.trim().is_empty() {
+        None
+    } else {
+        Some(file_name)
+    }
+}
+
+fn available_theme_file_names() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for dir in theme_dir_paths() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_thm = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("thm"))
+                .unwrap_or(false);
+            if !is_thm {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort_by_key(|s| s.to_ascii_lowercase());
+    names
+}
+
+fn load_ui_theme(mode: config::UiThemeMode, selected_file: Option<&str>) -> (UiTheme, Option<PathBuf>) {
+    let mut theme = match mode {
+        config::UiThemeMode::Dark => UiTheme::default(),
+        config::UiThemeMode::Light => UiTheme::light_default(),
+    };
+
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(selected) = normalize_theme_file_name(selected_file) {
+        candidates.push(selected);
+    }
+    let mode_default = default_theme_file_name(mode).to_string();
+    if !candidates.iter().any(|f| f.eq_ignore_ascii_case(&mode_default)) {
+        candidates.push(mode_default);
+    }
+
+    for file_name in candidates {
+        for path in theme_file_paths_for_name(&file_name) {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                    continue;
+                }
+                let Some((key, raw)) = line.split_once('=') else {
+                    continue;
+                };
+                let key = key.trim().to_ascii_lowercase();
+                let Some(color) = parse_theme_rgb(raw) else {
+                    continue;
+                };
+                match key.as_str() {
+                    "bg" => theme.bg = color,
+                    "fg" => theme.fg = color,
+                    "top_bg" => theme.top_bg = color,
+                    "top_border" => theme.top_border = color,
+                    "accent" => theme.accent = color,
+                    "muted" => theme.muted = color,
+                    _ => {}
+                }
+            }
+
+            return (theme, Some(path));
+        }
+    }
+
+    (theme, None)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,6 +629,7 @@ impl SshTab {
 
 pub struct AppState {
     theme: UiTheme,
+    theme_source: Option<PathBuf>,
     term_theme: TermTheme,
 
     config: config::AppConfig,
