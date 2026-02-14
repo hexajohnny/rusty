@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,8 @@ use crate::model::ConnectionSettings;
 use crate::{crypto, logger};
 
 const CFG_MAGIC_PREFIX: &str = "RUSTYCFG1:";
+const CONFIG_SAVE_RETRY_COUNT: usize = 3;
+const CONFIG_SAVE_RETRY_BASE_DELAY_MS: u64 = 120;
 
 fn default_terminal_font_size() -> f32 {
     14.0
@@ -131,6 +134,7 @@ pub enum TransferDirectionConfig {
 pub enum TransferStateConfig {
     Queued,
     Running,
+    Paused,
     Finished,
     Failed,
     Canceled,
@@ -277,10 +281,23 @@ pub fn load() -> AppConfig {
 pub fn save(cfg: &AppConfig) {
     let path = config_path();
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        if let Err(err) = fs::create_dir_all(parent) {
+            logger::log_line(
+                "logs\\config.log",
+                &format!(
+                    "Config save failed to create directory {}: {err}",
+                    parent.display()
+                ),
+            );
+            return;
+        }
     }
 
     let Ok(json) = serde_json::to_vec_pretty(cfg) else {
+        logger::log_line(
+            "logs\\config.log",
+            "Config save failed to serialize JSON payload",
+        );
         return;
     };
 
@@ -302,16 +319,49 @@ pub fn save(cfg: &AppConfig) {
         }
     };
 
-    // Best-effort atomic write.
+    // Best-effort atomic write with bounded retries for transient file lock races.
     let tmp = path.with_extension("json.tmp");
-    if fs::write(&tmp, payload).is_ok() {
-        let _ = fs::rename(&tmp, &path).or_else(|_| {
-            // If rename fails (e.g. cross-device), fall back.
-            match fs::read(&tmp) {
-                Ok(bytes) => fs::write(&path, bytes).and_then(|_| fs::remove_file(&tmp)),
-                Err(_) => fs::remove_file(&tmp),
+    for attempt in 0..=CONFIG_SAVE_RETRY_COUNT {
+        match write_config_atomic(&path, &tmp, &payload) {
+            Ok(()) => return,
+            Err(err) => {
+                let attempt_num = attempt + 1;
+                let total_attempts = CONFIG_SAVE_RETRY_COUNT + 1;
+                logger::log_line(
+                    "logs\\config.log",
+                    &format!(
+                        "Config save attempt {attempt_num}/{total_attempts} failed for {}: {err}",
+                        path.display()
+                    ),
+                );
+                if attempt < CONFIG_SAVE_RETRY_COUNT {
+                    let delay_ms = CONFIG_SAVE_RETRY_BASE_DELAY_MS * (attempt as u64 + 1);
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                } else {
+                    logger::log_line(
+                        "logs\\config.log",
+                        "Config save paused after retry limit; next save request will retry.",
+                    );
+                }
             }
-        });
+        }
+    }
+}
+
+fn write_config_atomic(path: &Path, tmp: &Path, payload: &[u8]) -> std::io::Result<()> {
+    fs::write(tmp, payload)?;
+
+    if fs::rename(tmp, path).is_ok() {
+        return Ok(());
+    }
+
+    // If rename fails (e.g. cross-device), fall back to copy+remove.
+    let bytes = fs::read(tmp)?;
+    fs::write(path, bytes)?;
+    match fs::remove_file(tmp) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 

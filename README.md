@@ -2,7 +2,13 @@
 
 Rusty is a Windows desktop SSH client built in Rust with an embedded, tabbed terminal and a dockable layout (via `egui_tiles`).
 
-![Rusty Screenshot](misc/example.png)
+## Screenshots
+
+<p align="center">
+  <img src="misc/example.png" alt="Rusty screenshot 1" width="32%" />
+  <img src="misc/example2.png" alt="Rusty screenshot 2" width="32%" />
+  <img src="misc/example3.png" alt="Rusty screenshot 3" width="32%" />
+</p>
 
 ## Features
 

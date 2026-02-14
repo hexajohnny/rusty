@@ -419,6 +419,10 @@ struct HostKeyDialog {
     prompt: ssh::HostKeyPrompt,
 }
 
+struct TransferDeleteDialog {
+    request_id: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsPage {
     Autostart,
@@ -472,6 +476,7 @@ impl SettingsDialog {
 enum DownloadState {
     Queued,
     Running,
+    Paused,
     Finished,
     Failed,
     Canceled,
@@ -701,9 +706,6 @@ impl SshTab {
     }
 
     fn start_connect(&mut self) {
-        if !self.is_terminal() {
-            return;
-        }
         if self.connected || self.connecting {
             return;
         }
@@ -720,7 +722,9 @@ impl SshTab {
         self.host_key_tx = Some(host_key_tx);
         self.connecting = true;
         self.last_status = "Connecting...".to_string();
-        self.title = Self::title_for(self.id, &self.settings);
+        if self.is_terminal() {
+            self.title = Self::title_for(self.id, &self.settings);
+        }
 
         let settings = self.settings.clone();
         let scrollback_len = self.scrollback_len;
@@ -736,9 +740,6 @@ impl SshTab {
     }
 
     fn disconnect(&mut self) {
-        if !self.is_terminal() {
-            return;
-        }
         if let Some(tx) = self.worker_tx.take() {
             let _ = tx.send(WorkerMessage::Disconnect);
         }
@@ -762,15 +763,13 @@ impl SshTab {
         self.last_selection_autoscroll = Instant::now();
     }
 
-    fn poll_messages(&mut self) {
-        if !self.is_terminal() {
-            return;
-        }
+    fn poll_messages(&mut self) -> bool {
         let Some(rx) = self.ui_rx.as_ref() else {
-            return;
+            return false;
         };
         const MAX_MSGS_PER_FRAME: usize = 256;
         let mut processed = 0usize;
+        let mut saw_message = false;
         let mut latest_screen: Option<Box<vt100::Screen>> = None;
         let mut latest_scrollback_max: Option<usize> = None;
         loop {
@@ -779,15 +778,19 @@ impl SshTab {
             }
             match rx.try_recv() {
                 Ok(UiMessage::Status(s)) => {
+                    saw_message = true;
                     self.last_status = s;
                 }
                 Ok(UiMessage::Screen(screen)) => {
+                    saw_message = true;
                     latest_screen = Some(screen);
                 }
                 Ok(UiMessage::ScrollbackMax(max)) => {
+                    saw_message = true;
                     latest_scrollback_max = Some(max);
                 }
                 Ok(UiMessage::Connected(ok)) => {
+                    saw_message = true;
                     self.connected = ok;
                     self.connecting = false;
                     if ok {
@@ -795,16 +798,20 @@ impl SshTab {
                     }
                 }
                 Ok(UiMessage::AuthPrompt(p)) => {
+                    saw_message = true;
                     self.pending_auth = Some(p);
                 }
                 Ok(UiMessage::HostKeyPrompt(p)) => {
+                    saw_message = true;
                     self.pending_host_key = Some(p);
                 }
                 Ok(UiMessage::SftpEvent(event)) => {
+                    saw_message = true;
                     self.pending_sftp_events.push(event);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    saw_message = true;
                     self.connected = false;
                     self.connecting = false;
                     break;
@@ -822,7 +829,7 @@ impl SshTab {
                     self.pending_scrollback = None;
                 }
             }
-            if !self.screen.title().is_empty() {
+            if self.is_terminal() && !self.screen.title().is_empty() {
                 // Prefer the remote title when set. Keep the id suffix to avoid
                 // confusing duplicates when opening multiple tabs with the same host.
                 self.title = format!("{} #{id}", self.screen.title(), id = self.id);
@@ -842,6 +849,8 @@ impl SshTab {
                 }
             }
         }
+
+        saw_message
     }
 }
 
@@ -859,6 +868,7 @@ pub struct AppState {
     next_session_id: u64,
 
     last_cursor_blink: Instant,
+    last_terminal_activity: Instant,
     cursor_visible: bool,
 
     tray: Option<crate::tray::TrayState>,
@@ -870,6 +880,7 @@ pub struct AppState {
     rename_popup: Option<RenamePopup>,
     auth_dialog: Option<AuthDialog>,
     host_key_dialog: Option<HostKeyDialog>,
+    transfer_delete_dialog: Option<TransferDeleteDialog>,
 
     style_initialized: bool,
 
@@ -879,6 +890,7 @@ pub struct AppState {
     next_sftp_request_id: u64,
     pending_sftp_requests: HashMap<u64, TileId>,
     downloads_window_open: bool,
+    downloads_window_just_opened: bool,
     download_jobs: Vec<DownloadJob>,
     download_event_tx: Sender<ssh::DownloadManagerEvent>,
     download_event_rx: Receiver<ssh::DownloadManagerEvent>,

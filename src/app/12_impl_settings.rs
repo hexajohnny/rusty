@@ -1,4 +1,16 @@
 impl AppState {
+    fn ms_until_cursor_blink_toggle(&self) -> u64 {
+        let blink_period = Duration::from_millis(530);
+        let elapsed = self.last_cursor_blink.elapsed();
+        if elapsed >= blink_period {
+            return 1;
+        }
+        let remaining = blink_period.saturating_sub(elapsed);
+        remaining
+            .as_millis()
+            .clamp(1, u64::MAX as u128) as u64
+    }
+
     fn update_cursor_blink(&mut self) {
         if self.last_cursor_blink.elapsed() >= Duration::from_millis(530) {
             self.cursor_visible = !self.cursor_visible;
@@ -143,56 +155,17 @@ impl AppState {
 
     fn draw_settings_page_autostart(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
-        ui.label("Default profile");
-        let selected_text = self
-            .config
-            .default_profile
-            .clone()
-            .unwrap_or_else(|| "None".to_string());
-        egui::ComboBox::from_id_source("default_profile_combo")
-            .selected_text(selected_text)
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                if ui
-                    .add(egui::SelectableLabel::new(
-                        self.config.default_profile.is_none(),
-                        egui::RichText::new("None").color(
-                            if self.config.default_profile.is_none() {
-                                Color32::from_rgb(20, 20, 20)
-                            } else {
-                                theme.fg
-                            },
-                        ),
-                    ))
-                    .clicked()
-                {
-                    self.config.default_profile = None;
-                    self.config_saver.request_save(self.config.clone());
-                }
-                for p in self.config.profiles.iter() {
-                    let selected = self
-                        .config
-                        .default_profile
-                        .as_deref()
-                        .map(|d| d.eq_ignore_ascii_case(&p.name))
-                        .unwrap_or(false);
-                    let text_color = if selected {
-                        Color32::from_rgb(20, 20, 20)
-                    } else {
-                        theme.fg
-                    };
-                    if ui
-                        .add(egui::SelectableLabel::new(
-                            selected,
-                            egui::RichText::new(&p.name).color(text_color),
-                        ))
-                        .clicked()
-                    {
-                        self.config.default_profile = Some(p.name.clone());
-                        self.config_saver.request_save(self.config.clone());
-                    }
-                }
-            });
+        let selected_text = self.config.default_profile.as_deref().unwrap_or("None");
+        ui.label(
+            egui::RichText::new(format!("Default profile: {selected_text}"))
+                .color(theme.muted)
+                .size(12.0),
+        );
+        ui.label(
+            egui::RichText::new("Set this in Profiles and Account.")
+                .color(theme.muted)
+                .size(12.0),
+        );
 
         ui.add_space(10.0);
 
@@ -204,13 +177,22 @@ impl AppState {
 
         ui.add_space(4.0);
         let note = if !self.config.autostart {
-            "When enabled, Rusty connects on launch using the default profile."
+            "When enabled, Rusty connects on launch using the default profile from Profiles and Account."
         } else if self.config.default_profile.is_none() {
-            "Pick a default profile to make autostart work."
+            "Set a default profile in Profiles and Account to make autostart work."
+        } else if self.config.save_session_layout {
+            "Autostart does not run while \"Save Session on Exit\" is enabled in Behavior (saved sessions are restored instead)."
         } else {
             "If the default profile does not store a password, you'll be prompted at startup."
         };
-        ui.label(egui::RichText::new(note).color(theme.muted));
+        let note_color = if self.config.autostart
+            && (self.config.default_profile.is_none() || self.config.save_session_layout)
+        {
+            Color32::from_rgb(220, 170, 90)
+        } else {
+            theme.muted
+        };
+        ui.label(egui::RichText::new(note).color(note_color));
     }
 
     fn draw_settings_page_behavior(&mut self, ui: &mut egui::Ui) {

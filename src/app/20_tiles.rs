@@ -467,9 +467,13 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
     ) {
         let active_pane_id = tabs
             .active
-            .or_else(|| tabs.children.first().copied())
-            .filter(|id| {
-                matches!(tiles.get(*id), Some(Tile::Pane(pane)) if pane.is_terminal())
+            .and_then(|id| {
+                matches!(tiles.get(id), Some(Tile::Pane(pane)) if pane.is_terminal()).then_some(id)
+            })
+            .or_else(|| {
+                tabs.children.iter().copied().find(|id| {
+                    matches!(tiles.get(*id), Some(Tile::Pane(pane)) if pane.is_terminal())
+                })
             });
 
         let btn_fill = adjust_color(self.theme.top_bg, 0.10);
@@ -531,6 +535,32 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                     }
                 }
             });
+
+            let folder_icon =
+                egui::Image::new(egui::include_image!("../../assets/folder.png")).tint(
+                    if active_pane_id.is_some() {
+                        self.theme.fg
+                    } else {
+                        self.theme.muted
+                    },
+                );
+            let folder_resp = title_bar_image_button(
+                ui,
+                folder_icon,
+                Vec2::new(14.0, 14.0),
+                btn_fill,
+                self.theme.top_border,
+            )
+            .on_hover_text(if active_pane_id.is_some() {
+                "Open File Manager"
+            } else {
+                "Open File Manager (requires a terminal tab in this pane)"
+            });
+            if folder_resp.clicked() {
+                if let Some(target_tile) = active_pane_id {
+                    self.actions.push(TilesAction::OpenFileManager(target_tile));
+                }
+            }
         });
     }
 }

@@ -25,43 +25,67 @@ impl eframe::App for AppState {
         self.ensure_tray_icon();
         self.handle_tray_events(ctx);
 
-        let any_live_session = self.pane_ids().into_iter().any(|id| {
-            self.pane(id)
-                .map(|t| t.connected || t.connecting)
-                .unwrap_or(false)
-        });
-        let any_active_download = self.has_active_downloads();
-        let repaint_ms = if self.hidden_to_tray {
-            200
-        } else if any_live_session
-            || any_active_download
-            || self.auth_dialog.is_some()
-            || self.host_key_dialog.is_some()
-            || self.rename_popup.is_some()
-            || self.downloads_window_open
-        {
-            16
-        } else {
-            80
-        };
-        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
         self.update_cursor_blink();
 
         self.ensure_tree_non_empty();
 
+        let mut saw_terminal_activity = false;
+        let mut live_session_count: usize = 0;
         for tile_id in self.pane_ids() {
             if let Some(tab) = self.pane_mut(tile_id) {
+                if tab.connected || tab.connecting {
+                    live_session_count += 1;
+                }
                 if let Some(rows) = tab.pending_scrollback {
                     if let Some(tx) = tab.worker_tx.as_ref() {
                         let _ = tx.send(WorkerMessage::SetScrollback(rows));
                     }
                 }
-                tab.poll_messages();
+                if tab.poll_messages() {
+                    saw_terminal_activity = true;
+                }
             }
+        }
+        if saw_terminal_activity {
+            self.last_terminal_activity = Instant::now();
         }
         self.route_sftp_events();
         self.poll_download_manager_events();
         self.sync_file_panes_with_sources();
+
+        let any_live_session = live_session_count > 0;
+        let any_active_download = self.has_active_downloads();
+        let ui_modal_open = self.auth_dialog.is_some()
+            || self.host_key_dialog.is_some()
+            || self.rename_popup.is_some()
+            || self.downloads_window_open
+            || self.settings_dialog.open
+            || self.transfer_delete_dialog.is_some();
+        let recent_terminal_activity = any_live_session
+            && self.last_terminal_activity.elapsed() <= Duration::from_millis(250);
+
+        let activity_repaint_ms = if live_session_count >= 3 {
+            24
+        } else if live_session_count >= 2 {
+            20
+        } else {
+            16
+        };
+        let mut repaint_ms = if self.hidden_to_tray {
+            200
+        } else if ui_modal_open || any_active_download {
+            16
+        } else if recent_terminal_activity {
+            activity_repaint_ms
+        } else if any_live_session {
+            33
+        } else {
+            80
+        };
+        if any_live_session {
+            repaint_ms = repaint_ms.min(self.ms_until_cursor_blink_toggle());
+        }
+        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
 
         // Copy flash: after a successful copy, briefly flash the selection then clear it.
         let now = Instant::now();
@@ -288,7 +312,7 @@ impl eframe::App for AppState {
                         .on_hover_text("Open Transfers Manager")
                         .clicked()
                         {
-                            self.downloads_window_open = true;
+                            self.open_downloads_window();
                         }
                     });
                 });

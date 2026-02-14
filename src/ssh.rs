@@ -19,6 +19,14 @@ use crate::model::ConnectionSettings;
 
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(30);
 pub const TERM_SCROLLBACK_LEN: usize = 5000;
+const TERM_SCREEN_EMIT_INTERVAL_BASE: Duration = Duration::from_millis(16);
+const TERM_SCREEN_EMIT_INTERVAL_MEDIUM: Duration = Duration::from_millis(24);
+const TERM_SCREEN_EMIT_INTERVAL_HIGH: Duration = Duration::from_millis(33);
+const TERM_SCREEN_EMIT_INTERVAL_EXTREME: Duration = Duration::from_millis(40);
+const TERM_SCREEN_RATE_WINDOW: Duration = Duration::from_millis(250);
+const DETACHED_TRANSFER_RETRY_COUNT: u32 = 3;
+const DETACHED_TRANSFER_RETRY_BASE_DELAY_MS: u64 = 800;
+const DETACHED_TRANSFER_RETRY_MAX_DELAY_MS: u64 = 8_000;
 
 fn app_data_dir() -> PathBuf {
     std::env::current_exe()
@@ -147,6 +155,17 @@ pub enum DownloadManagerEvent {
         downloaded_bytes: u64,
         total_bytes: Option<u64>,
         speed_bps: f64,
+    },
+    Retrying {
+        request_id: u64,
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        message: String,
+    },
+    Paused {
+        request_id: u64,
+        message: String,
     },
     Finished {
         request_id: u64,
@@ -375,6 +394,23 @@ fn send_screen(ui_tx: &Sender<UiMessage>, parser: &mut Parser) {
 
 fn send_scrollback_max(ui_tx: &Sender<UiMessage>, parser: &mut Parser) {
     let _ = ui_tx.send(UiMessage::ScrollbackMax(compute_scrollback_max(parser)));
+}
+
+fn adaptive_screen_emit_interval(window_bytes: u64, window_elapsed: Duration) -> Duration {
+    let secs = window_elapsed.as_secs_f64();
+    if secs <= 0.0 {
+        return TERM_SCREEN_EMIT_INTERVAL_BASE;
+    }
+    let bytes_per_sec = window_bytes as f64 / secs;
+    if bytes_per_sec >= 350_000.0 {
+        TERM_SCREEN_EMIT_INTERVAL_EXTREME
+    } else if bytes_per_sec >= 180_000.0 {
+        TERM_SCREEN_EMIT_INTERVAL_HIGH
+    } else if bytes_per_sec >= 90_000.0 {
+        TERM_SCREEN_EMIT_INTERVAL_MEDIUM
+    } else {
+        TERM_SCREEN_EMIT_INTERVAL_BASE
+    }
 }
 
 async fn ensure_sftp_session(
@@ -679,17 +715,100 @@ async fn open_authenticated_session_for_download(
     Ok(session)
 }
 
-async fn run_detached_sftp_download(
-    settings: ConnectionSettings,
+fn transfer_cancel_requested(cancel_rx: &Receiver<()>) -> bool {
+    matches!(
+        cancel_rx.try_recv(),
+        Ok(_) | Err(TryRecvError::Disconnected)
+    )
+}
+
+fn transfer_retry_delay_ms(attempt: u32) -> u64 {
+    let shift = attempt.saturating_sub(1).min(4);
+    let scaled = DETACHED_TRANSFER_RETRY_BASE_DELAY_MS.saturating_mul(1u64 << shift);
+    scaled.min(DETACHED_TRANSFER_RETRY_MAX_DELAY_MS)
+}
+
+fn is_retryable_transfer_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::UnexpectedEof => return true,
+                std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::AlreadyExists => return false,
+                _ => {}
+            }
+        }
+    }
+
+    let msg = err.to_string().to_ascii_lowercase();
+    if msg.contains("authentication failed")
+        || msg.contains("permission denied")
+        || msg.contains("no such file")
+        || msg.contains("failed to create local directory")
+        || msg.contains("failed to open local file")
+        || msg.contains("failed to create local file")
+        || msg.contains("failed to create remote file")
+    {
+        return false;
+    }
+
+    msg.contains("timed out")
+        || msg.contains("timeout")
+        || msg.contains("connection reset")
+        || msg.contains("connection aborted")
+        || msg.contains("connection closed")
+        || msg.contains("connection lost")
+        || msg.contains("broken pipe")
+        || msg.contains("unexpected eof")
+        || msg.contains("channel closed")
+}
+
+async fn wait_for_retry_or_cancel(cancel_rx: &Receiver<()>, delay_ms: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(delay_ms);
+    loop {
+        if transfer_cancel_requested(cancel_rx) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let sleep_for = remaining.min(Duration::from_millis(100));
+        tokio::time::sleep(sleep_for).await;
+    }
+}
+
+async fn run_detached_sftp_download_attempt(
+    settings: &ConnectionSettings,
     request_id: u64,
     remote_path: String,
     local_path: String,
     resume_from_local: bool,
     event_tx: &Sender<DownloadManagerEvent>,
-    cancel_rx: Receiver<()>,
+    cancel_rx: &Receiver<()>,
     log_path: &str,
 ) -> Result<()> {
-    let session = open_authenticated_session_for_download(&settings, log_path).await?;
+    if transfer_cancel_requested(cancel_rx) {
+        let _ = event_tx.send(DownloadManagerEvent::Canceled {
+            request_id,
+            local_path,
+        });
+        return Ok(());
+    }
+
+    let session = open_authenticated_session_for_download(settings, log_path).await?;
 
     let channel = session
         .channel_open_session()
@@ -780,7 +899,7 @@ async fn run_detached_sftp_download(
     let mut buf = [0u8; 128 * 1024];
 
     loop {
-        if cancel_rx.try_recv().is_ok() {
+        if transfer_cancel_requested(cancel_rx) {
             let _ = event_tx.send(DownloadManagerEvent::Canceled {
                 request_id,
                 local_path: local_path.clone(),
@@ -821,16 +940,106 @@ async fn run_detached_sftp_download(
     Ok(())
 }
 
-async fn run_detached_sftp_upload(
+async fn run_detached_sftp_download(
     settings: ConnectionSettings,
     request_id: u64,
     remote_path: String,
     local_path: String,
+    resume_from_local: bool,
     event_tx: &Sender<DownloadManagerEvent>,
-    cancel_rx: Receiver<()>,
+    cancel_rx: &Receiver<()>,
     log_path: &str,
 ) -> Result<()> {
-    let session = open_authenticated_session_for_download(&settings, log_path).await?;
+    let mut resume_next_attempt = resume_from_local;
+
+    for retry_index in 0..=DETACHED_TRANSFER_RETRY_COUNT {
+        let result = run_detached_sftp_download_attempt(
+            &settings,
+            request_id,
+            remote_path.clone(),
+            local_path.clone(),
+            resume_next_attempt,
+            event_tx,
+            cancel_rx,
+            log_path,
+        )
+        .await;
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let retryable = is_retryable_transfer_error(&err);
+                if retryable && retry_index < DETACHED_TRANSFER_RETRY_COUNT {
+                    let attempt = retry_index + 1;
+                    let delay_ms = transfer_retry_delay_ms(attempt);
+                    let message = format!(
+                        "Transient download error: {err}. Retrying ({attempt}/{}) in {:.1}s...",
+                        DETACHED_TRANSFER_RETRY_COUNT,
+                        delay_ms as f64 / 1000.0
+                    );
+                    logger::log_line(log_path, &message);
+                    let _ = event_tx.send(DownloadManagerEvent::Retrying {
+                        request_id,
+                        attempt,
+                        max_attempts: DETACHED_TRANSFER_RETRY_COUNT,
+                        delay_ms,
+                        message,
+                    });
+                    if wait_for_retry_or_cancel(cancel_rx, delay_ms).await {
+                        let _ = event_tx.send(DownloadManagerEvent::Canceled {
+                            request_id,
+                            local_path: local_path.clone(),
+                        });
+                        return Ok(());
+                    }
+                    resume_next_attempt = true;
+                    continue;
+                }
+
+                if retryable {
+                    let message = format!(
+                        "Download paused after {} retries: {err}. Click retry to resume.",
+                        DETACHED_TRANSFER_RETRY_COUNT
+                    );
+                    logger::log_line(log_path, &message);
+                    let _ = event_tx.send(DownloadManagerEvent::Paused {
+                        request_id,
+                        message,
+                    });
+                    return Ok(());
+                }
+
+                return Err(err);
+            }
+        }
+    }
+
+    let message = "Download paused: retry loop ended unexpectedly.".to_string();
+    let _ = event_tx.send(DownloadManagerEvent::Paused {
+        request_id,
+        message,
+    });
+    Ok(())
+}
+
+async fn run_detached_sftp_upload_attempt(
+    settings: &ConnectionSettings,
+    request_id: u64,
+    remote_path: String,
+    local_path: String,
+    event_tx: &Sender<DownloadManagerEvent>,
+    cancel_rx: &Receiver<()>,
+    log_path: &str,
+) -> Result<()> {
+    if transfer_cancel_requested(cancel_rx) {
+        let _ = event_tx.send(DownloadManagerEvent::Canceled {
+            request_id,
+            local_path,
+        });
+        return Ok(());
+    }
+
+    let session = open_authenticated_session_for_download(settings, log_path).await?;
 
     let channel = session
         .channel_open_session()
@@ -866,7 +1075,7 @@ async fn run_detached_sftp_upload(
     let mut buf = [0u8; 128 * 1024];
 
     loop {
-        if cancel_rx.try_recv().is_ok() {
+        if transfer_cancel_requested(cancel_rx) {
             let _ = event_tx.send(DownloadManagerEvent::Canceled {
                 request_id,
                 local_path: local_path.clone(),
@@ -915,6 +1124,83 @@ async fn run_detached_sftp_upload(
     Ok(())
 }
 
+async fn run_detached_sftp_upload(
+    settings: ConnectionSettings,
+    request_id: u64,
+    remote_path: String,
+    local_path: String,
+    event_tx: &Sender<DownloadManagerEvent>,
+    cancel_rx: &Receiver<()>,
+    log_path: &str,
+) -> Result<()> {
+    for retry_index in 0..=DETACHED_TRANSFER_RETRY_COUNT {
+        let result = run_detached_sftp_upload_attempt(
+            &settings,
+            request_id,
+            remote_path.clone(),
+            local_path.clone(),
+            event_tx,
+            cancel_rx,
+            log_path,
+        )
+        .await;
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let retryable = is_retryable_transfer_error(&err);
+                if retryable && retry_index < DETACHED_TRANSFER_RETRY_COUNT {
+                    let attempt = retry_index + 1;
+                    let delay_ms = transfer_retry_delay_ms(attempt);
+                    let message = format!(
+                        "Transient upload error: {err}. Retrying ({attempt}/{}) in {:.1}s...",
+                        DETACHED_TRANSFER_RETRY_COUNT,
+                        delay_ms as f64 / 1000.0
+                    );
+                    logger::log_line(log_path, &message);
+                    let _ = event_tx.send(DownloadManagerEvent::Retrying {
+                        request_id,
+                        attempt,
+                        max_attempts: DETACHED_TRANSFER_RETRY_COUNT,
+                        delay_ms,
+                        message,
+                    });
+                    if wait_for_retry_or_cancel(cancel_rx, delay_ms).await {
+                        let _ = event_tx.send(DownloadManagerEvent::Canceled {
+                            request_id,
+                            local_path: local_path.clone(),
+                        });
+                        return Ok(());
+                    }
+                    continue;
+                }
+
+                if retryable {
+                    let message = format!(
+                        "Upload paused after {} retries: {err}. Click retry to restart upload.",
+                        DETACHED_TRANSFER_RETRY_COUNT
+                    );
+                    logger::log_line(log_path, &message);
+                    let _ = event_tx.send(DownloadManagerEvent::Paused {
+                        request_id,
+                        message,
+                    });
+                    return Ok(());
+                }
+
+                return Err(err);
+            }
+        }
+    }
+
+    let message = "Upload paused: retry loop ended unexpectedly.".to_string();
+    let _ = event_tx.send(DownloadManagerEvent::Paused {
+        request_id,
+        message,
+    });
+    Ok(())
+}
+
 pub fn start_sftp_download_detached(
     settings: ConnectionSettings,
     request_id: u64,
@@ -937,7 +1223,7 @@ pub fn start_sftp_download_detached(
                 local_path.clone(),
                 resume_from_local,
                 &event_tx,
-                cancel_rx,
+                &cancel_rx,
                 &log_path,
             )),
             Err(err) => Err(anyhow!("Failed to create async runtime: {err}")),
@@ -972,7 +1258,7 @@ pub fn start_sftp_upload_detached(
                 remote_path.clone(),
                 local_path.clone(),
                 &event_tx,
-                cancel_rx,
+                &cancel_rx,
                 &log_path,
             )),
             Err(err) => Err(anyhow!("Failed to create async runtime: {err}")),
@@ -1815,10 +2101,12 @@ async fn run_shell_async(
     let mut sftp: Option<SftpSession> = None;
     let mut screen_dirty = true;
     let mut scrollback_dirty = true;
-    let screen_emit_interval = Duration::from_millis(16);
+    let mut screen_emit_interval = TERM_SCREEN_EMIT_INTERVAL_BASE;
     let mut last_screen_emit = Instant::now()
         .checked_sub(screen_emit_interval)
         .unwrap_or_else(Instant::now);
+    let mut screen_rate_window_started = Instant::now();
+    let mut screen_rate_window_bytes: u64 = 0;
 
     let mut writer = channel.make_writer();
 
@@ -1902,12 +2190,16 @@ async fn run_shell_async(
             Ok(Some(ChannelMsg::Data { data })) => {
                 process_with_query_responses(&mut parser, &mut scanner, &mut writer, data.as_ref())
                     .await?;
+                screen_rate_window_bytes =
+                    screen_rate_window_bytes.saturating_add(data.len() as u64);
                 screen_dirty = true;
                 scrollback_dirty = true;
             }
             Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
                 process_with_query_responses(&mut parser, &mut scanner, &mut writer, data.as_ref())
                     .await?;
+                screen_rate_window_bytes =
+                    screen_rate_window_bytes.saturating_add(data.len() as u64);
                 screen_dirty = true;
                 scrollback_dirty = true;
             }
@@ -1929,6 +2221,14 @@ async fn run_shell_async(
             Err(_) => {
                 // Poll timeout to keep worker input processing responsive.
             }
+        }
+
+        let rate_window_elapsed = screen_rate_window_started.elapsed();
+        if rate_window_elapsed >= TERM_SCREEN_RATE_WINDOW {
+            screen_emit_interval =
+                adaptive_screen_emit_interval(screen_rate_window_bytes, rate_window_elapsed);
+            screen_rate_window_started = Instant::now();
+            screen_rate_window_bytes = 0;
         }
 
         if scrollback_dirty {
