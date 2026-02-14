@@ -37,8 +37,31 @@ fn app_data_dir() -> PathBuf {
         .join("data")
 }
 
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            Some(home)
+        })
+}
+
+fn ensure_known_hosts_parent(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+}
+
 fn app_known_hosts_path() -> PathBuf {
-    app_data_dir().join("known_hosts")
+    let path = user_home_dir()
+        .map(|home| home.join(".ssh").join("known_hosts"))
+        .unwrap_or_else(|| app_data_dir().join("known_hosts"));
+    ensure_known_hosts_parent(&path);
+    path
 }
 
 #[derive(Debug)]

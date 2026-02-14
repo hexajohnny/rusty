@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Rusty"
+    Manufacturer="hexajohnny"
+    Version="0.0.7"
+    UpgradeCode="{A77A6E2E-8A7F-4C9F-9CF0-9D44E1A44F1A}"
+    Language="1033"
+    Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="MainFeature" Title="Rusty" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Rusty">
+        <Directory Id="THEMEFOLDER" Name="theme" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="PROGRAMMENUDIR" Name="Rusty" />
+    </StandardDirectory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="cmpRustyExe" Guid="*">
+        <File Id="filRustyExe" Source="dist\\rusty.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpDesktopShortcut" Guid="*" Directory="DesktopFolder">
+        <Shortcut
+          Id="scDesktopRusty"
+          Name="Rusty"
+          Description="Rusty SSH client"
+          Target="[INSTALLFOLDER]rusty.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\\hexajohnny\\Rusty"
+          Name="DesktopShortcut"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpStartMenuShortcut" Guid="*" Directory="PROGRAMMENUDIR">
+        <Shortcut
+          Id="scStartMenuRusty"
+          Name="Rusty"
+          Description="Rusty SSH client"
+          Target="[INSTALLFOLDER]rusty.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="rfProgramMenuDir" Directory="PROGRAMMENUDIR" On="uninstall" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\\hexajohnny\\Rusty"
+          Name="StartMenuShortcut"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpReadme" Guid="*">
+        <File Id="filReadme" Source="README.md" />
+      </Component>
+
+      <Component Id="cmpLicenseMit" Guid="*">
+        <File Id="filLicenseMit" Source="LICENSE-MIT" />
+      </Component>
+
+      <Component Id="cmpLicenseApache" Guid="*">
+        <File Id="filLicenseApache" Source="LICENSE-APACHE" />
+      </Component>
+
+      <Component Id="cmpThemeDark" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeDark" Source="dist\\theme\\Dark.thm" />
+      </Component>
+      <Component Id="cmpThemeLight" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeLight" Source="dist\\theme\\Light.thm" />
+      </Component>
+      <Component Id="cmpThemeCrimsonDusk" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeCrimsonDusk" Source="dist\\theme\\CrimsonDusk.thm" />
+      </Component>
+      <Component Id="cmpThemeEmeraldMist" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeEmeraldMist" Source="dist\\theme\\EmeraldMist.thm" />
+      </Component>
+      <Component Id="cmpThemeForestNight" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeForestNight" Source="dist\\theme\\ForestNight.thm" />
+      </Component>
+      <Component Id="cmpThemeGraphite" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeGraphite" Source="dist\\theme\\Graphite.thm" />
+      </Component>
+      <Component Id="cmpThemeMidnightBlue" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeMidnightBlue" Source="dist\\theme\\MidnightBlue.thm" />
+      </Component>
+      <Component Id="cmpThemeMonochromeSlate" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeMonochromeSlate" Source="dist\\theme\\MonochromeSlate.thm" />
+      </Component>
+      <Component Id="cmpThemeOceanBreeze" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeOceanBreeze" Source="dist\\theme\\OceanBreeze.thm" />
+      </Component>
+      <Component Id="cmpThemeSandstone" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeSandstone" Source="dist\\theme\\Sandstone.thm" />
+      </Component>
+      <Component Id="cmpThemeSolarizedDark" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeSolarizedDark" Source="dist\\theme\\SolarizedDark.thm" />
+      </Component>
+      <Component Id="cmpThemeSolarizedLight" Guid="*" Directory="THEMEFOLDER">
+        <File Id="filThemeSolarizedLight" Source="dist\\theme\\SolarizedLight.thm" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>
