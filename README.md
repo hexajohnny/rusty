@@ -94,7 +94,8 @@ Rusty is a Windows desktop SSH client built in Rust with an embedded, tabbed ter
 ## Security Notes
 - Config is stored per-user and encrypted on Windows using DPAPI (low CPU).
 - If you choose to remember secrets (password / key passphrase), they are stored encrypted in the local config.
-- Host key verification is currently permissive (server key is accepted without a `known_hosts` trust prompt).
+- Host keys are verified against `%USERPROFILE%\\.ssh\\known_hosts`.
+- Unknown host keys prompt for a Trust & Save decision and are written to `%USERPROFILE%\\.ssh\\known_hosts` when accepted.
 
 ## Config Location
 - `%APPDATA%\\Rusty\\config.json`
