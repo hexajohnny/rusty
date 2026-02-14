@@ -1,6 +1,6 @@
 # Rusty
 
-Rusty is a Windows desktop SSH client built in Rust with an embedded, tabbed terminal and a dockable layout (via `egui_tiles`).
+Rusty is a Windows desktop SSH client built in Rust with an embedded, tabbed terminal, an integrated SFTP file browser, a global download manager, and a dockable layout (via `egui_tiles`).
 
 ## Screenshots
 
