@@ -21,6 +21,7 @@ enum TilesAction {
     TabActivated(TileId),
     Connect(TileId),
     ToggleConnect(TileId),
+    OpenFileManager(TileId),
     OpenSettings(TileId),
     Rename(TileId),
     SetColor {
@@ -30,6 +31,32 @@ enum TilesAction {
     Split {
         pane_id: TileId,
         dir: LinearDir,
+    },
+    FileRefresh {
+        pane_id: TileId,
+        path: String,
+    },
+    FileUp(TileId),
+    FileMkdir {
+        pane_id: TileId,
+        dir_name: String,
+    },
+    FileRename {
+        pane_id: TileId,
+        from_name: String,
+        to_name: String,
+    },
+    FileDelete {
+        pane_id: TileId,
+        name: String,
+        is_dir: bool,
+    },
+    FileUpload {
+        pane_id: TileId,
+    },
+    FileDownload {
+        pane_id: TileId,
+        name: String,
     },
     Close(TileId),
     Exit,
@@ -93,19 +120,24 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
         }
 
         let ctx = ui.ctx().clone();
-        AppState::terminal_view(
-            ui,
-            &ctx,
-            self.clipboard,
-            pane,
-            self.active_tile == Some(tile_id),
-            self.theme,
-            self.term_theme,
-            self.cursor_visible,
-            self.term_font_size,
-            self.allow_resize,
-            self.focus_shade,
-        );
+        if pane.is_terminal() {
+            AppState::terminal_view(
+                ui,
+                &ctx,
+                self.clipboard,
+                pane,
+                self.active_tile == Some(tile_id),
+                self.theme,
+                self.term_theme,
+                self.cursor_visible,
+                self.term_font_size,
+                self.allow_resize,
+                self.focus_shade,
+            );
+        } else {
+            let actions = AppState::file_manager_view(ui, pane, self.theme, tile_id);
+            self.actions.extend(actions);
+        }
         UiResponse::None
     }
 
@@ -151,13 +183,14 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
         active: bool,
         is_being_dragged: bool,
     ) -> Response {
-        let text = self.tab_title_for_tile(tiles, tile_id);
         let font_id = FontId::proportional(15.0);
-        let galley = text.into_galley(ui, Some(false), f32::INFINITY, font_id);
+        let measured_galley =
+            self.tab_title_for_tile(tiles, tile_id)
+                .into_galley(ui, Some(false), f32::INFINITY, font_id.clone());
 
         let x_margin = 12.0;
         let (_, rect) = ui.allocate_space(egui::vec2(
-            galley.size().x + 2.0 * x_margin,
+            measured_galley.size().x + 2.0 * x_margin,
             ui.available_height(),
         ));
         let response = ui.interact(rect, id, Sense::click_and_drag());
@@ -216,17 +249,37 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
             }
 
             let text_color = match tiles.get(tile_id) {
-                Some(Tile::Pane(pane)) => pane
-                    .color
-                    .map(contrast_text_color)
-                    .unwrap_or_else(|| contrast_text_color(fill)),
-                _ => contrast_text_color(fill),
+                Some(Tile::Pane(pane)) => {
+                    if let Some(custom) = pane.color {
+                        let is_sand = custom.r() == 214 && custom.g() == 168 && custom.b() == 76;
+                        let is_lime = custom.r() == 120 && custom.g() == 200 && custom.b() == 72;
+                        if is_sand || is_lime {
+                            Color32::BLACK
+                        } else {
+                            Color32::WHITE
+                        }
+                    } else {
+                        self.theme.fg
+                    }
+                }
+                _ => self.theme.fg,
             };
+            let text_galley = ui
+                .scope(|ui| {
+                    ui.visuals_mut().override_text_color = Some(text_color);
+                    self.tab_title_for_tile(tiles, tile_id).into_galley(
+                        ui,
+                        Some(false),
+                        f32::INFINITY,
+                        font_id.clone(),
+                    )
+                })
+                .inner;
             ui.painter().galley(
                 egui::Align2::CENTER_CENTER
-                    .align_size_within_rect(galley.size(), paint_rect)
+                    .align_size_within_rect(text_galley.size(), paint_rect)
                     .min,
-                galley,
+                text_galley,
                 text_color,
             );
         }
@@ -239,24 +292,30 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
             _ => response,
         };
 
-        let pane_connection = match tiles.get(tile_id) {
-            Some(Tile::Pane(pane)) => Some((pane.connecting, pane.connected)),
+        let pane_state = match tiles.get(tile_id) {
+            Some(Tile::Pane(pane)) => Some((pane.is_terminal(), pane.connecting, pane.connected)),
             _ => None,
         };
 
-        if pane_connection.is_some() {
+        if pane_state.is_some() {
             response.context_menu(|ui: &mut egui::Ui| {
-                if let Some((connecting, connected)) = pane_connection {
-                    if connecting || connected {
-                        if ui.button("Disconnect").clicked() {
-                            self.actions.push(TilesAction::ToggleConnect(tile_id));
+                if let Some((is_terminal, connecting, connected)) = pane_state {
+                    if is_terminal {
+                        if connecting || connected {
+                            if ui.button("Disconnect").clicked() {
+                                self.actions.push(TilesAction::ToggleConnect(tile_id));
+                                ui.close_menu();
+                            }
+                        } else if ui.button("Connect").clicked() {
+                            self.actions.push(TilesAction::Connect(tile_id));
                             ui.close_menu();
                         }
-                    } else if ui.button("Connect").clicked() {
-                        self.actions.push(TilesAction::Connect(tile_id));
-                        ui.close_menu();
+                        if ui.button("Open File Manager").clicked() {
+                            self.actions.push(TilesAction::OpenFileManager(tile_id));
+                            ui.close_menu();
+                        }
+                        ui.separator();
                     }
-                    ui.separator();
                 }
 
                 if ui.button("Rename Tab").clicked() {
@@ -265,14 +324,17 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                 }
 
                 let hover_delay_sec = 0.18_f64;
+                let close_grace_sec = 0.35_f64;
                 let now = ui.input(|i| i.time);
                 let hover_since_id = ui.make_persistent_id(("tab_color_hover_since", tile_id));
                 let open_id = ui.make_persistent_id(("tab_color_open", tile_id));
+                let last_hot_id = ui.make_persistent_id(("tab_color_last_hot", tile_id));
 
                 let mut hover_since = ui.data_mut(|d| d.get_temp::<f64>(hover_since_id));
                 let mut color_menu_open = ui
                     .data_mut(|d| d.get_temp::<bool>(open_id))
                     .unwrap_or(false);
+                let mut last_hot = ui.data_mut(|d| d.get_temp::<f64>(last_hot_id));
                 let mut picked_color: Option<Option<Color32>> = None;
 
                 let color_btn = ui.button("Change Tab Color >");
@@ -292,6 +354,7 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                 }
 
                 let mut color_panel_hovered = false;
+                let mut pointer_in_transition_zone = false;
                 if color_menu_open {
                     let panel = ui.scope(|ui| {
                         ui.add_space(2.0);
@@ -326,9 +389,17 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                         .input(|i| i.pointer.hover_pos())
                         .map(|p| panel.response.rect.contains(p))
                         .unwrap_or(false);
+                    pointer_in_transition_zone = ui
+                        .input(|i| i.pointer.hover_pos())
+                        .map(|p| color_btn.rect.union(panel.response.rect).expand(10.0).contains(p))
+                        .unwrap_or(false);
                 }
 
-                if !color_btn.hovered() && !color_panel_hovered {
+                if color_btn.hovered() || color_panel_hovered || pointer_in_transition_zone {
+                    last_hot = Some(now);
+                } else if color_menu_open
+                    && (now - last_hot.unwrap_or(now)) >= close_grace_sec
+                {
                     color_menu_open = false;
                 }
 
@@ -342,6 +413,11 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                         d.insert_temp(open_id, true);
                     } else {
                         d.remove::<bool>(open_id);
+                    }
+                    if let Some(t) = last_hot {
+                        d.insert_temp(last_hot_id, t);
+                    } else {
+                        d.remove::<f64>(last_hot_id);
                     }
                 });
 
@@ -392,7 +468,9 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
         let active_pane_id = tabs
             .active
             .or_else(|| tabs.children.first().copied())
-            .filter(|id| matches!(tiles.get(*id), Some(Tile::Pane(_))));
+            .filter(|id| {
+                matches!(tiles.get(*id), Some(Tile::Pane(pane)) if pane.is_terminal())
+            });
 
         let btn_fill = adjust_color(self.theme.top_bg, 0.10);
         let btn = |label: egui::RichText| {

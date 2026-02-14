@@ -9,6 +9,7 @@ impl eframe::App for AppState {
         crate::tray::set_wake_ctx(ctx.clone());
 
         if !self.style_initialized {
+            egui_extras::install_image_loaders(ctx);
             self.apply_global_style(ctx);
             self.style_initialized = true;
         }
@@ -24,13 +25,21 @@ impl eframe::App for AppState {
         self.ensure_tray_icon();
         self.handle_tray_events(ctx);
 
-        let any_live_session = self
-            .pane_ids()
-            .into_iter()
-            .any(|id| self.pane(id).map(|t| t.connected || t.connecting).unwrap_or(false));
+        let any_live_session = self.pane_ids().into_iter().any(|id| {
+            self.pane(id)
+                .map(|t| t.connected || t.connecting)
+                .unwrap_or(false)
+        });
+        let any_active_download = self.has_active_downloads();
         let repaint_ms = if self.hidden_to_tray {
             200
-        } else if any_live_session || self.auth_dialog.is_some() || self.rename_popup.is_some() {
+        } else if any_live_session
+            || any_active_download
+            || self.auth_dialog.is_some()
+            || self.host_key_dialog.is_some()
+            || self.rename_popup.is_some()
+            || self.downloads_window_open
+        {
             16
         } else {
             80
@@ -50,6 +59,9 @@ impl eframe::App for AppState {
                 tab.poll_messages();
             }
         }
+        self.route_sftp_events();
+        self.poll_download_manager_events();
+        self.sync_file_panes_with_sources();
 
         // Copy flash: after a successful copy, briefly flash the selection then clear it.
         let now = Instant::now();
@@ -65,9 +77,8 @@ impl eframe::App for AppState {
             }
         }
 
-        // If any SSH worker is asking for keyboard-interactive input (password, OTP, etc),
-        // pop a modal dialog to collect it.
-        if self.auth_dialog.is_none() {
+        // If any SSH worker needs host-key trust confirmation, pop that modal first.
+        if self.host_key_dialog.is_none() {
             let mut candidates: Vec<TileId> = Vec::new();
             if let Some(active) = self.active_tile {
                 candidates.push(active);
@@ -80,7 +91,39 @@ impl eframe::App for AppState {
 
             for id in candidates {
                 let pending = {
-                    let Some(tab) = self.pane_mut(id) else { continue };
+                    let Some(tab) = self.pane_mut(id) else {
+                        continue;
+                    };
+                    tab.pending_host_key.take()
+                };
+                if let Some(prompt) = pending {
+                    self.host_key_dialog = Some(HostKeyDialog {
+                        tile_id: id,
+                        prompt,
+                    });
+                    break;
+                }
+            }
+        }
+
+        // If any SSH worker is asking for keyboard-interactive input (password, OTP, etc),
+        // pop a modal dialog to collect it.
+        if self.auth_dialog.is_none() && self.host_key_dialog.is_none() {
+            let mut candidates: Vec<TileId> = Vec::new();
+            if let Some(active) = self.active_tile {
+                candidates.push(active);
+            }
+            for id in self.pane_ids() {
+                if Some(id) != self.active_tile {
+                    candidates.push(id);
+                }
+            }
+
+            for id in candidates {
+                let pending = {
+                    let Some(tab) = self.pane_mut(id) else {
+                        continue;
+                    };
                     tab.pending_auth
                         .take()
                         .map(|p| (p, tab.profile_name.clone()))
@@ -137,8 +180,11 @@ impl eframe::App for AppState {
 
                 // Draggable title bar background. Buttons placed on top will "win" hit-testing.
                 let bar_rect = ui.max_rect();
-                let drag_resp =
-                    ui.interact(bar_rect, Id::new("rusty_title_drag"), Sense::click_and_drag());
+                let drag_resp = ui.interact(
+                    bar_rect,
+                    Id::new("rusty_title_drag"),
+                    Sense::click_and_drag(),
+                );
                 if drag_resp.drag_started() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
@@ -148,13 +194,6 @@ impl eframe::App for AppState {
                 }
 
                 let btn_fill = adjust_color(theme.top_bg, 0.10);
-                let icon_btn = |label: egui::RichText| {
-                    egui::Button::new(label)
-                        .fill(btn_fill)
-                        .stroke(Stroke::new(1.0, theme.top_border))
-                        .rounding(egui::Rounding::same(8.0))
-                        .min_size(Vec2::new(30.0, 24.0))
-                };
 
                 ui.horizontal(|ui| {
                     ui.label(
@@ -165,26 +204,49 @@ impl eframe::App for AppState {
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(icon_btn(egui::RichText::new("X").size(16.0).color(theme.fg)))
-                            .clicked()
+                        let close_icon =
+                            egui::Image::new(egui::include_image!("../../assets/x.png"))
+                                .tint(theme.fg);
+                        if title_bar_image_button(
+                            ui,
+                            close_icon,
+                            Vec2::splat(12.0),
+                            btn_fill,
+                            theme.top_border,
+                        )
+                        .clicked()
                         {
                             global_actions.push(TilesAction::Exit);
                         }
 
                         let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                        let max_label = if is_max { "\u{2750}" } else { "\u{25A1}" }; // restore / maximize
-                        if ui
-                            .add(icon_btn(egui::RichText::new(max_label).size(14.0).color(theme.fg)))
-                            .clicked()
+                        let maximize_icon =
+                            egui::Image::new(egui::include_image!("../../assets/square.png"))
+                                .tint(theme.fg);
+                        if title_bar_image_button(
+                            ui,
+                            maximize_icon,
+                            Vec2::splat(12.0),
+                            btn_fill,
+                            theme.top_border,
+                        )
+                        .clicked()
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
                         }
 
                         // Minimize button (taskbar or tray, depending on settings).
-                        if ui
-                            .add(icon_btn(egui::RichText::new("_").size(16.0).color(theme.fg)))
-                            .clicked()
+                        let minimize_icon =
+                            egui::Image::new(egui::include_image!("../../assets/minus.png"))
+                                .tint(theme.fg);
+                        if title_bar_image_button(
+                            ui,
+                            minimize_icon,
+                            Vec2::new(14.0, 14.0),
+                            btn_fill,
+                            theme.top_border,
+                        )
+                        .clicked()
                         {
                             if self.config.minimize_to_tray {
                                 self.minimize_to_tray_requested = true;
@@ -194,44 +256,40 @@ impl eframe::App for AppState {
                         }
 
                         let target = self.cog_target_tile();
-                        let (connecting, connected) = target
-                            .and_then(|id| self.pane(id))
-                            .map(|t| (t.connecting, t.connected))
-                            .unwrap_or((false, false));
 
-                        ui.menu_button(
-                            egui::RichText::new("\u{2699}").size(18.0).color(theme.fg),
-                            |ui| {
-                                let Some(tile_id) = target else {
-                                    ui.label(egui::RichText::new("No session").color(theme.muted));
-                                    return;
-                                };
+                        let settings_icon =
+                            egui::Image::new(egui::include_image!("../../assets/settings.png"))
+                                .tint(theme.fg);
+                        let settings_resp = title_bar_image_button(
+                            ui,
+                            settings_icon,
+                            Vec2::splat(14.0),
+                            btn_fill,
+                            theme.top_border,
+                        )
+                        .on_hover_text("Open Settings");
+                        if settings_resp.clicked() {
+                            if let Some(tile_id) = target {
+                                global_actions.push(TilesAction::OpenSettings(tile_id));
+                            }
+                        }
 
-                                if ui.button("Connect").clicked() {
-                                    global_actions.push(TilesAction::Connect(tile_id));
-                                    ui.close_menu();
-                                }
-
-                                if connecting || connected {
-                                    if ui.button("Disconnect").clicked() {
-                                        global_actions.push(TilesAction::ToggleConnect(tile_id));
-                                        ui.close_menu();
-                                    }
-                                }
-
-                                ui.separator();
-                                if ui.button("Settings").clicked() {
-                                    global_actions.push(TilesAction::OpenSettings(tile_id));
-                                    ui.close_menu();
-                                }
-
-                                ui.separator();
-                                if ui.button("Exit").clicked() {
-                                    global_actions.push(TilesAction::Exit);
-                                    ui.close_menu();
-                                }
-                            },
-                        );
+                        // Global downloads manager opener.
+                        let download_icon =
+                            egui::Image::new(egui::include_image!("../../assets/download.png"))
+                                .tint(theme.fg);
+                        if title_bar_image_button(
+                            ui,
+                            download_icon,
+                            Vec2::splat(14.0),
+                            btn_fill,
+                            theme.top_border,
+                        )
+                        .on_hover_text("Open Transfers Manager")
+                        .clicked()
+                        {
+                            self.downloads_window_open = true;
+                        }
                     });
                 });
             });
@@ -287,20 +345,27 @@ impl eframe::App for AppState {
                     color,
                     profile_name,
                 } => {
-                    let _ = self.add_new_pane_to_tabs_with_settings(tabs_container_id, settings, color, profile_name);
+                    let _ = self.add_new_pane_to_tabs_with_settings(
+                        tabs_container_id,
+                        settings,
+                        color,
+                        profile_name,
+                    );
                     self.layout_dirty = true;
                 }
                 TilesAction::TabActivated(tile_id) => {
                     if matches!(self.tree.tiles.get(tile_id), Some(Tile::Pane(_))) {
                         self.active_tile = Some(tile_id);
-                        self.settings_dialog.target_tile = Some(tile_id);
-                        self.set_focus_next_frame(tile_id);
+                        if self.terminal_pane(tile_id).is_some() {
+                            self.settings_dialog.target_tile = Some(tile_id);
+                            self.set_focus_next_frame(tile_id);
+                        }
                         self.layout_dirty = true;
                     }
                 }
                 TilesAction::Connect(tile_id) => {
                     let (missing_settings, connected_or_connecting) = self
-                        .pane(tile_id)
+                        .terminal_pane(tile_id)
                         .map(|t| {
                             (
                                 t.settings.host.trim().is_empty()
@@ -313,7 +378,7 @@ impl eframe::App for AppState {
                     if missing_settings || connected_or_connecting {
                         self.open_settings_dialog_for_tile(tile_id);
                         self.settings_dialog.page = SettingsPage::ProfilesAndAccount;
-                    } else if let Some(tab) = self.pane_mut(tile_id) {
+                    } else if let Some(tab) = self.terminal_pane_mut(tile_id) {
                         tab.start_connect();
                         tab.focus_terminal_next_frame = true;
                     }
@@ -322,7 +387,7 @@ impl eframe::App for AppState {
                 }
                 TilesAction::ToggleConnect(tile_id) => {
                     let needs_settings = self
-                        .pane(tile_id)
+                        .terminal_pane(tile_id)
                         .map(|t| {
                             t.settings.host.trim().is_empty()
                                 || t.settings.username.trim().is_empty()
@@ -330,7 +395,7 @@ impl eframe::App for AppState {
                         .unwrap_or(true);
                     if needs_settings {
                         self.open_settings_dialog_for_tile(tile_id);
-                    } else if let Some(tab) = self.pane_mut(tile_id) {
+                    } else if let Some(tab) = self.terminal_pane_mut(tile_id) {
                         if tab.connecting || tab.connected {
                             tab.disconnect();
                         } else {
@@ -344,12 +409,13 @@ impl eframe::App for AppState {
                 TilesAction::OpenSettings(tile_id) => {
                     self.open_settings_dialog_for_tile(tile_id);
                 }
+                TilesAction::OpenFileManager(tile_id) => {
+                    let _ = self.open_file_manager_for_terminal(tile_id);
+                    self.layout_dirty = true;
+                }
                 TilesAction::Rename(tile_id) => {
                     if let Some(tab) = self.pane(tile_id) {
-                        let initial = tab
-                            .user_title
-                            .clone()
-                            .unwrap_or_else(|| tab.title.clone());
+                        let initial = tab.user_title.clone().unwrap_or_else(|| tab.title.clone());
                         self.rename_popup = Some(RenamePopup {
                             tile_id,
                             value: initial,
@@ -366,6 +432,50 @@ impl eframe::App for AppState {
                 TilesAction::Split { pane_id, dir } => {
                     let _ = self.split_pane(pane_id, dir);
                     self.layout_dirty = true;
+                }
+                TilesAction::FileRefresh { pane_id, path } => {
+                    self.request_file_list(pane_id, path);
+                }
+                TilesAction::FileUp(pane_id) => {
+                    self.request_file_up(pane_id);
+                }
+                TilesAction::FileMkdir { pane_id, dir_name } => {
+                    self.request_file_mkdir(pane_id, dir_name);
+                    let path = self
+                        .file_pane(pane_id)
+                        .map(|f| f.cwd.clone())
+                        .unwrap_or_else(|| ".".to_string());
+                    self.request_file_list(pane_id, path);
+                }
+                TilesAction::FileRename {
+                    pane_id,
+                    from_name,
+                    to_name,
+                } => {
+                    self.request_file_rename(pane_id, from_name, to_name);
+                    let path = self
+                        .file_pane(pane_id)
+                        .map(|f| f.cwd.clone())
+                        .unwrap_or_else(|| ".".to_string());
+                    self.request_file_list(pane_id, path);
+                }
+                TilesAction::FileDelete {
+                    pane_id,
+                    name,
+                    is_dir,
+                } => {
+                    self.request_file_delete(pane_id, name, is_dir);
+                    let path = self
+                        .file_pane(pane_id)
+                        .map(|f| f.cwd.clone())
+                        .unwrap_or_else(|| ".".to_string());
+                    self.request_file_list(pane_id, path);
+                }
+                TilesAction::FileUpload { pane_id } => {
+                    let _ = self.start_upload_for_file(pane_id);
+                }
+                TilesAction::FileDownload { pane_id, name } => {
+                    self.start_download_for_file(pane_id, name);
                 }
                 TilesAction::Close(tile_id) => {
                     self.close_pane(tile_id);
@@ -446,11 +556,12 @@ impl eframe::App for AppState {
         handle_window_resize(ctx);
 
         self.draw_settings_dialog(ctx);
+        self.draw_host_key_dialog(ctx);
         self.draw_auth_dialog(ctx);
+        self.draw_downloads_manager_window(ctx);
 
         self.maybe_save_session_layout(ctx);
 
         self.clipboard = clipboard;
     }
 }
-

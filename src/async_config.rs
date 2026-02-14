@@ -111,4 +111,3 @@ fn saver_thread(rx: mpsc::Receiver<Msg>) {
         }
     }
 }
-

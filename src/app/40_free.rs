@@ -148,11 +148,42 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 fn adjust_color(c: Color32, delta: f32) -> Color32 {
     let (r, g, b, a) = c.to_tuple();
     let t = delta.abs().clamp(0.0, 1.0);
-    let (tr, tg, tb) = if delta >= 0.0 { (255u8, 255u8, 255u8) } else { (0u8, 0u8, 0u8) };
+    let (tr, tg, tb) = if delta >= 0.0 {
+        (255u8, 255u8, 255u8)
+    } else {
+        (0u8, 0u8, 0u8)
+    };
     let lerp = |x: u8, y: u8| -> u8 {
         (x as f32 + (y as f32 - x as f32) * t)
             .round()
             .clamp(0.0, 255.0) as u8
     };
     Color32::from_rgba_premultiplied(lerp(r, tr), lerp(g, tg), lerp(b, tb), a)
+}
+
+fn title_bar_icon_button<'a>(
+    button: egui::Button<'a>,
+    fill: Color32,
+    border: Color32,
+) -> egui::Button<'a> {
+    button
+        .fill(fill)
+        .stroke(Stroke::new(1.0, border))
+        .rounding(egui::Rounding::same(8.0))
+        .min_size(Vec2::new(30.0, 24.0))
+}
+
+fn title_bar_image_button(
+    ui: &mut egui::Ui,
+    icon: egui::Image<'_>,
+    icon_size: Vec2,
+    fill: Color32,
+    border: Color32,
+) -> Response {
+    let response = ui.add(title_bar_icon_button(egui::Button::new(""), fill, border));
+    if ui.is_rect_visible(response.rect) {
+        let icon_rect = Rect::from_center_size(response.rect.center(), icon_size);
+        icon.paint_at(ui, icon_rect);
+    }
+    response
 }

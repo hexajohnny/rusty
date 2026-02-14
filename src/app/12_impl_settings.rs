@@ -58,7 +58,9 @@ impl AppState {
     }
 
     fn load_profile_into_dialog(&mut self, idx: usize) {
-        let Some(p) = self.config.profiles.get(idx).cloned() else { return };
+        let Some(p) = self.config.profiles.get(idx).cloned() else {
+            return;
+        };
         self.settings_dialog.selected_profile = Some(idx);
         let draft = config::write_profile_settings(&p);
         self.settings_dialog.profile_name = p.name;
@@ -86,7 +88,8 @@ impl AppState {
             self.settings_dialog.selected_profile = Some(i);
         } else {
             self.config.profiles.push(profile);
-            self.settings_dialog.selected_profile = Some(self.config.profiles.len().saturating_sub(1));
+            self.settings_dialog.selected_profile =
+                Some(self.config.profiles.len().saturating_sub(1));
         }
 
         self.config_saver.request_save(self.config.clone());
@@ -113,7 +116,9 @@ impl AppState {
     }
 
     fn delete_selected_profile(&mut self) {
-        let Some(idx) = self.settings_dialog.selected_profile else { return };
+        let Some(idx) = self.settings_dialog.selected_profile else {
+            return;
+        };
         if idx >= self.config.profiles.len() {
             self.settings_dialog.selected_profile = None;
             return;
@@ -151,11 +156,13 @@ impl AppState {
                 if ui
                     .add(egui::SelectableLabel::new(
                         self.config.default_profile.is_none(),
-                        egui::RichText::new("None").color(if self.config.default_profile.is_none() {
-                            Color32::from_rgb(20, 20, 20)
-                        } else {
-                            theme.fg
-                        }),
+                        egui::RichText::new("None").color(
+                            if self.config.default_profile.is_none() {
+                                Color32::from_rgb(20, 20, 20)
+                            } else {
+                                theme.fg
+                            },
+                        ),
                     ))
                     .clicked()
                 {
@@ -169,7 +176,11 @@ impl AppState {
                         .as_deref()
                         .map(|d| d.eq_ignore_ascii_case(&p.name))
                         .unwrap_or(false);
-                    let text_color = if selected { Color32::from_rgb(20, 20, 20) } else { theme.fg };
+                    let text_color = if selected {
+                        Color32::from_rgb(20, 20, 20)
+                    } else {
+                        theme.fg
+                    };
                     if ui
                         .add(egui::SelectableLabel::new(
                             selected,
@@ -202,23 +213,51 @@ impl AppState {
         ui.label(egui::RichText::new(note).color(theme.muted));
     }
 
+    fn draw_settings_page_behavior(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme;
+
+        let before = self.config.minimize_to_tray;
+        ui.checkbox(&mut self.config.minimize_to_tray, "Minimize to tray");
+        if self.config.minimize_to_tray != before {
+            if !self.config.minimize_to_tray && self.hidden_to_tray {
+                // If we are currently hidden and the user disables tray minimize, bring the window back.
+                // (This will be a no-op if the backend ignores it.)
+                // Note: we don't have access to `ctx` here, so we just clear state and let update handle it.
+                self.hidden_to_tray = false;
+            }
+            self.config_saver.request_save(self.config.clone());
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "When enabled, the minimize button hides Rusty to the system tray.",
+            )
+            .color(theme.muted),
+        );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        let before = self.config.save_session_layout;
+        ui.checkbox(&mut self.config.save_session_layout, "Save session layout");
+        if self.config.save_session_layout != before {
+            self.layout_dirty = true;
+            // Save immediately so next startup uses the new preference.
+            self.config_saver.request_save(self.config.clone());
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Remembers splits/tabs and window position/size between launches.")
+                .color(theme.muted),
+        );
+    }
+
     fn draw_settings_page_appearance(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
         let ctx = ui.ctx().clone();
 
-        ui.label("UI color scheme");
-        let before_mode = self.config.ui_theme_mode;
         let before_theme_file = self.config.ui_theme_file.clone();
-        let mut reload_requested = false;
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.config.ui_theme_mode, config::UiThemeMode::Dark, "Dark");
-            ui.selectable_value(&mut self.config.ui_theme_mode, config::UiThemeMode::Light, "Light");
-            if ui.button("Reload Theme File").clicked() {
-                reload_requested = true;
-            }
-        });
-
-        ui.add_space(6.0);
         ui.label("Theme file (.thm)");
         let mode_file = default_theme_file_name(self.config.ui_theme_mode).to_string();
         let available_theme_files = available_theme_file_names();
@@ -260,18 +299,17 @@ impl AppState {
             });
         self.config.ui_theme_file = chosen_theme_file;
 
-        let mode_changed = self.config.ui_theme_mode != before_mode;
         let theme_file_changed = self.config.ui_theme_file != before_theme_file;
-        if mode_changed || theme_file_changed || reload_requested {
-            let (new_theme, source) =
-                load_ui_theme(self.config.ui_theme_mode, self.config.ui_theme_file.as_deref());
+        if theme_file_changed {
+            let (new_theme, source) = load_ui_theme(
+                self.config.ui_theme_mode,
+                self.config.ui_theme_file.as_deref(),
+            );
             self.theme = new_theme;
             self.theme_source = source;
             self.apply_global_style(&ctx);
             self.style_initialized = true;
-            if mode_changed || theme_file_changed {
-                self.config_saver.request_save(self.config.clone());
-            }
+            self.config_saver.request_save(self.config.clone());
         }
 
         if let Some(path) = self.theme_source.as_ref() {
@@ -285,7 +323,7 @@ impl AppState {
                 format!("Using built-in fallback (theme file '{file}' not found or invalid).")
             } else {
                 format!(
-                    "Using built-in fallback (missing ./theme/{mode_file} near the executable)."
+                    "Using built-in fallback (missing {mode_file} in ./theme, ./dist/theme, or near the executable)."
                 )
             };
             ui.label(egui::RichText::new(msg).color(theme.muted).size(12.0));
@@ -327,7 +365,10 @@ impl AppState {
         // Note: on the release-frame `resp.changed()` may be false, so key off `drag_released`.
         if resp.drag_released() {
             self.config_saver.request_save(self.config.clone());
-        } else if resp.changed() && !resp.dragged() && (self.config.terminal_font_size - before).abs() > f32::EPSILON {
+        } else if resp.changed()
+            && !resp.dragged()
+            && (self.config.terminal_font_size - before).abs() > f32::EPSILON
+        {
             self.config_saver.request_save(self.config.clone());
         }
 
@@ -359,46 +400,10 @@ impl AppState {
         }
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("Applies on new connections (reconnect existing tabs to take effect).")
-                .color(theme.muted),
-        );
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(10.0);
-
-        let before = self.config.minimize_to_tray;
-        ui.checkbox(&mut self.config.minimize_to_tray, "Minimize to tray");
-        if self.config.minimize_to_tray != before {
-            if !self.config.minimize_to_tray && self.hidden_to_tray {
-                // If we are currently hidden and the user disables tray minimize, bring the window back.
-                // (This will be a no-op if the backend ignores it.)
-                // Note: we don't have access to `ctx` here, so we just clear state and let update handle it.
-                self.hidden_to_tray = false;
-            }
-            self.config_saver.request_save(self.config.clone());
-        }
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("When enabled, the minimize button hides Rusty to the system tray.")
-                .color(theme.muted),
-        );
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(10.0);
-
-        let before = self.config.save_session_layout;
-        ui.checkbox(&mut self.config.save_session_layout, "Save session layout");
-        if self.config.save_session_layout != before {
-            self.layout_dirty = true;
-            // Save immediately so next startup uses the new preference.
-            self.config_saver.request_save(self.config.clone());
-        }
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("Remembers splits/tabs and window position/size between launches.")
-                .color(theme.muted),
+            egui::RichText::new(
+                "Applies on new connections (reconnect existing tabs to take effect).",
+            )
+            .color(theme.muted),
         );
     }
 
@@ -468,7 +473,9 @@ impl AppState {
         );
         ui.add_space(8.0);
 
-        const NAMES: [&str; 8] = ["Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White"];
+        const NAMES: [&str; 8] = [
+            "Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White",
+        ];
         egui::Grid::new("terminal_palette16_grid")
             .num_columns(4)
             .spacing(Vec2::new(12.0, 10.0))
@@ -486,7 +493,8 @@ impl AppState {
                     let mut c1 = self.config.terminal_colors.palette16[i + 8].to_array();
                     let r1 = ui.color_edit_button_srgb(&mut c1);
                     if r1.changed() {
-                        self.config.terminal_colors.palette16[i + 8] = config::RgbColor::from_array(c1);
+                        self.config.terminal_colors.palette16[i + 8] =
+                            config::RgbColor::from_array(c1);
                         changed = true;
                     }
                     ui.end_row();
@@ -518,70 +526,74 @@ impl AppState {
             .id_source("settings_profiles_list_scroll")
             .max_height(140.0)
             .show(ui, |ui| {
-            let mut load_idx: Option<usize> = None;
-            let mut delete_idx: Option<usize> = None;
-            let mut set_default_idx: Option<usize> = None;
-            let mut clear_default = false;
-            for (i, p) in self.config.profiles.iter().enumerate() {
-                let selected = self.settings_dialog.selected_profile == Some(i);
-                let label = config::profile_display_name(p, &self.config);
-                let text_color = if selected { Color32::from_rgb(20, 20, 20) } else { theme.fg };
-                let is_default = self
-                    .config
-                    .default_profile
-                    .as_deref()
-                    .map(|d| d.eq_ignore_ascii_case(&p.name))
-                    .unwrap_or(false);
-                let resp = ui.add(egui::SelectableLabel::new(
-                    selected,
-                    egui::RichText::new(label).color(text_color),
-                ));
-                if resp.clicked() {
-                    load_idx = Some(i);
-                }
-                resp.context_menu(|ui: &mut egui::Ui| {
-                    if is_default {
-                        if ui.button("Clear Default Profile").clicked() {
-                            clear_default = true;
+                let mut load_idx: Option<usize> = None;
+                let mut delete_idx: Option<usize> = None;
+                let mut set_default_idx: Option<usize> = None;
+                let mut clear_default = false;
+                for (i, p) in self.config.profiles.iter().enumerate() {
+                    let selected = self.settings_dialog.selected_profile == Some(i);
+                    let label = config::profile_display_name(p, &self.config);
+                    let text_color = if selected {
+                        Color32::from_rgb(20, 20, 20)
+                    } else {
+                        theme.fg
+                    };
+                    let is_default = self
+                        .config
+                        .default_profile
+                        .as_deref()
+                        .map(|d| d.eq_ignore_ascii_case(&p.name))
+                        .unwrap_or(false);
+                    let resp = ui.add(egui::SelectableLabel::new(
+                        selected,
+                        egui::RichText::new(label).color(text_color),
+                    ));
+                    if resp.clicked() {
+                        load_idx = Some(i);
+                    }
+                    resp.context_menu(|ui: &mut egui::Ui| {
+                        if is_default {
+                            if ui.button("Clear Default Profile").clicked() {
+                                clear_default = true;
+                                ui.close_menu();
+                            }
+                        } else if ui.button("Set As Default Profile").clicked() {
+                            set_default_idx = Some(i);
                             ui.close_menu();
                         }
-                    } else if ui.button("Set As Default Profile").clicked() {
-                        set_default_idx = Some(i);
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Delete Profile").clicked() {
-                        delete_idx = Some(i);
-                        ui.close_menu();
-                    }
-                });
-            }
-            if self.config.profiles.is_empty() {
-                ui.label(egui::RichText::new("No profiles yet.").color(theme.muted));
-            }
+                        ui.separator();
+                        if ui.button("Delete Profile").clicked() {
+                            delete_idx = Some(i);
+                            ui.close_menu();
+                        }
+                    });
+                }
+                if self.config.profiles.is_empty() {
+                    ui.label(egui::RichText::new("No profiles yet.").color(theme.muted));
+                }
 
-            if clear_default {
-                self.config.default_profile = None;
-                self.config_saver.request_save(self.config.clone());
-            }
-
-            if let Some(i) = set_default_idx {
-                if let Some(profile) = self.config.profiles.get(i) {
-                    self.config.default_profile = Some(profile.name.clone());
+                if clear_default {
+                    self.config.default_profile = None;
                     self.config_saver.request_save(self.config.clone());
                 }
-            }
 
-            if let Some(i) = delete_idx {
-                self.settings_dialog.selected_profile = Some(i);
-                self.delete_selected_profile();
-                return;
-            }
+                if let Some(i) = set_default_idx {
+                    if let Some(profile) = self.config.profiles.get(i) {
+                        self.config.default_profile = Some(profile.name.clone());
+                        self.config_saver.request_save(self.config.clone());
+                    }
+                }
 
-            if let Some(i) = load_idx {
-                self.load_profile_into_dialog(i);
-            }
-        });
+                if let Some(i) = delete_idx {
+                    self.settings_dialog.selected_profile = Some(i);
+                    self.delete_selected_profile();
+                    return;
+                }
+
+                if let Some(i) = load_idx {
+                    self.load_profile_into_dialog(i);
+                }
+            });
 
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
@@ -604,9 +616,20 @@ impl AppState {
                 self.delete_selected_profile();
             }
 
-            let can_save = !self.settings_dialog.profile_name.trim().is_empty();
-            if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
-                self.upsert_profile_from_dialog();
+            let selected_profile_name = self
+                .settings_dialog
+                .selected_profile
+                .and_then(|i| self.config.profiles.get(i))
+                .map(|p| p.name.clone());
+            if ui
+                .add_enabled(
+                    selected_profile_name.is_some(),
+                    egui::Button::new("Make Default"),
+                )
+                .clicked()
+            {
+                self.config.default_profile = selected_profile_name;
+                self.config_saver.request_save(self.config.clone());
             }
         });
 
@@ -623,7 +646,10 @@ impl AppState {
         }
 
         ui.add_space(6.0);
-        ui.checkbox(&mut self.settings_dialog.remember_password, "Remember password");
+        ui.checkbox(
+            &mut self.settings_dialog.remember_password,
+            "Remember password",
+        );
         if self.settings_dialog.remember_password {
             ui.label(
                 egui::RichText::new("Stored encrypted in a local config file (Windows DPAPI).")
@@ -658,7 +684,6 @@ impl AppState {
         ui.label("User");
         ui.add(
             egui::TextEdit::singleline(&mut self.settings_dialog.draft.username)
-                .hint_text("root")
                 .desired_width(ui.available_width()),
         );
         ui.add_space(6.0);
@@ -711,6 +736,7 @@ impl AppState {
 
         ui.add_space(12.0);
 
+        let can_save = !self.settings_dialog.profile_name.trim().is_empty();
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
             if ui.button("Close").clicked() {
                 self.settings_dialog.open = false;
@@ -744,10 +770,22 @@ impl AppState {
                 }
                 self.settings_dialog.open = false;
             }
+
+            if ui
+                .add_enabled(can_save, egui::Button::new("Save"))
+                .clicked()
+            {
+                self.upsert_profile_from_dialog();
+            }
         });
     }
 
-    fn draw_settings_contents(&mut self, ui: &mut egui::Ui, theme: UiTheme, _section_frame: &egui::Frame) {
+    fn draw_settings_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: UiTheme,
+        _section_frame: &egui::Frame,
+    ) {
         ui.visuals_mut().override_text_color = Some(theme.fg);
         ui.spacing_mut().item_spacing = Vec2::new(8.0, 10.0);
 
@@ -779,91 +817,106 @@ impl AppState {
             let (nav_rect, _) = ui.allocate_exact_size(Vec2::new(nav_w, avail_h), Sense::hover());
             ui.painter()
                 .rect_filled(nav_rect, panel_rounding, adjust_color(theme.top_bg, 0.10));
-            ui.painter().rect_stroke(nav_rect, panel_rounding, panel_stroke);
+            ui.painter()
+                .rect_stroke(nav_rect, panel_rounding, panel_stroke);
             let nav_inner = nav_rect.shrink(12.0);
             let mut nav_ui = ui.child_ui(nav_inner, egui::Layout::top_down(Align::Min));
             nav_ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-            nav_ui.label(egui::RichText::new("Sections").color(theme.muted).size(12.0));
+            nav_ui.label(
+                egui::RichText::new("Sections")
+                    .color(theme.muted)
+                    .size(12.0),
+            );
             nav_ui.add_space(6.0);
 
             egui::ScrollArea::vertical()
                 .id_source("settings_nav_scroll")
                 .auto_shrink([false, false])
                 .show(&mut nav_ui, |ui| {
-                let item_h = 34.0;
-                let rounding = egui::Rounding::same(10.0);
-                let font_id = FontId::proportional(16.0);
+                    let item_h = 34.0;
+                    let rounding = egui::Rounding::same(10.0);
+                    let font_id = FontId::proportional(16.0);
 
-                let mut item = |ui: &mut egui::Ui, page: SettingsPage| {
-                    let selected = self.settings_dialog.page == page;
-                    let text = egui::WidgetText::from(page.label());
-                    let galley = text.into_galley(ui, Some(false), f32::INFINITY, font_id.clone());
+                    let mut item = |ui: &mut egui::Ui, page: SettingsPage| {
+                        let selected = self.settings_dialog.page == page;
+                        let text = egui::WidgetText::from(page.label());
+                        let galley =
+                            text.into_galley(ui, Some(false), f32::INFINITY, font_id.clone());
 
-                    let (rect, resp) =
-                        ui.allocate_exact_size(Vec2::new(ui.available_width(), item_h), Sense::click());
-                    let hovered = resp.hovered();
+                        let (rect, resp) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), item_h),
+                            Sense::click(),
+                        );
+                        let hovered = resp.hovered();
 
-                    let fill = if selected {
-                        adjust_color(theme.top_bg, 0.16)
-                    } else if hovered {
-                        adjust_color(theme.top_bg, 0.10)
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    let stroke = if selected {
-                        Stroke::new(1.0, theme.accent)
-                    } else if hovered {
-                        Stroke::new(1.0, theme.top_border)
-                    } else {
-                        Stroke::NONE
-                    };
-                    let text_color = if selected { theme.accent } else { theme.fg };
+                        let fill = if selected {
+                            adjust_color(theme.top_bg, 0.16)
+                        } else if hovered {
+                            adjust_color(theme.top_bg, 0.10)
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let stroke = if selected {
+                            Stroke::new(1.0, theme.accent)
+                        } else if hovered {
+                            Stroke::new(1.0, theme.top_border)
+                        } else {
+                            Stroke::NONE
+                        };
+                        let text_color = if selected { theme.accent } else { theme.fg };
 
-                    if ui.is_rect_visible(rect) {
-                        if fill != Color32::TRANSPARENT {
-                            ui.painter().rect_filled(rect, rounding, fill);
-                        }
-                        if stroke != Stroke::NONE {
-                            ui.painter().rect_stroke(rect, rounding, stroke);
-                        }
+                        if ui.is_rect_visible(rect) {
+                            if fill != Color32::TRANSPARENT {
+                                ui.painter().rect_filled(rect, rounding, fill);
+                            }
+                            if stroke != Stroke::NONE {
+                                ui.painter().rect_stroke(rect, rounding, stroke);
+                            }
 
-                        if selected {
-                            let bar_w = 4.0;
-                            let bar = Rect::from_min_max(
-                                rect.min,
-                                Pos2::new(rect.min.x + bar_w, rect.max.y),
+                            if selected {
+                                let bar_w = 4.0;
+                                let bar = Rect::from_min_max(
+                                    rect.min,
+                                    Pos2::new(rect.min.x + bar_w, rect.max.y),
+                                );
+                                let bar_rounding = egui::Rounding {
+                                    nw: rounding.nw,
+                                    sw: rounding.sw,
+                                    ne: 0.0,
+                                    se: 0.0,
+                                };
+                                ui.painter().rect_filled(bar, bar_rounding, theme.accent);
+                            }
+
+                            let text_pos = Pos2::new(
+                                rect.left() + 14.0,
+                                rect.center().y - galley.size().y * 0.5,
                             );
-                            let bar_rounding = egui::Rounding {
-                                nw: rounding.nw,
-                                sw: rounding.sw,
-                                ne: 0.0,
-                                se: 0.0,
-                            };
-                            ui.painter().rect_filled(bar, bar_rounding, theme.accent);
+                            ui.painter().galley(text_pos, galley, text_color);
                         }
 
-                        let text_pos = Pos2::new(rect.left() + 14.0, rect.center().y - galley.size().y * 0.5);
-                        ui.painter().galley(text_pos, galley, text_color);
-                    }
+                        if resp.clicked() {
+                            self.settings_dialog.page = page;
+                        }
+                    };
 
-                    if resp.clicked() {
-                        self.settings_dialog.page = page;
-                    }
-                };
-
-                item(ui, SettingsPage::Autostart);
-                item(ui, SettingsPage::Appearance);
-                item(ui, SettingsPage::TerminalColors);
-                item(ui, SettingsPage::ProfilesAndAccount);
-            });
+                    item(ui, SettingsPage::Autostart);
+                    item(ui, SettingsPage::Behavior);
+                    item(ui, SettingsPage::Appearance);
+                    item(ui, SettingsPage::TerminalColors);
+                    item(ui, SettingsPage::ProfilesAndAccount);
+                });
 
             ui.add_space(gap);
 
             let content_w = ui.available_width().max(10.0);
             let (content_rect, _) =
                 ui.allocate_exact_size(Vec2::new(content_w, avail_h), Sense::hover());
-            ui.painter()
-                .rect_filled(content_rect, panel_rounding, adjust_color(theme.top_bg, 0.10));
+            ui.painter().rect_filled(
+                content_rect,
+                panel_rounding,
+                adjust_color(theme.top_bg, 0.10),
+            );
             ui.painter()
                 .rect_stroke(content_rect, panel_rounding, panel_stroke);
             let content_inner = content_rect.shrink(12.0);
@@ -874,9 +927,12 @@ impl AppState {
                 .auto_shrink([false, false])
                 .show(&mut content_ui, |ui| match self.settings_dialog.page {
                     SettingsPage::Autostart => self.draw_settings_page_autostart(ui),
+                    SettingsPage::Behavior => self.draw_settings_page_behavior(ui),
                     SettingsPage::Appearance => self.draw_settings_page_appearance(ui),
                     SettingsPage::TerminalColors => self.draw_settings_page_terminal_colors(ui),
-                    SettingsPage::ProfilesAndAccount => self.draw_settings_page_profiles_and_account(ui),
+                    SettingsPage::ProfilesAndAccount => {
+                        self.draw_settings_page_profiles_and_account(ui)
+                    }
                 });
         });
     }
@@ -887,13 +943,21 @@ impl AppState {
         }
 
         let viewport_id = egui::ViewportId::from_hash_of("rusty_settings_viewport");
-        let builder = egui::ViewportBuilder::default()
+        let force_front = self.settings_dialog.just_opened;
+        let mut builder = egui::ViewportBuilder::default()
             .with_title("Rusty Settings")
             .with_inner_size(Vec2::new(640.0, 720.0))
             .with_min_inner_size(Vec2::new(420.0, 520.0))
             .with_resizable(true);
+        if force_front {
+            builder = builder.with_active(true);
+        }
 
         ctx.show_viewport_immediate(viewport_id, builder, |ctx, class| {
+            if force_front && !matches!(class, egui::ViewportClass::Embedded) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
             if ctx.input(|i| i.viewport().close_requested()) {
                 self.settings_dialog.open = false;
             }
@@ -938,8 +1002,139 @@ impl AppState {
         });
     }
 
+    fn draw_host_key_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.host_key_dialog.take() else {
+            return;
+        };
+
+        // If the tab was closed while waiting on user input, drop this prompt.
+        if !matches!(self.tree.tiles.get(dialog.tile_id), Some(Tile::Pane(_))) {
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        let overlay_id =
+            egui::LayerId::new(egui::Order::PanelResizeLine, Id::new("host_key_modal_bg"));
+        let painter = ctx.layer_painter(overlay_id);
+        painter.rect_filled(
+            screen_rect,
+            0.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+        );
+
+        let mut decision: Option<ssh::HostKeyDecision> = None;
+        let mut open = true;
+
+        let win_w = (screen_rect.width() * 0.90).clamp(420.0, 640.0);
+        let win_h = (screen_rect.height() * 0.65).clamp(300.0, 420.0);
+        let pad = 10.0;
+        let mut x = screen_rect.center().x - win_w * 0.5;
+        let mut y = screen_rect.center().y - win_h * 0.5;
+        let min_x = screen_rect.left() + pad;
+        let min_y = screen_rect.top() + pad;
+        let max_x = (screen_rect.right() - win_w - pad).max(min_x);
+        let max_y = (screen_rect.bottom() - win_h - pad).max(min_y);
+        x = x.clamp(min_x, max_x);
+        y = y.clamp(min_y, max_y);
+        let win_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(win_w, win_h));
+
+        let frame = egui::Frame::none()
+            .fill(adjust_color(self.theme.top_bg, 0.06))
+            .stroke(Stroke::new(1.0, self.theme.top_border))
+            .rounding(egui::Rounding::same(12.0))
+            .shadow(egui::epaint::Shadow::big_dark())
+            .inner_margin(egui::Margin::same(12.0));
+
+        egui::Window::new("Host Key Verification")
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .fixed_rect(win_rect)
+            .frame(frame)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.visuals_mut().override_text_color = Some(self.theme.fg);
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Unknown Host Key")
+                            .strong()
+                            .size(18.0)
+                            .color(self.theme.accent),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Reject").clicked() {
+                            decision = Some(ssh::HostKeyDecision::Reject);
+                        }
+                    });
+                });
+                ui.separator();
+
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Host: {}:{}",
+                        dialog.prompt.host, dialog.prompt.port
+                    ))
+                    .strong(),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Algorithm: {}", dialog.prompt.algorithm))
+                        .color(self.theme.muted),
+                );
+                ui.add_space(4.0);
+
+                ui.label(egui::RichText::new("SHA256 fingerprint").strong());
+                egui::ScrollArea::vertical()
+                    .id_source(("hostkey_fp_scroll", dialog.tile_id))
+                    .max_height(56.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.monospace(&dialog.prompt.fingerprint);
+                    });
+                ui.add_space(4.0);
+
+                ui.label(
+                    egui::RichText::new(format!(
+                        "If trusted, this key will be pinned to:\n{}",
+                        dialog.prompt.known_hosts_path
+                    ))
+                    .color(self.theme.muted),
+                );
+                ui.add_space(10.0);
+
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    let trust = ui.add(egui::Button::new("Trust & Save"));
+                    if trust.clicked() {
+                        decision = Some(ssh::HostKeyDecision::TrustAndSave);
+                    }
+                });
+            });
+
+        if !open && decision.is_none() {
+            decision = Some(ssh::HostKeyDecision::Reject);
+        }
+
+        if let Some(decision) = decision {
+            if let Some(tab) = self.pane_mut(dialog.tile_id) {
+                if let Some(tx) = tab.host_key_tx.as_ref() {
+                    let _ = tx.send(decision);
+                }
+                if decision == ssh::HostKeyDecision::Reject {
+                    if let Some(tx) = tab.worker_tx.as_ref() {
+                        let _ = tx.send(WorkerMessage::Disconnect);
+                    }
+                }
+            }
+        } else {
+            self.host_key_dialog = Some(dialog);
+        }
+    }
+
     fn draw_auth_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut auth) = self.auth_dialog.take() else { return };
+        let Some(mut auth) = self.auth_dialog.take() else {
+            return;
+        };
         auth.responses.resize(auth.prompts.len(), String::new());
 
         // If the tab went away (closed) or no longer exists, drop the prompt.
@@ -1035,20 +1230,21 @@ impl AppState {
                     .id_source(("auth_prompts_scroll", auth.tile_id))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                    let field_w = ui.available_width().min(360.0);
-                    for (i, p) in auth.prompts.iter().enumerate() {
-                        ui.label(egui::RichText::new(&p.text).strong());
-                        let edit = egui::TextEdit::singleline(auth.responses.get_mut(i).unwrap())
-                            .password(!p.echo)
-                            .desired_width(field_w);
-                        let resp = ui.add(edit);
-                        if auth.just_opened && i == 0 {
-                            resp.request_focus();
+                        let field_w = ui.available_width().min(360.0);
+                        for (i, p) in auth.prompts.iter().enumerate() {
+                            ui.label(egui::RichText::new(&p.text).strong());
+                            let edit =
+                                egui::TextEdit::singleline(auth.responses.get_mut(i).unwrap())
+                                    .password(!p.echo)
+                                    .desired_width(field_w);
+                            let resp = ui.add(edit);
+                            if auth.just_opened && i == 0 {
+                                resp.request_focus();
+                            }
+                            ui.add_space(8.0);
                         }
-                        ui.add_space(8.0);
-                    }
-                    auth.just_opened = false;
-                });
+                        auth.just_opened = false;
+                    });
 
                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let can_continue = if is_key_passphrase_prompt {
@@ -1066,12 +1262,25 @@ impl AppState {
                     ui.add_space(2.0);
                     let can_remember = auth.profile_name.is_some();
                     ui.add_enabled_ui(can_remember, |ui| {
-                        ui.checkbox(&mut auth.remember_key_passphrase, "Remember key passphrase for this profile");
+                        ui.checkbox(
+                            &mut auth.remember_key_passphrase,
+                            "Remember key passphrase for this profile",
+                        );
                     });
                     if !can_remember {
-                        ui.label(egui::RichText::new("Open this session from a saved profile to enable remembering.").color(self.theme.muted).size(12.0));
+                        ui.label(
+                            egui::RichText::new(
+                                "Open this session from a saved profile to enable remembering.",
+                            )
+                            .color(self.theme.muted)
+                            .size(12.0),
+                        );
                     } else {
-                        ui.label(egui::RichText::new("Saved encrypted (Windows DPAPI).").color(self.theme.muted).size(12.0));
+                        ui.label(
+                            egui::RichText::new("Saved encrypted (Windows DPAPI).")
+                                .color(self.theme.muted)
+                                .size(12.0),
+                        );
                     }
                 }
 
@@ -1129,5 +1338,4 @@ impl AppState {
             self.auth_dialog = Some(auth);
         }
     }
-
 }

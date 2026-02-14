@@ -10,7 +10,7 @@ use crate::{crypto, logger};
 const CFG_MAGIC_PREFIX: &str = "RUSTYCFG1:";
 
 fn default_terminal_font_size() -> f32 {
-    16.0
+    14.0
 }
 
 fn default_terminal_scrollback_lines() -> usize {
@@ -119,6 +119,37 @@ impl Default for TerminalColorsConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirectionConfig {
+    Download,
+    Upload,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferStateConfig {
+    Queued,
+    Running,
+    Finished,
+    Failed,
+    Canceled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TransferHistoryEntry {
+    pub request_id: u64,
+    pub direction: TransferDirectionConfig,
+    pub settings: ConnectionSettings,
+    pub remote_path: String,
+    pub local_path: String,
+    pub transferred_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub speed_bps: f64,
+    pub state: TransferStateConfig,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     pub profiles: Vec<ConnectionProfile>,
@@ -144,6 +175,8 @@ pub struct AppConfig {
     pub saved_window: Option<SavedWindow>,
     #[serde(default)]
     pub terminal_colors: TerminalColorsConfig,
+    #[serde(default)]
+    pub transfer_history: Vec<TransferHistoryEntry>,
 }
 
 impl Default for AppConfig {
@@ -162,6 +195,7 @@ impl Default for AppConfig {
             saved_session_layout_json: None,
             saved_window: None,
             terminal_colors: TerminalColorsConfig::default(),
+            transfer_history: Vec::new(),
         }
     }
 }
@@ -227,7 +261,9 @@ pub fn load() -> AppConfig {
         serde_json::from_slice::<AppConfig>(&bytes).ok()
     };
 
-    let Some(cfg) = parsed else { return AppConfig::default() };
+    let Some(cfg) = parsed else {
+        return AppConfig::default();
+    };
 
     // Best-effort migration: rewrite plaintext configs encrypted, and migrate from the legacy
     // directory to the current one.
@@ -258,7 +294,10 @@ pub fn save(cfg: &AppConfig) {
         }
         Err(err) => {
             // If encryption fails for some reason, avoid breaking the app; log and fall back.
-            logger::log_line("logs\\config.log", &format!("Config encryption failed: {err}"));
+            logger::log_line(
+                "logs\\config.log",
+                &format!("Config encryption failed: {err}"),
+            );
             json
         }
     };
@@ -277,7 +316,9 @@ pub fn save(cfg: &AppConfig) {
 }
 
 pub fn find_profile_index(cfg: &AppConfig, name: &str) -> Option<usize> {
-    cfg.profiles.iter().position(|p| p.name.eq_ignore_ascii_case(name))
+    cfg.profiles
+        .iter()
+        .position(|p| p.name.eq_ignore_ascii_case(name))
 }
 
 pub fn profile_display_name(p: &ConnectionProfile, cfg: &AppConfig) -> String {

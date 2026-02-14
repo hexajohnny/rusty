@@ -7,5 +7,7 @@ include!("app/11_impl_terminal_helpers.rs");
 include!("app/12_impl_settings.rs");
 include!("app/13_impl_terminal_view.rs");
 include!("app/20_tiles.rs");
+include!("app/21_impl_file_manager_view.rs");
+include!("app/22_impl_downloads_window.rs");
 include!("app/30_app_impl.rs");
 include!("app/40_free.rs");

@@ -1,22 +1,34 @@
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
 
 use arboard::Clipboard;
-use egui_tiles::{
-    Behavior as TilesBehavior, Container, LinearDir, SimplificationOptions, Tile, TileId, Tiles,
-    Tree, UiResponse,
-};
 use eframe::egui;
 use eframe::egui::{
     text::{LayoutJob, TextFormat},
     Align, Color32, EventFilter, FontId, Id, Pos2, Rect, Response, Sense, Stroke, Vec2,
 };
+use egui_tiles::{
+    Behavior as TilesBehavior, Container, LinearDir, SimplificationOptions, Tile, TileId, Tiles,
+    Tree, UiResponse,
+};
 
+use crate::async_config::AsyncConfigSaver;
 use crate::config;
 use crate::model::ConnectionSettings;
 use crate::ssh::{self, UiMessage, WorkerMessage};
-use crate::async_config::AsyncConfigSaver;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PersistedPaneKind {
+    #[default]
+    Terminal,
+    FileManager {
+        source_terminal: TileId,
+        path: String,
+    },
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct PersistedTab {
@@ -28,6 +40,8 @@ struct PersistedTab {
     scrollback_len: usize,
     #[serde(default)]
     autoconnect: bool,
+    #[serde(default)]
+    pane_kind: PersistedPaneKind,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -36,7 +50,7 @@ struct PersistedSession {
     active_tile: Option<TileId>,
 }
 
-const TERM_FONT_SIZE_DEFAULT: f32 = 16.0;
+const TERM_FONT_SIZE_DEFAULT: f32 = 14.0;
 const TERM_FONT_SIZE_MIN: f32 = 10.0;
 const TERM_FONT_SIZE_MAX: f32 = 28.0;
 const TERM_PAD_X: f32 = 1.0;
@@ -87,22 +101,22 @@ impl Default for TermTheme {
             bg: Color32::from_rgb(0, 0, 0),
             fg: Color32::from_rgb(220, 220, 220),
             palette16: [
-                Color32::from_rgb(0, 0, 0),         // 0 black
-                Color32::from_rgb(205, 49, 49),     // 1 red
-                Color32::from_rgb(13, 188, 121),    // 2 green
-                Color32::from_rgb(229, 229, 16),    // 3 yellow
-                Color32::from_rgb(36, 114, 200),    // 4 blue
-                Color32::from_rgb(188, 63, 188),    // 5 magenta
-                Color32::from_rgb(17, 168, 205),    // 6 cyan
-                Color32::from_rgb(229, 229, 229),   // 7 white
-                Color32::from_rgb(102, 102, 102),   // 8 bright black (gray)
-                Color32::from_rgb(241, 76, 76),     // 9 bright red
-                Color32::from_rgb(35, 209, 139),    // 10 bright green
-                Color32::from_rgb(245, 245, 67),    // 11 bright yellow
-                Color32::from_rgb(59, 142, 234),    // 12 bright blue
-                Color32::from_rgb(214, 112, 214),   // 13 bright magenta
-                Color32::from_rgb(41, 184, 219),    // 14 bright cyan
-                Color32::from_rgb(255, 255, 255),   // 15 bright white
+                Color32::from_rgb(0, 0, 0),       // 0 black
+                Color32::from_rgb(205, 49, 49),   // 1 red
+                Color32::from_rgb(13, 188, 121),  // 2 green
+                Color32::from_rgb(229, 229, 16),  // 3 yellow
+                Color32::from_rgb(36, 114, 200),  // 4 blue
+                Color32::from_rgb(188, 63, 188),  // 5 magenta
+                Color32::from_rgb(17, 168, 205),  // 6 cyan
+                Color32::from_rgb(229, 229, 229), // 7 white
+                Color32::from_rgb(102, 102, 102), // 8 bright black (gray)
+                Color32::from_rgb(241, 76, 76),   // 9 bright red
+                Color32::from_rgb(35, 209, 139),  // 10 bright green
+                Color32::from_rgb(245, 245, 67),  // 11 bright yellow
+                Color32::from_rgb(59, 142, 234),  // 12 bright blue
+                Color32::from_rgb(214, 112, 214), // 13 bright magenta
+                Color32::from_rgb(41, 184, 219),  // 14 bright cyan
+                Color32::from_rgb(255, 255, 255), // 15 bright white
             ],
             dim_blend: 0.38,
         }
@@ -211,6 +225,24 @@ fn parse_theme_rgb(value: &str) -> Option<Color32> {
     Some(Color32::from_rgb(r, g, b))
 }
 
+fn for_each_theme_kv(text: &str, mut f: impl FnMut(&str, &str)) {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, raw)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = raw.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        f(key, value);
+    }
+}
+
 fn default_theme_file_name(mode: config::UiThemeMode) -> &'static str {
     match mode {
         config::UiThemeMode::Dark => "Dark.thm",
@@ -220,17 +252,21 @@ fn default_theme_file_name(mode: config::UiThemeMode) -> &'static str {
 
 fn theme_dir_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    let mut push_unique = |path: PathBuf| {
+        if !dirs.iter().any(|p| p == &path) {
+            dirs.push(path);
+        }
+    };
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            dirs.push(dir.join("theme"));
+            push_unique(dir.join("theme"));
+            push_unique(dir.join("dist").join("theme"));
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
-        let candidate = cwd.join("theme");
-        if !dirs.iter().any(|p| p == &candidate) {
-            dirs.push(candidate);
-        }
+        push_unique(cwd.join("theme"));
+        push_unique(cwd.join("dist").join("theme"));
     }
     dirs
 }
@@ -247,7 +283,10 @@ fn normalize_theme_file_name(file: Option<&str>) -> Option<String> {
     if raw.is_empty() {
         return None;
     }
-    let file_name = std::path::Path::new(raw).file_name()?.to_string_lossy().to_string();
+    let file_name = std::path::Path::new(raw)
+        .file_name()?
+        .to_string_lossy()
+        .to_string();
     if file_name.trim().is_empty() {
         None
     } else {
@@ -287,7 +326,10 @@ fn available_theme_file_names() -> Vec<String> {
     names
 }
 
-fn load_ui_theme(mode: config::UiThemeMode, selected_file: Option<&str>) -> (UiTheme, Option<PathBuf>) {
+fn load_ui_theme(
+    mode: config::UiThemeMode,
+    selected_file: Option<&str>,
+) -> (UiTheme, Option<PathBuf>) {
     let mut theme = match mode {
         config::UiThemeMode::Dark => UiTheme::default(),
         config::UiThemeMode::Light => UiTheme::light_default(),
@@ -298,7 +340,10 @@ fn load_ui_theme(mode: config::UiThemeMode, selected_file: Option<&str>) -> (UiT
         candidates.push(selected);
     }
     let mode_default = default_theme_file_name(mode).to_string();
-    if !candidates.iter().any(|f| f.eq_ignore_ascii_case(&mode_default)) {
+    if !candidates
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(&mode_default))
+    {
         candidates.push(mode_default);
     }
 
@@ -308,28 +353,24 @@ fn load_ui_theme(mode: config::UiThemeMode, selected_file: Option<&str>) -> (UiT
                 continue;
             };
 
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-                    continue;
-                }
-                let Some((key, raw)) = line.split_once('=') else {
-                    continue;
+            for_each_theme_kv(&text, |key, value| {
+                let Some(color) = parse_theme_rgb(value) else {
+                    return;
                 };
-                let key = key.trim().to_ascii_lowercase();
-                let Some(color) = parse_theme_rgb(raw) else {
-                    continue;
-                };
-                match key.as_str() {
-                    "bg" => theme.bg = color,
-                    "fg" => theme.fg = color,
-                    "top_bg" => theme.top_bg = color,
-                    "top_border" => theme.top_border = color,
-                    "accent" => theme.accent = color,
-                    "muted" => theme.muted = color,
-                    _ => {}
+                if key.eq_ignore_ascii_case("bg") {
+                    theme.bg = color;
+                } else if key.eq_ignore_ascii_case("fg") {
+                    theme.fg = color;
+                } else if key.eq_ignore_ascii_case("top_bg") {
+                    theme.top_bg = color;
+                } else if key.eq_ignore_ascii_case("top_border") {
+                    theme.top_border = color;
+                } else if key.eq_ignore_ascii_case("accent") {
+                    theme.accent = color;
+                } else if key.eq_ignore_ascii_case("muted") {
+                    theme.muted = color;
                 }
-            }
+            });
 
             return (theme, Some(path));
         }
@@ -373,9 +414,15 @@ struct AuthDialog {
     remember_key_passphrase: bool,
 }
 
+struct HostKeyDialog {
+    tile_id: TileId,
+    prompt: ssh::HostKeyPrompt,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsPage {
     Autostart,
+    Behavior,
     Appearance,
     TerminalColors,
     ProfilesAndAccount,
@@ -385,6 +432,7 @@ impl SettingsPage {
     fn label(self) -> &'static str {
         match self {
             Self::Autostart => "Autostart",
+            Self::Behavior => "Behavior",
             Self::Appearance => "Appearance",
             Self::TerminalColors => "Terminal Colors",
             Self::ProfilesAndAccount => "Profiles and Account",
@@ -420,6 +468,83 @@ impl SettingsDialog {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DownloadState {
+    Queued,
+    Running,
+    Finished,
+    Failed,
+    Canceled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransferDirection {
+    Download,
+    Upload,
+}
+
+#[derive(Clone, Debug)]
+struct DownloadJob {
+    request_id: u64,
+    direction: TransferDirection,
+    settings: ConnectionSettings,
+    remote_path: String,
+    local_path: String,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    speed_bps: f64,
+    state: DownloadState,
+    message: String,
+}
+
+#[derive(Clone, Debug)]
+enum PaneKind {
+    Terminal,
+    FileManager(FileBrowserState),
+}
+
+#[derive(Clone, Debug)]
+struct FileBrowserState {
+    source_terminal: TileId,
+    source_connected: bool,
+    cwd: String,
+    path_input: String,
+    entries: Vec<ssh::SftpEntry>,
+    selected_name: Option<String>,
+    rename_to: String,
+    rename_from: Option<String>,
+    rename_dialog_open: bool,
+    mkdir_name: String,
+    mkdir_dialog_open: bool,
+    busy: bool,
+    status: String,
+}
+
+impl FileBrowserState {
+    fn new(source_terminal: TileId, path: String) -> Self {
+        let path = if path.trim().is_empty() {
+            ".".to_string()
+        } else {
+            path
+        };
+        Self {
+            source_terminal,
+            source_connected: false,
+            cwd: path.clone(),
+            path_input: path,
+            entries: Vec::new(),
+            selected_name: None,
+            rename_to: String::new(),
+            rename_from: None,
+            rename_dialog_open: false,
+            mkdir_name: String::new(),
+            mkdir_dialog_open: false,
+            busy: false,
+            status: "Not connected".to_string(),
+        }
+    }
+}
+
 struct SshTab {
     id: u64,
     title: String,
@@ -440,6 +565,7 @@ struct SshTab {
 
     ui_rx: Option<Receiver<UiMessage>>,
     worker_tx: Option<Sender<WorkerMessage>>,
+    host_key_tx: Option<Sender<ssh::HostKeyDecision>>,
 
     last_sent_size: Option<(u16, u16, u32, u32)>,
     pending_resize: Option<(u16, u16, u32, u32)>,
@@ -452,8 +578,11 @@ struct SshTab {
     pending_remote_click: Option<PendingRemoteClick>,
 
     pending_auth: Option<ssh::AuthPrompt>,
+    pending_host_key: Option<ssh::HostKeyPrompt>,
     pending_scrollback: Option<usize>,
     last_selection_autoscroll: Instant,
+    pending_sftp_events: Vec<ssh::SftpEvent>,
+    kind: PaneKind,
 }
 
 impl SshTab {
@@ -465,7 +594,11 @@ impl SshTab {
         log_path: String,
     ) -> Self {
         let len = scrollback_len.clamp(0, 200_000);
-        let len = if len == 0 { ssh::TERM_SCROLLBACK_LEN } else { len };
+        let len = if len == 0 {
+            ssh::TERM_SCROLLBACK_LEN
+        } else {
+            len
+        };
         let screen = vt100::Parser::new(24, 80, len).screen().clone();
         let title = Self::title_for(id, &settings);
         Self {
@@ -486,6 +619,7 @@ impl SshTab {
             copy_flash_until: None,
             ui_rx: None,
             worker_tx: None,
+            host_key_tx: None,
             last_sent_size: None,
             pending_resize: None,
             focus_terminal_next_frame: false,
@@ -494,8 +628,63 @@ impl SshTab {
             abs_selection: None,
             pending_remote_click: None,
             pending_auth: None,
+            pending_host_key: None,
             pending_scrollback: None,
             last_selection_autoscroll: Instant::now(),
+            pending_sftp_events: Vec::new(),
+            kind: PaneKind::Terminal,
+        }
+    }
+
+    fn new_file_manager(
+        id: u64,
+        settings: ConnectionSettings,
+        profile_name: Option<String>,
+        color: Option<Color32>,
+        source_terminal: TileId,
+        path: String,
+    ) -> Self {
+        let mut tab = Self::new(
+            id,
+            settings,
+            profile_name,
+            ssh::TERM_SCROLLBACK_LEN,
+            format!("logs\\file-tab-{id}.log"),
+        );
+        let user = tab.settings.username.trim();
+        let host = tab.settings.host.trim();
+        let identity = match (user.is_empty(), host.is_empty()) {
+            (false, false) => format!("{user}@{host}"),
+            (false, true) => format!("{user}@new"),
+            (true, false) => format!("ssh@{host}"),
+            (true, true) => "session".to_string(),
+        };
+        tab.title = format!("SFTP: {identity}");
+        tab.color = color;
+        tab.last_status = "Not connected".to_string();
+        tab.kind = PaneKind::FileManager(FileBrowserState::new(source_terminal, path));
+        tab
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(self.kind, PaneKind::Terminal)
+    }
+
+    fn is_file_manager(&self) -> bool {
+        matches!(self.kind, PaneKind::FileManager(_))
+    }
+
+    fn file_browser(&self) -> Option<&FileBrowserState> {
+        match &self.kind {
+            PaneKind::FileManager(f) => Some(f),
+            PaneKind::Terminal => None,
+        }
+    }
+
+    fn file_browser_mut(&mut self) -> Option<&mut FileBrowserState> {
+        match &mut self.kind {
+            PaneKind::FileManager(f) => Some(f),
+            PaneKind::Terminal => None,
         }
     }
 
@@ -512,17 +701,23 @@ impl SshTab {
     }
 
     fn start_connect(&mut self) {
+        if !self.is_terminal() {
+            return;
+        }
         if self.connected || self.connecting {
             return;
         }
 
         self.pending_auth = None;
+        self.pending_host_key = None;
 
         let (ui_tx, ui_rx) = mpsc::channel::<UiMessage>();
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>();
+        let (host_key_tx, host_key_rx) = mpsc::channel::<ssh::HostKeyDecision>();
 
         self.ui_rx = Some(ui_rx);
         self.worker_tx = Some(worker_tx);
+        self.host_key_tx = Some(host_key_tx);
         self.connecting = true;
         self.last_status = "Connecting...".to_string();
         self.title = Self::title_for(self.id, &self.settings);
@@ -530,14 +725,25 @@ impl SshTab {
         let settings = self.settings.clone();
         let scrollback_len = self.scrollback_len;
         let log_path = self.log_path.clone();
-        let _handle = ssh::start_shell(settings, scrollback_len, ui_tx, worker_rx, log_path);
+        let _handle = ssh::start_shell(
+            settings,
+            scrollback_len,
+            ui_tx,
+            worker_rx,
+            host_key_rx,
+            log_path,
+        );
     }
 
     fn disconnect(&mut self) {
+        if !self.is_terminal() {
+            return;
+        }
         if let Some(tx) = self.worker_tx.take() {
             let _ = tx.send(WorkerMessage::Disconnect);
         }
         self.ui_rx = None;
+        self.host_key_tx = None;
         self.connected = false;
         self.connecting = false;
         self.last_status = "Disconnected".to_string();
@@ -551,12 +757,18 @@ impl SshTab {
         self.abs_selection = None;
         self.pending_remote_click = None;
         self.pending_auth = None;
+        self.pending_host_key = None;
         self.pending_scrollback = None;
         self.last_selection_autoscroll = Instant::now();
     }
 
     fn poll_messages(&mut self) {
-        let Some(rx) = self.ui_rx.as_ref() else { return };
+        if !self.is_terminal() {
+            return;
+        }
+        let Some(rx) = self.ui_rx.as_ref() else {
+            return;
+        };
         const MAX_MSGS_PER_FRAME: usize = 256;
         let mut processed = 0usize;
         let mut latest_screen: Option<Box<vt100::Screen>> = None;
@@ -584,6 +796,12 @@ impl SshTab {
                 }
                 Ok(UiMessage::AuthPrompt(p)) => {
                     self.pending_auth = Some(p);
+                }
+                Ok(UiMessage::HostKeyPrompt(p)) => {
+                    self.pending_host_key = Some(p);
+                }
+                Ok(UiMessage::SftpEvent(event)) => {
+                    self.pending_sftp_events.push(event);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -651,11 +869,19 @@ pub struct AppState {
     clipboard: Option<Clipboard>,
     rename_popup: Option<RenamePopup>,
     auth_dialog: Option<AuthDialog>,
+    host_key_dialog: Option<HostKeyDialog>,
 
     style_initialized: bool,
 
     layout_dirty: bool,
     last_layout_save: Instant,
     restored_window: bool,
+    next_sftp_request_id: u64,
+    pending_sftp_requests: HashMap<u64, TileId>,
+    downloads_window_open: bool,
+    download_jobs: Vec<DownloadJob>,
+    download_event_tx: Sender<ssh::DownloadManagerEvent>,
+    download_event_rx: Receiver<ssh::DownloadManagerEvent>,
+    download_cancel_txs: HashMap<u64, Sender<()>>,
+    upload_refresh_targets: HashMap<u64, TileId>,
 }
-

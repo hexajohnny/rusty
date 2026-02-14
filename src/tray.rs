@@ -129,7 +129,7 @@ pub fn capture_foreground_hwnd() {}
 fn find_process_window() -> Option<isize> {
     use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GW_OWNER, GetWindow, GetWindowTextW, GetWindowThreadProcessId,
+        EnumWindows, GetWindow, GetWindowTextW, GetWindowThreadProcessId, GW_OWNER,
     };
 
     struct SearchCtx {
@@ -178,7 +178,7 @@ fn find_process_window() -> Option<isize> {
 #[cfg(target_os = "windows")]
 fn native_show_window() -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindowAsync,
+        SetForegroundWindow, ShowWindowAsync, SW_RESTORE, SW_SHOW,
     };
 
     let cached = MAIN_HWND.load(Ordering::Relaxed);
@@ -268,7 +268,12 @@ fn load_tray_icon() -> anyhow::Result<Icon> {
     let tray_px: u32 = 32;
     let (w, h) = img.dimensions();
     let img = if w != tray_px || h != tray_px {
-        image::imageops::resize(&img, tray_px, tray_px, image::imageops::FilterType::Lanczos3)
+        image::imageops::resize(
+            &img,
+            tray_px,
+            tray_px,
+            image::imageops::FilterType::Lanczos3,
+        )
     } else {
         img
     };
