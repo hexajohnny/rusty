@@ -271,6 +271,20 @@ fn theme_dir_paths() -> Vec<PathBuf> {
     dirs
 }
 
+fn user_profile_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            Some(home)
+        })
+        .filter(|path| path.is_dir())
+}
+
 fn theme_file_paths_for_name(file_name: &str) -> Vec<PathBuf> {
     theme_dir_paths()
         .into_iter()

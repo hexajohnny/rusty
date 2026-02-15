@@ -687,13 +687,8 @@ impl AppState {
             );
             if ui.button("Browse...").clicked() {
                 let mut dlg = rfd::FileDialog::new();
-                if let Some(home) = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from) {
-                    let ssh_dir = home.join(".ssh");
-                    if ssh_dir.is_dir() {
-                        dlg = dlg.set_directory(ssh_dir);
-                    } else {
-                        dlg = dlg.set_directory(home);
-                    }
+                if let Some(profile_dir) = user_profile_dir() {
+                    dlg = dlg.set_directory(profile_dir);
                 }
                 if let Some(path) = dlg.pick_file() {
                     self.settings_dialog.draft.private_key_path = path.display().to_string();

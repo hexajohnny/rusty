@@ -883,8 +883,8 @@ impl AppState {
         };
 
         let mut dlg = rfd::FileDialog::new();
-        if let Ok(cwd) = std::env::current_dir() {
-            dlg = dlg.set_directory(cwd);
+        if let Some(profile_dir) = user_profile_dir() {
+            dlg = dlg.set_directory(profile_dir);
         }
         let Some(local_path) = dlg.pick_file() else {
             if let Some(file) = self.file_pane_mut(file_tile) {
@@ -974,8 +974,8 @@ impl AppState {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(name.clone());
         let mut dlg = rfd::FileDialog::new().set_file_name(&default_name);
-        if let Ok(cwd) = std::env::current_dir() {
-            dlg = dlg.set_directory(cwd);
+        if let Some(profile_dir) = user_profile_dir() {
+            dlg = dlg.set_directory(profile_dir);
         }
         let Some(local_path) = dlg.save_file() else {
             if let Some(file) = self.file_pane_mut(file_tile) {
