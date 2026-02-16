@@ -153,6 +153,15 @@ impl AppState {
         Self::send_bytes(tab, bytes);
     }
 
+    fn paste_from_clipboard(tab: &mut SshTab, clipboard: &mut Option<Clipboard>) {
+        let Some(cb) = clipboard.as_mut() else {
+            return;
+        };
+        if let Ok(s) = cb.get_text() {
+            Self::send_paste_text(tab, &s);
+        }
+    }
+
     fn copy_text_to_clipboard(ctx: &egui::Context, clipboard: &mut Option<Clipboard>, text: String) {
         ctx.output_mut(|o| o.copied_text = text.clone());
         if let Some(cb) = clipboard.as_mut() {
@@ -324,6 +333,13 @@ impl AppState {
         let primary_down = ui.input(|i| i.pointer.primary_down());
         let primary_released = ui.input(|i| i.pointer.primary_released());
         let hovering_term = pointer_pos.map(|pos| term_rect.contains(pos)).unwrap_or(false) || response.hovered();
+
+        // Right-click paste (no context menu), matching common terminal behavior.
+        if response.secondary_clicked() && tab.connected {
+            Self::paste_from_clipboard(tab, clipboard);
+            response.request_focus();
+            tab.pending_remote_click = None;
+        }
 
         // Scrollbar interaction (hover-only; click-drag to scroll).
         // We keep this independent from "remote mouse mode" so you can always scroll locally.
@@ -741,15 +757,11 @@ impl AppState {
 
                         // Paste shortcut. Prefer the platform integration's Paste event, but
                         // fall back to reading the OS clipboard directly if needed.
-                        if (modifiers.ctrl && *key == egui::Key::V) || (modifiers.ctrl && modifiers.shift && *key == egui::Key::V) {
+                        if modifiers.ctrl && *key == egui::Key::V {
                             if has_paste_event || has_text_event {
                                 continue;
                             }
-                            if let Some(cb) = clipboard.as_mut() {
-                                if let Ok(s) = cb.get_text() {
-                                    Self::send_paste_text(tab, &s);
-                                }
-                            }
+                            Self::paste_from_clipboard(tab, clipboard);
                             continue;
                         }
 

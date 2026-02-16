@@ -127,6 +127,23 @@ impl AppState {
             (tree, pane_id, Some(pane_id))
         };
 
+        let mut update_available_version = config.update_available_version.clone();
+        let mut update_available_url = config.update_available_url.clone();
+        let cached_update_valid = update_available_version
+            .as_deref()
+            .map(Self::is_newer_version_than_current)
+            .unwrap_or(false);
+        if !cached_update_valid {
+            update_available_version = None;
+            update_available_url = None;
+            if config.update_available_version.is_some() || config.update_available_url.is_some() {
+                config.update_available_version = None;
+                config.update_available_url = None;
+                config_saver.request_save(config.clone());
+            }
+        }
+        let update_next_check_at = Self::next_update_check_at(config.update_last_check_unix);
+
         Self {
             theme,
             theme_source,
@@ -163,6 +180,176 @@ impl AppState {
             download_event_rx,
             download_cancel_txs: HashMap::new(),
             upload_refresh_targets: HashMap::new(),
+            update_check_in_progress: false,
+            update_check_rx: None,
+            update_next_check_at,
+            update_available_version,
+            update_available_url,
+        }
+    }
+
+    fn now_unix_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn parse_version_triplet(raw: &str) -> Option<(u64, u64, u64)> {
+        let base = raw
+            .trim()
+            .trim_start_matches('v')
+            .split_once('-')
+            .map(|(v, _)| v)
+            .unwrap_or(raw.trim().trim_start_matches('v'))
+            .split_once('+')
+            .map(|(v, _)| v)
+            .unwrap_or(raw.trim().trim_start_matches('v'));
+        let mut parts = base.split('.');
+        let major = parts.next()?.parse::<u64>().ok()?;
+        let minor = parts.next()?.parse::<u64>().ok()?;
+        let patch = parts.next()?.parse::<u64>().ok()?;
+        Some((major, minor, patch))
+    }
+
+    fn is_newer_version_than_current(version: &str) -> bool {
+        let Some(latest) = Self::parse_version_triplet(version) else {
+            return false;
+        };
+        let Some(current) = Self::parse_version_triplet(env!("CARGO_PKG_VERSION")) else {
+            return false;
+        };
+        latest > current
+    }
+
+    fn next_update_check_at(last_check_unix: Option<u64>) -> Instant {
+        let now_unix = Self::now_unix_secs();
+        let wait_secs = last_check_unix
+            .and_then(|last| last.checked_add(UPDATE_CHECK_INTERVAL_SECS))
+            .map(|next| next.saturating_sub(now_unix))
+            .unwrap_or(0);
+        Instant::now() + Duration::from_secs(wait_secs)
+    }
+
+    fn start_update_check_if_due(&mut self) {
+        if self.update_check_in_progress {
+            return;
+        }
+        if Instant::now() < self.update_next_check_at {
+            return;
+        }
+
+        self.update_next_check_at = Instant::now() + Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS);
+        self.config.update_last_check_unix = Some(Self::now_unix_secs());
+        self.config_saver.request_save(self.config.clone());
+
+        let (tx, rx) = mpsc::channel::<UpdateCheckResult>();
+        self.update_check_rx = Some(rx);
+        self.update_check_in_progress = true;
+
+        std::thread::spawn(move || {
+            let mut result = UpdateCheckResult {
+                check_succeeded: false,
+                available_version: None,
+                available_url: None,
+            };
+
+            let response = ureq::get(UPDATE_CHECK_API_URL)
+                .set("Accept", "application/vnd.github+json")
+                .set("User-Agent", "rusty-update-check")
+                .call();
+
+            if let Ok(resp) = response {
+                if let Ok(json) = resp.into_json::<serde_json::Value>() {
+                    let latest_tag = json
+                        .get("tag_name")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let latest_url = json
+                        .get("html_url")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| UPDATE_RELEASES_URL.to_string());
+
+                    if let Some(tag) = latest_tag {
+                        result.check_succeeded = true;
+                        if Self::is_newer_version_than_current(&tag) {
+                            result.available_version = Some(tag);
+                            result.available_url = Some(latest_url);
+                        }
+                    }
+                }
+            }
+
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_update_check_result(&mut self) {
+        let Some(rx) = self.update_check_rx.as_ref() else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(result) => {
+                self.update_check_in_progress = false;
+                self.update_check_rx = None;
+
+                if result.check_succeeded {
+                    self.update_available_version = result.available_version.clone();
+                    self.update_available_url = result.available_url.clone();
+                    self.config.update_available_version = result.available_version;
+                    self.config.update_available_url = result.available_url;
+                    self.config_saver.request_save(self.config.clone());
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.update_check_in_progress = false;
+                self.update_check_rx = None;
+            }
+        }
+    }
+
+    fn update_button_label(&self) -> Option<String> {
+        let version = self.update_available_version.as_deref()?;
+        let version = if version.starts_with('v') {
+            version.to_string()
+        } else {
+            format!("v{version}")
+        };
+        Some(format!("Update Available {version}"))
+    }
+
+    fn open_update_release_page(&self) {
+        let url = self
+            .update_available_url
+            .as_deref()
+            .unwrap_or(UPDATE_RELEASES_URL);
+
+        #[cfg(target_os = "windows")]
+        let result = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(url)
+            .spawn();
+
+        #[cfg(target_os = "macos")]
+        let result = std::process::Command::new("open").arg(url).spawn();
+
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        let result = std::process::Command::new("xdg-open").arg(url).spawn();
+
+        if let Err(err) = result {
+            crate::logger::log_line(
+                "logs\\update.log",
+                &format!("Failed to open update URL {url}: {err}"),
+            );
         }
     }
 

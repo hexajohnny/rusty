@@ -1,6 +1,6 @@
 [package]
 name = "rusty"
-version = "0.0.7"
+version = "0.0.8"
 authors = ["hexajohnny"]
 edition = "2021"
 build = "build.rs"
@@ -26,6 +26,7 @@ rfd = "0.14"
 base64 = "0.22"
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_UI_WindowsAndMessaging"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
+ureq = { version = "2.12", features = ["json"] }
 
 [profile.release]
 opt-level = "z"
