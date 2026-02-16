@@ -1,6 +1,8 @@
 # Rusty
 
-Rusty is a Windows desktop SSH client built in Rust with an embedded, tabbed terminal, an integrated SFTP file browser, a global download manager, and a dockable layout (via `egui_tiles`).
+Rusty is a Windows desktop SSH client built in Rust with a tabbed terminal, integrated SFTP file browser, and global transfer manager.
+
+- Theme file format guide: [THEMES.md](THEMES.md)
 
 ## Screenshots
 
@@ -13,99 +15,92 @@ Rusty is a Windows desktop SSH client built in Rust with an embedded, tabbed ter
 ## Features
 
 ### SSH and authentication
-- Username/password login.
-- Private-key login from a file path in each profile.
-- Key passphrase prompt when needed, with optional per-profile passphrase saving.
-- Keyboard-interactive auth (server prompts like password, OTP, etc.).
-- Interactive PTY shell session with `TERM=xterm-256color`.
-- Idle session keepalive (20s interval, no inactivity timeout).
-- Connection/session logs written to `logs/tab-<id>.log`.
+- Password authentication.
+- Public key authentication (including key passphrase prompt/save).
+- Keyboard-interactive authentication.
+- `ssh-agent` authentication support.
+- PTY shell with `TERM=xterm-256color`.
+- Keepalive (20s) and per-session logs in `logs/tab-<id>.log`.
+- Host key verification against `%USERPROFILE%\\.ssh\\known_hosts`.
+- Unknown host key trust prompt (`Trust & Save` / `Reject`).
 
-### Terminal behavior
-- Embedded VT terminal rendering (xterm/VT100 escape handling).
-- ANSI colors (16 + 256) with customizable base palette.
-- Adjustable scrollback size (default 5000, configurable up to 200,000).
-- Mouse wheel scrollback and a wider draggable scrollbar.
-- Click-drag text selection, including selection across scrollback.
-- Copy and paste support (including bracketed paste when remote app supports it).
-- Terminal-style shortcuts:
-  - `Ctrl+C` copies when text is selected, otherwise sends SIGINT.
-  - `Ctrl+Shift+C` copies selection (or full visible screen if nothing is selected).
-  - `Ctrl+V` / `Ctrl+Shift+V` pastes.
-- Focus lock for terminal keys (arrows/tab/escape) so focus stays in the terminal.
-- Active terminal pane highlight, plus optional dimming for inactive panes.
+### Terminal
+- Embedded VT terminal rendering (xterm/VT100).
+- ANSI colors (16 + 256) with configurable terminal palette.
+- Adjustable scrollback (default 5000, up to 200,000).
+- Mouse wheel + draggable scrollbar for scrollback.
+- Selection across visible content and scrollback.
+- Copy/paste shortcuts plus right-click paste.
+- Bracketed paste when supported by the remote app.
+- Focus lock for terminal keys (tab/arrows/escape).
+- Active terminal highlighting and optional inactive-pane dimming.
+
+### SFTP file browser
+- Opens in its own dedicated connection per file manager tab.
+- Open from tab menu (`Open File Manager`) or pane folder button.
+- Directory navigation (`Go`, `Refresh`, parent folder).
+- Upload and download from the current remote directory.
+- Remote folder create (`Mkdir`), rename, and delete.
+- File/folder card view with right-click actions.
+
+### Global transfer manager
+- Separate transfers window (not docked).
+- Unified upload/download queue and history.
+- Per-transfer status, progress, speed, and message.
+- Retry flow with automatic backoff for transient failures.
+- Pause state after retry exhaustion (manual retry available).
+- Cancel, retry, remove-history, and open-containing-folder actions.
+- Delete flow with confirmation (downloads can remove local file).
 
 ### Tabs, panes, and layout
-- Multiple SSH sessions in tabs.
-- `+` button opens a new tab (inherits active tab settings when available).
-- Right-click `+` opens a new tab from a saved profile.
-- Tab context menu:
-  - Connect or disconnect (based on current state).
-  - Rename tab.
-  - Change tab color from presets.
-  - Split right or split down.
-  - Close tab.
-- Delayed hover submenu for tab color picker.
-- Dockable split layout using `egui_tiles`.
-- Optional session layout restore (tabs/splits + active state) on launch.
+- Multi-tab SSH sessions.
+- Split panes (right/down) with dockable layout (`egui_tiles`).
+- New tab from active tab settings or from saved profile (`+` menu).
+- Tab context menu: connect/disconnect, rename, color, split, close.
+- Optional session layout save/restore.
 
 ### Settings and profiles
-- Dedicated settings window with sections:
+- Settings window sections:
   - Autostart
+  - Behavior
   - Appearance
   - Terminal Colors
   - Profiles and Account
-- Profile management:
-  - Create, edit, save, and delete profiles.
-  - Right-click profile actions: set default, clear default, delete.
-  - Optional saved password per profile.
-  - Optional saved key passphrase per profile.
-- Connection fields:
-  - Host, port, username, password, private key path.
-  - Private key file browser.
-- Default profile + autostart support.
-- Appearance options:
-  - Dark/light mode.
-  - Theme file selection from `.thm` files.
-  - Reload theme file without restarting.
-  - Focus shade toggle for inactive terminals.
-  - Terminal font size slider (live update).
-  - Scrollback line count setting.
-  - Minimize-to-tray toggle.
-  - Save session layout toggle.
-- Terminal color editor:
-  - Background and foreground colors.
-  - 16-color ANSI palette (normal + bright).
-  - Dim/faint blend strength.
+- Profile create/edit/save/delete with default profile support.
+- Optional saved password and key passphrase per profile.
+- Connection fields: host, port, username, password, private key path.
+- Autostart uses the default profile from Profiles and Account.
+- Save-session-layout option with autostart compatibility note.
 
-### Themes
-- Loads UI theme files from `./theme` near the executable (and from current working directory fallback).
-- Supports `Dark.thm` / `Light.thm` defaults plus selectable custom `.thm` files.
+### Appearance and themes
+- Dark/light UI mode.
+- Select and reload `.thm` UI theme files at runtime.
+- Built-in fallback when a theme file is missing/invalid.
 - Included theme pack in `dist/theme/`:
   - `Dark.thm`, `Light.thm`, `CrimsonDusk.thm`, `EmeraldMist.thm`, `ForestNight.thm`, `Graphite.thm`, `MidnightBlue.thm`, `MonochromeSlate.thm`, `OceanBreeze.thm`, `Sandstone.thm`, `SolarizedDark.thm`, `SolarizedLight.thm`.
+- Full theme spec: [THEMES.md](THEMES.md)
 
-### Window and tray
-- Borderless custom window with rounded corners and custom title bar controls.
-- Tray icon appears only when the app is minimized/hidden to tray.
-- Single left-click on tray icon restores/raises the app.
-- Tray menu actions: Show Rusty, Exit.
-- Global cog menu for Connect, Disconnect, Settings, and Exit.
+### Window, tray, and updates
+- Borderless window with custom title bar controls.
+- Minimize-to-tray support (with tray show/exit actions).
+- Global top-bar controls for settings and transfer manager.
+- Update check for latest GitHub release at most once every 12 hours.
+- Top-right `Update Available v*.*.*` button appears only when newer release is detected.
 
-## Security Notes
-- Config is stored per-user and encrypted on Windows using DPAPI (low CPU).
-- If you choose to remember secrets (password / key passphrase), they are stored encrypted in the local config.
-- Host keys are verified against `%USERPROFILE%\\.ssh\\known_hosts`.
-- Unknown host keys prompt for a Trust & Save decision and are written to `%USERPROFILE%\\.ssh\\known_hosts` when accepted.
+## Security and storage
 
-## Config Location
-- `%APPDATA%\\Rusty\\config.json`
+- Config is per-user and encrypted on Windows with DPAPI.
+- Saved secrets (password/passphrase) are stored encrypted in config.
+- Config path: `%APPDATA%\\Rusty\\config.json`
 
 ## Build (Windows / MSVC)
+
 ```powershell
 cargo build --release
 ```
 
 ## Run
+
 ```powershell
 .\target\release\rusty.exe
 ```
