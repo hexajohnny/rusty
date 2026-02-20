@@ -734,6 +734,10 @@ impl SshTab {
             return;
         }
 
+        // Force a fresh PTY resize sync on (re)connect.
+        self.last_sent_size = None;
+        self.pending_resize = None;
+
         self.pending_auth = None;
         self.pending_host_key = None;
 
@@ -818,6 +822,10 @@ impl SshTab {
                     self.connected = ok;
                     self.connecting = false;
                     if ok {
+                        // A new shell starts at server-default PTY size (often 80x24).
+                        // Reset cached size so the next frame always sends current viewport size.
+                        self.last_sent_size = None;
+                        self.pending_resize = None;
                         self.focus_terminal_next_frame = true;
                     }
                 }

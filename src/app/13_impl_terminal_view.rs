@@ -47,12 +47,11 @@ impl AppState {
         let left = (rect.left() - screen.left()).abs() <= eps;
         let right = (rect.right() - screen.right()).abs() <= eps;
         let top = (rect.top() - screen.top()).abs() <= eps;
-        let bottom = (rect.bottom() - screen.bottom()).abs() <= eps;
         let rounding = egui::Rounding {
             nw: if top && left { WINDOW_RADIUS } else { 0.0 },
             ne: if top && right { WINDOW_RADIUS } else { 0.0 },
-            sw: if bottom && left { WINDOW_RADIUS } else { 0.0 },
-            se: if bottom && right { WINDOW_RADIUS } else { 0.0 },
+            sw: 0.0,
+            se: 0.0,
         };
         painter.rect_filled(rect, rounding, term_theme.bg);
 
@@ -172,8 +171,8 @@ impl AppState {
             let glow = Stroke::new(3.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a_glow));
             let r0 = rect.shrink(1.0);
             let r1 = rect.shrink(3.0);
-            painter.rect_stroke(r1, 6.0, glow);
-            painter.rect_stroke(r0, 6.0, stroke);
+            painter.rect_stroke(r1, rounding, glow);
+            painter.rect_stroke(r0, rounding, stroke);
         }
 
     }

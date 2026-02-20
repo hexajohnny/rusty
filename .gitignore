@@ -1,5 +1,6 @@
 /target
 /dist
+/release
 /backups
 /logs
 .DS_Store
