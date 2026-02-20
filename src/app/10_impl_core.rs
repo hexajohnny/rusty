@@ -185,6 +185,8 @@ impl AppState {
             update_next_check_at,
             update_available_version,
             update_available_url,
+            update_manual_open_if_newer: false,
+            update_manual_status: None,
         }
     }
 
@@ -232,10 +234,20 @@ impl AppState {
     }
 
     fn start_update_check_if_due(&mut self) {
+        self.start_update_check(false);
+    }
+
+    fn start_update_check_now_open_if_newer(&mut self) {
+        self.update_manual_open_if_newer = true;
+        self.update_manual_status = Some("Checking for updates...".to_string());
+        self.start_update_check(true);
+    }
+
+    fn start_update_check(&mut self, force: bool) {
         if self.update_check_in_progress {
             return;
         }
-        if Instant::now() < self.update_next_check_at {
+        if !force && Instant::now() < self.update_next_check_at {
             return;
         }
 
@@ -296,6 +308,8 @@ impl AppState {
 
         match rx.try_recv() {
             Ok(result) => {
+                let manual_open_if_newer = self.update_manual_open_if_newer;
+                self.update_manual_open_if_newer = false;
                 self.update_check_in_progress = false;
                 self.update_check_rx = None;
 
@@ -305,24 +319,42 @@ impl AppState {
                     self.config.update_available_version = result.available_version;
                     self.config.update_available_url = result.available_url;
                     self.config_saver.request_save(self.config.clone());
+
+                    if self.update_available_version.is_some() {
+                        let shown_version = self
+                            .update_available_version
+                            .as_deref()
+                            .map(|v| {
+                                if v.starts_with('v') {
+                                    v.to_string()
+                                } else {
+                                    format!("v{v}")
+                                }
+                            })
+                            .unwrap_or_else(|| "newer release".to_string());
+                        self.update_manual_status =
+                            Some(format!("Update available: {shown_version}"));
+                        if manual_open_if_newer {
+                            self.open_update_release_page();
+                        }
+                    } else {
+                        self.update_manual_status =
+                            Some("You are already on the latest release.".to_string());
+                    }
+                } else {
+                    self.update_manual_status =
+                        Some("Update check failed. Please try again.".to_string());
                 }
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
+                self.update_manual_open_if_newer = false;
+                self.update_manual_status =
+                    Some("Update check failed. Please try again.".to_string());
                 self.update_check_in_progress = false;
                 self.update_check_rx = None;
             }
         }
-    }
-
-    fn update_button_label(&self) -> Option<String> {
-        let version = self.update_available_version.as_deref()?;
-        let version = if version.starts_with('v') {
-            version.to_string()
-        } else {
-            format!("v{version}")
-        };
-        Some(format!("Update Available {version}"))
     }
 
     fn open_update_release_page(&self) {

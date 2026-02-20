@@ -317,24 +317,6 @@ impl eframe::App for AppState {
                             self.open_downloads_window();
                         }
 
-                        if let Some(update_label) = self.update_button_label() {
-                            let update_btn = egui::Button::new(
-                                egui::RichText::new(update_label)
-                                    .strong()
-                                    .size(12.0)
-                                    .color(contrast_text_color(theme.accent)),
-                            )
-                            .fill(theme.accent)
-                            .stroke(Stroke::new(1.0, theme.top_border))
-                            .rounding(6.0);
-                            if ui
-                                .add(update_btn)
-                                .on_hover_text("Open latest release page")
-                                .clicked()
-                            {
-                                self.open_update_release_page();
-                            }
-                        }
                     });
                 });
             });

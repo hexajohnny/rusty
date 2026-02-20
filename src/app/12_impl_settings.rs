@@ -389,6 +389,70 @@ impl AppState {
         );
     }
 
+    fn draw_settings_page_updates(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme;
+
+        ui.label(
+            egui::RichText::new(format!(
+                "Current version: v{}",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .strong(),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Checks GitHub releases and opens the release page when a newer version is found.")
+                .color(theme.muted),
+        );
+        ui.add_space(10.0);
+
+        if ui
+            .add_enabled(
+                !self.update_check_in_progress,
+                egui::Button::new("Check for updates now"),
+            )
+            .clicked()
+        {
+            self.start_update_check_now_open_if_newer();
+        }
+
+        if self.update_check_in_progress {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Checking for updates...").color(theme.muted));
+        }
+
+        if let Some(version) = self.update_available_version.as_deref() {
+            let shown = if version.starts_with('v') {
+                version.to_string()
+            } else {
+                format!("v{version}")
+            };
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(format!("New release detected: {shown}"))
+                    .color(theme.accent)
+                    .strong(),
+            );
+            if ui.button("Open latest release page").clicked() {
+                self.open_update_release_page();
+            }
+        }
+
+        if let Some(status) = self.update_manual_status.as_deref() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(status).color(theme.muted));
+        }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Automatic checks still run at most once every 12 hours.")
+                .color(theme.muted)
+                .size(12.0),
+        );
+    }
+
     fn draw_settings_page_terminal_colors(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
 
@@ -880,6 +944,7 @@ impl AppState {
                     item(ui, SettingsPage::Autostart);
                     item(ui, SettingsPage::Behavior);
                     item(ui, SettingsPage::Appearance);
+                    item(ui, SettingsPage::Updates);
                     item(ui, SettingsPage::TerminalColors);
                     item(ui, SettingsPage::ProfilesAndAccount);
                 });
@@ -906,6 +971,7 @@ impl AppState {
                     SettingsPage::Autostart => self.draw_settings_page_autostart(ui),
                     SettingsPage::Behavior => self.draw_settings_page_behavior(ui),
                     SettingsPage::Appearance => self.draw_settings_page_appearance(ui),
+                    SettingsPage::Updates => self.draw_settings_page_updates(ui),
                     SettingsPage::TerminalColors => self.draw_settings_page_terminal_colors(ui),
                     SettingsPage::ProfilesAndAccount => {
                         self.draw_settings_page_profiles_and_account(ui)

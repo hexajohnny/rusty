@@ -452,6 +452,7 @@ enum SettingsPage {
     Autostart,
     Behavior,
     Appearance,
+    Updates,
     TerminalColors,
     ProfilesAndAccount,
 }
@@ -462,6 +463,7 @@ impl SettingsPage {
             Self::Autostart => "Autostart",
             Self::Behavior => "Behavior",
             Self::Appearance => "Appearance",
+            Self::Updates => "Updates",
             Self::TerminalColors => "Terminal Colors",
             Self::ProfilesAndAccount => "Profiles and Account",
         }
@@ -933,4 +935,6 @@ pub struct AppState {
     update_next_check_at: Instant,
     update_available_version: Option<String>,
     update_available_url: Option<String>,
+    update_manual_open_if_newer: bool,
+    update_manual_status: Option<String>,
 }
