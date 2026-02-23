@@ -1,6 +1,6 @@
 [package]
 name = "rusty"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["hexajohnny"]
 edition = "2021"
 build = "build.rs"
@@ -9,7 +9,8 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 anyhow = "1.0"
 arboard = "3.4"
-eframe = "0.26"
+eframe = { version = "0.26", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+wgpu = { version = "0.19.4", default-features = false, features = ["dx12", "wgsl"] }
 egui_extras = { version = "0.26", features = ["image"] }
 egui_tiles = "0.7.1"
 serde = { version = "1.0", features = ["derive"] }

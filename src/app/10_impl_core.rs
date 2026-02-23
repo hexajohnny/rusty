@@ -506,15 +506,17 @@ impl AppState {
         w.active.fg_stroke.color = self.theme.fg;
         w.active.bg_stroke = Stroke::new(1.0, self.theme.accent);
 
+        let ppp = ctx.pixels_per_point().max(1.0);
+        let snap = |sz: f32| ((sz * ppp).round() / ppp).max(8.0);
         style
             .text_styles
-            .insert(egui::TextStyle::Heading, FontId::proportional(18.0));
+            .insert(egui::TextStyle::Heading, FontId::proportional(snap(18.0)));
         style
             .text_styles
-            .insert(egui::TextStyle::Button, FontId::proportional(14.0));
+            .insert(egui::TextStyle::Button, FontId::proportional(snap(14.0)));
         style
             .text_styles
-            .insert(egui::TextStyle::Body, FontId::proportional(14.0));
+            .insert(egui::TextStyle::Body, FontId::proportional(snap(14.0)));
 
         ctx.set_style(style);
     }
@@ -785,18 +787,37 @@ impl AppState {
             return;
         };
 
+        // Saved geometry can be invalid when moving between host/VM setups with different displays.
+        // Clamp to a conservative visible range so startup can't end up off-screen.
+        let mut x = sw.outer_pos[0];
+        let mut y = sw.outer_pos[1];
+        if !x.is_finite()
+            || !y.is_finite()
+            || x < -2000.0
+            || y < -2000.0
+            || x > 10000.0
+            || y > 10000.0
+        {
+            x = 40.0;
+            y = 40.0;
+        }
+        x = x.max(0.0);
+        y = y.max(0.0);
+        let w = sw.inner_size[0].clamp(360.0, 3840.0);
+        let h = sw.inner_size[1].clamp(240.0, 2160.0);
+
         // Restore normal geometry first, then maximize if requested.
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(
-            sw.outer_pos[0],
-            sw.outer_pos[1],
+            x, y,
         )));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
-            sw.inner_size[0].max(100.0),
-            sw.inner_size[1].max(100.0),
+            w, h,
         )));
         if sw.maximized {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
         }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     }
 
     fn maybe_save_session_layout(&mut self, ctx: &egui::Context) {

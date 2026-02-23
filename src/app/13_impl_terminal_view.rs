@@ -56,7 +56,9 @@ impl AppState {
         painter.rect_filled(rect, rounding, term_theme.bg);
 
         // Compute visible rows/cols and keep the remote PTY in sync.
-        let font_id = FontId::monospace(term_font_size);
+        let ppp = ctx.pixels_per_point().max(1.0);
+        let snapped_term_font_size = ((term_font_size * ppp).round() / ppp).max(8.0);
+        let font_id = FontId::monospace(snapped_term_font_size);
         let (cell_w, cell_h) = Self::cell_metrics(ctx, &font_id);
 
         let inner_size = rect.size() - Vec2::new(TERM_PAD_X * 2.0, TERM_PAD_Y * 2.0);

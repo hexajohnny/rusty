@@ -1,10 +1,18 @@
 impl eframe::App for AppState {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // We use a transparent window to get rounded corners on borderless windows.
-        egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+        // Use an opaque clear to avoid VM OpenGL compositing artifacts that can blur text.
+        self.theme.bg.to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // VM OpenGL paths can become blurry at fractional DPI scales (e.g. 125%).
+        // Enforce integer pixels-per-point every frame.
+        let ppp = ctx.pixels_per_point();
+        let snapped = ppp.round().max(1.0);
+        if (ppp - snapped).abs() > 0.01 {
+            ctx.set_pixels_per_point(snapped);
+        }
+
         // Allow tray callbacks to wake the app even while the viewport is hidden.
         crate::tray::set_wake_ctx(ctx.clone());
 
