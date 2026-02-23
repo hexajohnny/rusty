@@ -40,19 +40,7 @@ impl AppState {
         }
 
         let painter = ui.painter().with_clip_rect(rect);
-        // If this pane touches the window edge, round the pane background corners too so we don't
-        // "fill in" the transparent rounded-corner pixels of the borderless window.
-        let screen = ctx.screen_rect();
-        let eps = 1.2;
-        let left = (rect.left() - screen.left()).abs() <= eps;
-        let right = (rect.right() - screen.right()).abs() <= eps;
-        let top = (rect.top() - screen.top()).abs() <= eps;
-        let rounding = egui::Rounding {
-            nw: if top && left { WINDOW_RADIUS } else { 0.0 },
-            ne: if top && right { WINDOW_RADIUS } else { 0.0 },
-            sw: 0.0,
-            se: 0.0,
-        };
+        let rounding = egui::Rounding::ZERO;
         painter.rect_filled(rect, rounding, term_theme.bg);
 
         // Compute visible rows/cols and keep the remote PTY in sync.

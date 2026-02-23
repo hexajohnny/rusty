@@ -3,7 +3,7 @@
   <Package
     Name="Rusty"
     Manufacturer="hexajohnny"
-    Version="0.1.1"
+    Version="0.1.2"
     UpgradeCode="{A77A6E2E-8A7F-4C9F-9CF0-9D44E1A44F1A}"
     Language="1033"
     Scope="perMachine">

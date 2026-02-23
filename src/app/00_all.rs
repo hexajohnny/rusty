@@ -57,7 +57,6 @@ const TERM_PAD_X: f32 = 1.0;
 const TERM_PAD_Y: f32 = 1.0;
 
 const TITLE_BAR_H: f32 = 28.0;
-const WINDOW_RADIUS: f32 = 14.0;
 const TITLE_PAD_X: f32 = 10.0;
 const CONTENT_PAD: f32 = 0.0;
 const RESIZE_MARGIN: f32 = 6.0;

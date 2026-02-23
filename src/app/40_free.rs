@@ -1,11 +1,6 @@
 fn paint_window_chrome(ctx: &egui::Context, theme: UiTheme) {
     let rect = ctx.screen_rect();
-    let window_rounding = egui::Rounding {
-        nw: WINDOW_RADIUS,
-        ne: WINDOW_RADIUS,
-        sw: 0.0,
-        se: 0.0,
-    };
+    let window_rounding = egui::Rounding::ZERO;
     // Use the shared background layer so our fills are always behind panels/widgets.
     let painter_bg = ctx.layer_painter(egui::LayerId::background());
     // Draw the border/lines above all UI so minimal padding doesn't hide them.
@@ -17,11 +12,7 @@ fn paint_window_chrome(ctx: &egui::Context, theme: UiTheme) {
     painter_bg.rect_filled(rect, window_rounding, theme.bg);
 
     let bar_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), TITLE_BAR_H));
-    painter_bg.rect_filled(
-        bar_rect,
-        window_rounding,
-        theme.top_bg,
-    );
+    painter_bg.rect_filled(bar_rect, window_rounding, theme.top_bg);
 
     painter_fg.rect_stroke(
         rect.shrink(0.5),
