@@ -78,41 +78,43 @@
       </Component>
 
       <Component Id="cmpThemeDark" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeDark" Source="dist\\theme\\Dark.thm" />
+        <File Id="filThemeDark" Source="installer\\theme\\Dark.thm" />
       </Component>
       <Component Id="cmpThemeLight" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeLight" Source="dist\\theme\\Light.thm" />
+        <File Id="filThemeLight" Source="installer\\theme\\Light.thm" />
       </Component>
       <Component Id="cmpThemeCrimsonDusk" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeCrimsonDusk" Source="dist\\theme\\CrimsonDusk.thm" />
+        <File Id="filThemeCrimsonDusk" Source="installer\\theme\\CrimsonDusk.thm" />
       </Component>
       <Component Id="cmpThemeEmeraldMist" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeEmeraldMist" Source="dist\\theme\\EmeraldMist.thm" />
+        <File Id="filThemeEmeraldMist" Source="installer\\theme\\EmeraldMist.thm" />
       </Component>
       <Component Id="cmpThemeForestNight" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeForestNight" Source="dist\\theme\\ForestNight.thm" />
+        <File Id="filThemeForestNight" Source="installer\\theme\\ForestNight.thm" />
       </Component>
       <Component Id="cmpThemeGraphite" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeGraphite" Source="dist\\theme\\Graphite.thm" />
+        <File Id="filThemeGraphite" Source="installer\\theme\\Graphite.thm" />
       </Component>
       <Component Id="cmpThemeMidnightBlue" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeMidnightBlue" Source="dist\\theme\\MidnightBlue.thm" />
+        <File Id="filThemeMidnightBlue" Source="installer\\theme\\MidnightBlue.thm" />
       </Component>
       <Component Id="cmpThemeMonochromeSlate" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeMonochromeSlate" Source="dist\\theme\\MonochromeSlate.thm" />
+        <File Id="filThemeMonochromeSlate" Source="installer\\theme\\MonochromeSlate.thm" />
       </Component>
       <Component Id="cmpThemeOceanBreeze" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeOceanBreeze" Source="dist\\theme\\OceanBreeze.thm" />
+        <File Id="filThemeOceanBreeze" Source="installer\\theme\\OceanBreeze.thm" />
       </Component>
       <Component Id="cmpThemeSandstone" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeSandstone" Source="dist\\theme\\Sandstone.thm" />
+        <File Id="filThemeSandstone" Source="installer\\theme\\Sandstone.thm" />
       </Component>
       <Component Id="cmpThemeSolarizedDark" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeSolarizedDark" Source="dist\\theme\\SolarizedDark.thm" />
+        <File Id="filThemeSolarizedDark" Source="installer\\theme\\SolarizedDark.thm" />
       </Component>
       <Component Id="cmpThemeSolarizedLight" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeSolarizedLight" Source="dist\\theme\\SolarizedLight.thm" />
+        <File Id="filThemeSolarizedLight" Source="installer\\theme\\SolarizedLight.thm" />
       </Component>
     </ComponentGroup>
   </Fragment>
 </Wix>
+
+
