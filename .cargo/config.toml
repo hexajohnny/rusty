@@ -1,0 +1,17 @@
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-gnu]
+linker = "C:\\Users\\where\\Desktop\\rusty\\.cargo\\gcc-ucrt.cmd"
+ar = "C:\\Users\\where\\Desktop\\rusty\\.cargo\\ar-ucrt.cmd"
+rustflags = [
+  "-Cdlltool=C:\\Users\\where\\Desktop\\rusty\\.cargo\\dlltool-ucrt.cmd",
+  "-Ctarget-feature=+crt-static",
+]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+CC_x86_64_pc_windows_gnu = "C:\\Users\\where\\Desktop\\rusty\\.cargo\\gcc-ucrt.cmd"
+AR_x86_64_pc_windows_gnu = "C:\\Users\\where\\Desktop\\rusty\\.cargo\\ar-ucrt.cmd"
