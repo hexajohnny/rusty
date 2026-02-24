@@ -99,6 +99,12 @@ Rusty is a Windows desktop SSH client built in Rust with color-coded organizatio
 cargo build --release
 ```
 
+## Install (Windows)
+
+```powershell
+winget install rusty
+```
+
 ## Run
 
 ```powershell
