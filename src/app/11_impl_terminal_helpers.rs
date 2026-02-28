@@ -23,21 +23,21 @@ impl AppState {
         })
     }
 
-    fn vt_color_to_color32(c: vt100::Color, default: Color32, term_theme: &TermTheme) -> Color32 {
+    fn vt_color_to_color32(c: crate::terminal_emulator::Color, default: Color32, term_theme: &TermTheme) -> Color32 {
         match c {
-            vt100::Color::Default => default,
-            vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
-            vt100::Color::Idx(i) => xterm_256_color(i, &term_theme.palette16),
+            crate::terminal_emulator::Color::Default => default,
+            crate::terminal_emulator::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
+            crate::terminal_emulator::Color::Idx(i) => xterm_256_color(i, &term_theme.palette16),
         }
     }
 
-    fn cell_style(cell: &vt100::Cell, term_theme: &TermTheme) -> TermStyle {
+    fn cell_style(cell: &crate::terminal_emulator::Cell, term_theme: &TermTheme) -> TermStyle {
         let mut fg = Self::vt_color_to_color32(cell.fgcolor(), term_theme.fg, term_theme);
         let mut bg = Self::vt_color_to_color32(cell.bgcolor(), term_theme.bg, term_theme);
 
         // Common terminal behavior: bold maps to bright variants for the first 8 colors.
         if cell.bold() {
-            if let vt100::Color::Idx(i) = cell.fgcolor() {
+            if let crate::terminal_emulator::Color::Idx(i) = cell.fgcolor() {
                 if i < 8 {
                     fg = xterm_256_color(i + 8, &term_theme.palette16);
                 }
@@ -66,7 +66,7 @@ impl AppState {
     }
 
     fn screen_to_layout_job(
-        screen: &vt100::Screen,
+        screen: &crate::terminal_emulator::Screen,
         font_id: FontId,
         term_theme: &TermTheme,
     ) -> LayoutJob {
@@ -254,14 +254,14 @@ impl AppState {
     }
 
     fn mouse_event_bytes(
-        encoding: vt100::MouseProtocolEncoding,
-        mode: vt100::MouseProtocolMode,
+        encoding: crate::terminal_emulator::MouseProtocolEncoding,
+        mode: crate::terminal_emulator::MouseProtocolMode,
         pressed: bool,
         button: egui::PointerButton,
         col_1: u16,
         row_1: u16,
     ) -> Option<Vec<u8>> {
-        if mode == vt100::MouseProtocolMode::None {
+        if mode == crate::terminal_emulator::MouseProtocolMode::None {
             return None;
         }
 
@@ -273,12 +273,12 @@ impl AppState {
         };
 
         // In press-only mode, ignore releases.
-        if mode == vt100::MouseProtocolMode::Press && !pressed {
+        if mode == crate::terminal_emulator::MouseProtocolMode::Press && !pressed {
             return None;
         }
 
         match encoding {
-            vt100::MouseProtocolEncoding::Sgr => {
+            crate::terminal_emulator::MouseProtocolEncoding::Sgr => {
                 let suffix = if pressed { b'M' } else { b'm' };
                 let s = format!("\x1b[<{};{};{}{}", btn_code, col_1, row_1, suffix as char);
                 Some(s.into_bytes())
@@ -315,7 +315,7 @@ impl AppState {
 
         let (screen_rows, screen_cols) = tab.screen.size();
         let remote_mouse_enabled =
-            tab.connected && tab.screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
+            tab.connected && tab.screen.mouse_protocol_mode() != crate::terminal_emulator::MouseProtocolMode::None;
         let local_select_enabled = !remote_mouse_enabled || global_mods.shift;
         let allow_remote_mouse = remote_mouse_enabled && !global_mods.shift;
 
@@ -779,7 +779,7 @@ impl AppState {
         origin: Pos2,
         cell_w: f32,
         cell_h: f32,
-        screen: &vt100::Screen,
+        screen: &crate::terminal_emulator::Screen,
         galley: Option<&egui::Galley>,
         rows: u16,
         cols: u16,
@@ -808,7 +808,7 @@ impl AppState {
     fn pos_to_cell_galley(
         pos: Pos2,
         origin: Pos2,
-        screen: &vt100::Screen,
+        screen: &crate::terminal_emulator::Screen,
         galley: &egui::Galley,
         rows: u16,
         cols: u16,
@@ -857,7 +857,7 @@ impl AppState {
         Some((row_u16, col_idx as u16))
     }
 
-    fn row_col_to_char_index_map(screen: &vt100::Screen, row: u16) -> Vec<usize> {
+    fn row_col_to_char_index_map(screen: &crate::terminal_emulator::Screen, row: u16) -> Vec<usize> {
         let (_rows, cols) = screen.size();
         let cols_usize = cols as usize;
         let mut out = Vec::with_capacity(cols_usize.saturating_add(1));
@@ -908,7 +908,7 @@ impl AppState {
         col
     }
 
-    fn selection_text(screen: &vt100::Screen, sel: TermSelection) -> String {
+    fn selection_text(screen: &crate::terminal_emulator::Screen, sel: TermSelection) -> String {
         let (rows, cols) = screen.size();
         if rows == 0 || cols == 0 {
             return String::new();
@@ -954,7 +954,7 @@ impl AppState {
         out
     }
 
-    fn row_segment_text(screen: &vt100::Screen, row: u16, start_col: u16, end_col: u16) -> String {
+    fn row_segment_text(screen: &crate::terminal_emulator::Screen, row: u16, start_col: u16, end_col: u16) -> String {
         if start_col > end_col {
             return String::new();
         }
@@ -978,7 +978,7 @@ impl AppState {
     }
 
     fn selection_text_abs(
-        screen: &vt100::Screen,
+        screen: &crate::terminal_emulator::Screen,
         max_scrollback: usize,
         sel: TermAbsSelection,
     ) -> String {

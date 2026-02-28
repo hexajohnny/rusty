@@ -8,6 +8,7 @@ mod logger;
 mod model;
 mod ssh;
 mod tray;
+mod terminal_emulator;
 
 fn main() -> eframe::Result<()> {
     if std::env::var_os("WGPU_BACKEND").is_none() {

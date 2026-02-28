@@ -587,7 +587,7 @@ struct SshTab {
     connecting: bool,
     last_status: String,
 
-    screen: vt100::Screen,
+    screen: crate::terminal_emulator::Screen,
     scroll_wheel_accum: f32,
     scrollback_max: usize,
     scrollbar_dragging: bool,
@@ -629,7 +629,7 @@ impl SshTab {
         } else {
             len
         };
-        let screen = vt100::Parser::new(24, 80, len).screen().clone();
+        let screen = crate::terminal_emulator::Parser::new(24, 80, len).screen().clone();
         let title = Self::title_for(id, &settings);
         Self {
             id,
@@ -799,7 +799,7 @@ impl SshTab {
         const MAX_MSGS_PER_FRAME: usize = 256;
         let mut processed = 0usize;
         let mut saw_message = false;
-        let mut latest_screen: Option<Box<vt100::Screen>> = None;
+        let mut latest_screen: Option<Box<crate::terminal_emulator::Screen>> = None;
         let mut latest_scrollback_max: Option<usize> = None;
         loop {
             if processed >= MAX_MSGS_PER_FRAME {

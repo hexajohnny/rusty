@@ -12,7 +12,7 @@ use russh::{ChannelMsg, Disconnect, MethodKind, MethodSet};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType as SftpFileType;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use vt100::Parser;
+use crate::terminal_emulator::Parser;
 
 use crate::logger;
 use crate::model::ConnectionSettings;
@@ -67,7 +67,7 @@ fn app_known_hosts_path() -> PathBuf {
 #[derive(Debug)]
 pub enum UiMessage {
     Status(String),
-    Screen(Box<vt100::Screen>),
+    Screen(Box<crate::terminal_emulator::Screen>),
     ScrollbackMax(usize),
     Connected(bool),
     AuthPrompt(AuthPrompt),
