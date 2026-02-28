@@ -29,7 +29,7 @@
   <Fragment>
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
       <Component Id="cmpRustyExe" Guid="*">
-        <File Id="filRustyExe" Source="$(var.ExeSource)" KeyPath="yes" />
+        <File Id="filRustyExe" Source="$(var.ExeSource)" Name="rusty.exe" KeyPath="yes" />
       </Component>
 
       <Component Id="cmpDesktopShortcut" Guid="*" Directory="DesktopFolder">
