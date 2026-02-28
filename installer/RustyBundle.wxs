@@ -14,6 +14,8 @@
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication
         LicenseUrl="https://github.com/hexajohnny/rusty/blob/main/LICENSE-MIT"
+        LogoFile="assets\icon.png"
+        LogoSideFile="assets\icon.png"
         Theme="hyperlinkLicense" />
     </BootstrapperApplication>
 
