@@ -9,6 +9,7 @@
     Name="Rusty"
     Manufacturer="hexajohnny"
     Version="$(var.Version)"
+    IconSourceFile="assets\icon.ico"
     UpgradeCode="{B02F4D88-9B36-46D8-9D65-1F8C0F2EA5AB}">
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication

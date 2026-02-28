@@ -16,7 +16,7 @@
   </Package>
 
   <Fragment>
-    <StandardDirectory Id="ProgramFilesFolder">
+    <StandardDirectory Id="$(var.ProgramFilesRoot)">
       <Directory Id="INSTALLFOLDER" Name="Rusty">
         <Directory Id="THEMEFOLDER" Name="theme" />
       </Directory>
@@ -37,7 +37,7 @@
           Id="scDesktopRusty"
           Name="Rusty"
           Description="Rusty SSH client"
-          Target="[INSTALLFOLDER]rusty.exe"
+          Target="[#filRustyExe]"
           WorkingDirectory="INSTALLFOLDER" />
         <RegistryValue
           Root="HKLM"
@@ -53,7 +53,7 @@
           Id="scStartMenuRusty"
           Name="Rusty"
           Description="Rusty SSH client"
-          Target="[INSTALLFOLDER]rusty.exe"
+          Target="[#filRustyExe]"
           WorkingDirectory="INSTALLFOLDER" />
         <RemoveFolder Id="rfProgramMenuDir" Directory="PROGRAMMENUDIR" On="uninstall" />
         <RegistryValue
