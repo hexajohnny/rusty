@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crate::terminal_emulator::Parser;
 use anyhow::{anyhow, Context, Result};
 use russh::client::{self, AuthResult, KeyboardInteractiveAuthResponse};
 use russh::keys::{self, load_secret_key, PrivateKeyWithHashAlg};
@@ -12,7 +13,6 @@ use russh::{ChannelMsg, Disconnect, MethodKind, MethodSet};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType as SftpFileType;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use crate::terminal_emulator::Parser;
 
 use crate::logger;
 use crate::model::ConnectionSettings;
@@ -400,7 +400,7 @@ fn method_set_to_csv(methods: &MethodSet) -> String {
 }
 
 fn supports_method(methods: &MethodSet, target: MethodKind) -> bool {
-    methods.iter().any(|m| *m == target)
+    methods.contains(&target)
 }
 
 fn compute_scrollback_max(parser: &mut Parser) -> usize {
@@ -634,10 +634,12 @@ async fn open_authenticated_session_for_download(
         .with_context(|| format!("Failed to connect to {addr}"))?;
     let _ = tcp.set_nodelay(true);
 
-    let mut config = client::Config::default();
-    config.inactivity_timeout = None;
-    config.keepalive_interval = Some(Duration::from_secs(20));
-    config.keepalive_max = 0;
+    let config = client::Config {
+        inactivity_timeout: None,
+        keepalive_interval: Some(Duration::from_secs(20)),
+        keepalive_max: 0,
+        ..Default::default()
+    };
     let config = Arc::new(config);
 
     let mut session =
@@ -1748,12 +1750,14 @@ async fn run_shell_async(
         .with_context(|| format!("Failed to connect to {addr}"))?;
     let _ = tcp.set_nodelay(true);
 
-    let mut config = client::Config::default();
-    // Keep sessions alive indefinitely while idle.
-    config.inactivity_timeout = None;
-    config.keepalive_interval = Some(Duration::from_secs(20));
-    // 0 means "do not auto-close after missed keepalive replies".
-    config.keepalive_max = 0;
+    let config = client::Config {
+        // Keep sessions alive indefinitely while idle.
+        inactivity_timeout: None,
+        keepalive_interval: Some(Duration::from_secs(20)),
+        // 0 means "do not auto-close after missed keepalive replies".
+        keepalive_max: 0,
+        ..Default::default()
+    };
     let config = Arc::new(config);
 
     logger::log_line(log_path, "Creating SSH session.");

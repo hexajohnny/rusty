@@ -22,7 +22,8 @@ fn main() {
         );
 
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
-            let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+            let manifest_dir =
+                std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
             res.set_toolkit_path(&manifest_dir);
             res.set_windres_path(&format!("{manifest_dir}\\.cargo\\windres-ucrt.cmd"));
             res.set_ar_path(&format!("{manifest_dir}\\.cargo\\ar-ucrt.cmd"));

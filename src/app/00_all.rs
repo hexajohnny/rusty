@@ -530,7 +530,7 @@ struct DownloadJob {
 #[derive(Clone, Debug)]
 enum PaneKind {
     Terminal,
-    FileManager(FileBrowserState),
+    FileManager(Box<FileBrowserState>),
 }
 
 #[derive(Clone, Debug)]
@@ -692,7 +692,7 @@ impl SshTab {
         tab.title = format!("SFTP: {identity}");
         tab.color = color;
         tab.last_status = "Not connected".to_string();
-        tab.kind = PaneKind::FileManager(FileBrowserState::new(source_terminal, path));
+        tab.kind = PaneKind::FileManager(Box::new(FileBrowserState::new(source_terminal, path)));
         tab
     }
 
@@ -706,28 +706,20 @@ impl SshTab {
 
     fn file_browser(&self) -> Option<&FileBrowserState> {
         match &self.kind {
-            PaneKind::FileManager(f) => Some(f),
+            PaneKind::FileManager(f) => Some(f.as_ref()),
             PaneKind::Terminal => None,
         }
     }
 
     fn file_browser_mut(&mut self) -> Option<&mut FileBrowserState> {
         match &mut self.kind {
-            PaneKind::FileManager(f) => Some(f),
+            PaneKind::FileManager(f) => Some(f.as_mut()),
             PaneKind::Terminal => None,
         }
     }
 
-    fn title_for(id: u64, settings: &ConnectionSettings) -> String {
-        let host = settings.host.trim();
-        let user = settings.username.trim();
-        let base = match (user.is_empty(), host.is_empty()) {
-            (false, false) => format!("{user}@{host}"),
-            (false, true) => format!("{user}@new"),
-            (true, false) => format!("ssh@{host}"),
-            (true, true) => "new tab".to_string(),
-        };
-        format!("{base} #{id}")
+    fn title_for(id: u64, _settings: &ConnectionSettings) -> String {
+        format!("Untitled Tab {id}")
     }
 
     fn start_connect(&mut self) {
@@ -862,11 +854,8 @@ impl SshTab {
                     self.pending_scrollback = None;
                 }
             }
-            if self.is_terminal() && !self.screen.title().is_empty() {
-                // Prefer the remote title when set. Keep the id suffix to avoid
-                // confusing duplicates when opening multiple tabs with the same host.
-                self.title = format!("{} #{id}", self.screen.title(), id = self.id);
-            }
+            // Keep local tab naming stable. Some remote shells/TUIs set OSC titles
+            // like "wezterm", which should not replace user-facing tab labels.
         }
 
         if let Some(max) = latest_scrollback_max {

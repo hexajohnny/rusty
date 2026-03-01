@@ -66,6 +66,7 @@ impl AppState {
         ui.painter()
             .rect_filled(rect, 0.0, adjust_color(theme.top_bg, 0.05));
         let mut content = ui.child_ui(rect.shrink(8.0), egui::Layout::top_down(Align::Min));
+        let rounded_button = |label: &str| egui::Button::new(label).rounding(egui::Rounding::same(6.0));
 
         content.horizontal(|ui| {
             let status_color = if file.source_connected {
@@ -92,10 +93,10 @@ impl AppState {
             ui.label("Path");
             let path_resp = ui.text_edit_singleline(&mut file.path_input);
             let go = ui
-                .add_enabled(!file.busy, egui::Button::new("Go"))
+                .add_enabled(!file.busy, rounded_button("Go"))
                 .on_hover_text("List this remote path");
             let refresh = ui
-                .add_enabled(!file.busy, egui::Button::new("Refresh"))
+                .add_enabled(!file.busy, rounded_button("Refresh"))
                 .on_hover_text("Reload current directory");
 
             if go.clicked()
@@ -135,7 +136,7 @@ impl AppState {
             if ui
                 .add_enabled(
                     !file.busy && selected_downloadable,
-                    egui::Button::new("Download"),
+                    rounded_button("Download"),
                 )
                 .clicked()
             {
@@ -148,7 +149,7 @@ impl AppState {
             }
 
             if ui
-                .add_enabled(!file.busy && selected_any, egui::Button::new("Rename"))
+                .add_enabled(!file.busy && selected_any, rounded_button("Rename"))
                 .clicked()
             {
                 if let Some(name) = selected_name.as_ref() {
@@ -159,7 +160,7 @@ impl AppState {
             }
 
             if ui
-                .add_enabled(!file.busy && selected_any, egui::Button::new("Delete"))
+                .add_enabled(!file.busy && selected_any, rounded_button("Delete"))
                 .clicked()
             {
                 if let Some(name) = selected_name.as_ref() {
@@ -172,7 +173,7 @@ impl AppState {
             }
 
             if ui
-                .add_enabled(!file.busy, egui::Button::new("Mkdir"))
+                .add_enabled(!file.busy, rounded_button("Mkdir"))
                 .clicked()
             {
                 file.mkdir_dialog_open = true;
@@ -203,11 +204,11 @@ impl AppState {
                 });
                 let folder_icon = egui::Image::new(egui::include_image!("../../assets/folder.png"));
                 let file_icon = egui::Image::new(egui::include_image!("../../assets/file.png"));
-                let card_size = Vec2::new(132.0, 126.0);
-                let icon_size = Vec2::splat(44.0);
+                let card_size = Vec2::new(102.0, 92.0);
+                let icon_size = Vec2::splat(32.0);
 
                 ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(10.0, 10.0);
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
 
                     // Always show the parent directory shortcut first.
                     let (up_rect, up_base_resp) = ui.allocate_exact_size(card_size, Sense::click());
@@ -222,19 +223,19 @@ impl AppState {
                     ui.painter()
                         .rect_stroke(up_rect, 10.0, Stroke::new(1.0, theme.top_border));
                     let mut up_ui = ui.child_ui(
-                        up_rect.shrink2(Vec2::new(8.0, 8.0)),
+                        up_rect.shrink2(Vec2::new(4.0, 4.0)),
                         egui::Layout::top_down(Align::Center),
                     );
                     up_ui.vertical_centered(|ui| {
                         let icon = folder_icon.clone().tint(adjust_color(theme.accent, -0.05));
                         let (icon_rect, _) = ui.allocate_exact_size(icon_size, Sense::hover());
                         icon.paint_at(ui, icon_rect);
-                        ui.add_space(6.0);
+                        ui.add_space(3.0);
                         ui.label(egui::RichText::new("..").color(theme.fg).strong());
                         ui.label(
                             egui::RichText::new("Parent folder")
                                 .color(theme.muted)
-                                .size(11.0),
+                                .size(10.0),
                         );
                     });
                     if up_resp.clicked() || up_resp.double_clicked() {
@@ -281,7 +282,7 @@ impl AppState {
                         ui.painter().rect_stroke(rect, 10.0, stroke);
 
                         let mut card_ui = ui.child_ui(
-                            rect.shrink2(Vec2::new(8.0, 8.0)),
+                            rect.shrink2(Vec2::new(4.0, 4.0)),
                             egui::Layout::top_down(Align::Center),
                         );
                         card_ui.vertical_centered(|ui| {
@@ -298,8 +299,8 @@ impl AppState {
                             let (icon_rect, _) = ui.allocate_exact_size(icon_size, Sense::hover());
                             icon.paint_at(ui, icon_rect);
 
-                            ui.add_space(6.0);
-                            let max_chars = 18usize;
+                            ui.add_space(3.0);
+                            let max_chars = 14usize;
                             let display_name = if entry.file_name.chars().count() > max_chars {
                                 let truncated: String =
                                     entry.file_name.chars().take(max_chars).collect();
@@ -313,7 +314,7 @@ impl AppState {
                             } else {
                                 Self::file_size_label(entry.size, false)
                             };
-                            ui.label(egui::RichText::new(meta).color(theme.muted).size(11.0));
+                            ui.label(egui::RichText::new(meta).color(theme.muted).size(10.0));
                         });
 
                         if resp.clicked() {

@@ -7,8 +7,8 @@ mod crypto;
 mod logger;
 mod model;
 mod ssh;
-mod tray;
 mod terminal_emulator;
+mod tray;
 
 fn main() -> eframe::Result<()> {
     if std::env::var_os("WGPU_BACKEND").is_none() {
@@ -21,8 +21,10 @@ fn main() -> eframe::Result<()> {
 }
 
 fn run_with_renderer(renderer: eframe::Renderer) -> eframe::Result<()> {
-    let mut native_options = eframe::NativeOptions::default();
-    native_options.renderer = renderer;
+    let mut native_options = eframe::NativeOptions {
+        renderer,
+        ..Default::default()
+    };
     native_options.wgpu_options.supported_backends = wgpu::Backends::DX12;
     // Hide native window chrome; we draw our own title bar + close button in egui.
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok();

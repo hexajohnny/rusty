@@ -203,6 +203,10 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
             }
         }
 
+        if response.double_clicked() && matches!(tiles.get(tile_id), Some(Tile::Pane(_))) {
+            self.actions.push(TilesAction::Rename(tile_id));
+        }
+
         // Show a gap when dragged.
         if ui.is_rect_visible(rect) && !is_being_dragged {
             let mut fill = if active {
@@ -287,7 +291,11 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
         // Tooltips and context menu only make sense for leaf panes.
         let response = match tiles.get(tile_id) {
             Some(Tile::Pane(pane)) if pane.user_title.is_some() => {
-                response.on_hover_text(pane.title.clone())
+                let tooltip = pane
+                    .user_title
+                    .clone()
+                    .unwrap_or_else(|| pane.title.clone());
+                response.on_hover_text(tooltip)
             }
             _ => response,
         };

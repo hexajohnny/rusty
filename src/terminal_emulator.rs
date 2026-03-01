@@ -146,7 +146,6 @@ pub struct Screen {
     scrollback_max: usize,
     lines: Vec<Line>,
     visible_cells: Vec<Cell>,
-    title: String,
     bracketed_paste: bool,
     application_cursor: bool,
     mouse_mode: MouseProtocolMode,
@@ -165,7 +164,6 @@ impl Screen {
             scrollback_max: snapshot.scrollback_max,
             lines: snapshot.lines,
             visible_cells: Vec::new(),
-            title: snapshot.title,
             bracketed_paste: snapshot.bracketed_paste,
             application_cursor: snapshot.application_cursor,
             mouse_mode: snapshot.mouse_mode,
@@ -231,10 +229,6 @@ impl Screen {
 
     pub fn scrollback(&self) -> usize {
         self.scrollback
-    }
-
-    pub fn title(&self) -> &str {
-        &self.title
     }
 
     pub fn bracketed_paste(&self) -> bool {
@@ -331,9 +325,9 @@ impl Parser {
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
-        let filtered = self
-            .seq_filter
-            .transform(bytes, &mut self.mode_state, self.disable_alt_screen);
+        let filtered =
+            self.seq_filter
+                .transform(bytes, &mut self.mode_state, self.disable_alt_screen);
         if !filtered.is_empty() {
             self.terminal.advance_bytes(filtered);
         }
@@ -383,7 +377,6 @@ impl Parser {
             scrollback: self.scrollback,
             scrollback_max,
             lines: term_screen.lines_in_phys_range(0..total_rows),
-            title: self.terminal.get_title().to_string(),
             bracketed_paste: self.terminal.bracketed_paste_enabled(),
             application_cursor: self.mode_state.application_cursor,
             mouse_mode: self.mode_state.mouse_mode(),
@@ -431,7 +424,6 @@ struct ScreenSnapshot {
     scrollback: usize,
     scrollback_max: usize,
     lines: Vec<Line>,
-    title: String,
     bracketed_paste: bool,
     application_cursor: bool,
     mouse_mode: MouseProtocolMode,
@@ -449,7 +441,6 @@ impl ScreenSnapshot {
             scrollback: 0,
             scrollback_max: 0,
             lines: Vec::new(),
-            title: String::new(),
             bracketed_paste: false,
             application_cursor: false,
             mouse_mode: MouseProtocolMode::None,

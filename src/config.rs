@@ -20,17 +20,12 @@ fn default_terminal_scrollback_lines() -> usize {
     5000
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum UiThemeMode {
+    #[default]
     Dark,
     Light,
-}
-
-impl Default for UiThemeMode {
-    fn default() -> Self {
-        Self::Dark
-    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

@@ -16,7 +16,7 @@ pub struct AsyncConfigSaver {
 }
 
 enum Msg {
-    Save(AppConfig),
+    Save(Box<AppConfig>),
     Flush(mpsc::Sender<()>),
     Shutdown,
 }
@@ -33,10 +33,12 @@ impl AsyncConfigSaver {
 
     /// Request a save. This is best-effort and returns immediately.
     pub fn request_save(&self, cfg: AppConfig) {
-        if self.tx.send(Msg::Save(cfg.clone())).is_err() {
+        if let Err(err) = self.tx.send(Msg::Save(Box::new(cfg))) {
             // Fallback: if the background saver is unavailable, persist synchronously
             // so config updates are not silently lost.
-            crate::config::save(&cfg);
+            if let Msg::Save(cfg) = err.0 {
+                crate::config::save(&cfg);
+            }
         }
     }
 
@@ -60,7 +62,7 @@ impl Drop for AsyncConfigSaver {
 }
 
 fn saver_thread(rx: mpsc::Receiver<Msg>) {
-    let mut pending: Option<AppConfig> = None;
+    let mut pending: Option<Box<AppConfig>> = None;
     loop {
         // Wait for the next message.
         let msg = match rx.recv() {

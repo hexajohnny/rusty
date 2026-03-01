@@ -8,8 +8,8 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1.0"
-arboard = "3.4"
-eframe = { version = "0.26", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+arboard = { version = "3.4", default-features = false }
+eframe = { version = "0.26", default-features = false, features = ["wgpu", "default_fonts"] }
 wgpu = { version = "0.19.4", default-features = false, features = ["dx12", "wgsl"] }
 egui_extras = { version = "0.26", features = ["image"] }
 egui_tiles = "0.7.1"
