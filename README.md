@@ -26,7 +26,7 @@ WezTerm scheme reference:
 ## Screenshots
 
 <p align="center">
-  <img src="misc/example.png" alt="Rusty screenshot 1" width="32%" />
+  <img src="misc/example.gif" alt="Rusty screenshot 1" width="32%" />
   <img src="misc/example2.png" alt="Rusty screenshot 2" width="32%" />
   <img src="misc/example3.png" alt="Rusty screenshot 3" width="32%" />
 </p>
