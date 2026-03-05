@@ -18,6 +18,7 @@ use crate::async_config::AsyncConfigSaver;
 use crate::config;
 use crate::model::ConnectionSettings;
 use crate::ssh::{self, UiMessage, WorkerMessage};
+use crate::terminal_themes::ThemeRegistry;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -100,6 +101,9 @@ impl Default for UiTheme {
 struct TermTheme {
     bg: Color32,
     fg: Color32,
+    cursor: Color32,
+    selection_bg: Color32,
+    selection_fg: Color32,
     palette16: [Color32; 16],
     dim_blend: f32,
 }
@@ -109,6 +113,9 @@ impl Default for TermTheme {
         Self {
             bg: Color32::from_rgb(0, 0, 0),
             fg: Color32::from_rgb(220, 220, 220),
+            cursor: Color32::from_rgb(220, 220, 220),
+            selection_bg: Color32::from_rgb(255, 184, 108),
+            selection_fg: Color32::from_rgb(20, 20, 20),
             palette16: [
                 Color32::from_rgb(0, 0, 0),       // 0 black
                 Color32::from_rgb(205, 49, 49),   // 1 red
@@ -147,6 +154,9 @@ impl TermTheme {
         Self {
             bg: to_c32(cfg.bg),
             fg: to_c32(cfg.fg),
+            cursor: to_c32(cfg.cursor),
+            selection_bg: to_c32(cfg.selection_bg),
+            selection_fg: to_c32(cfg.selection_fg),
             palette16,
             dim_blend,
         }
@@ -880,6 +890,7 @@ pub struct AppState {
     theme: UiTheme,
     theme_source: Option<PathBuf>,
     term_theme: TermTheme,
+    terminal_theme_registry: ThemeRegistry,
 
     config: config::AppConfig,
     config_saver: AsyncConfigSaver,

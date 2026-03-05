@@ -456,113 +456,203 @@ impl AppState {
     fn draw_settings_page_terminal_colors(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
 
-        ui.label(egui::RichText::new("Base colors").strong());
-        ui.add_space(6.0);
-
-        let mut changed = false;
-        {
-            let mut bg = self.config.terminal_colors.bg.to_array();
-            ui.horizontal(|ui| {
-                ui.label("Background");
-                let resp = ui.color_edit_button_srgb(&mut bg);
-                changed |= resp.changed();
-            });
-            if changed {
-                self.config.terminal_colors.bg = config::RgbColor::from_array(bg);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Theme presets").strong());
+            if ui.button("Reload from term/").clicked() {
+                self.refresh_terminal_theme_registry();
             }
-        }
-
-        {
-            let mut fg = self.config.terminal_colors.fg.to_array();
-            ui.horizontal(|ui| {
-                ui.label("Foreground");
-                let resp = ui.color_edit_button_srgb(&mut fg);
-                changed |= resp.changed();
-            });
-            if changed {
-                self.config.terminal_colors.fg = config::RgbColor::from_array(fg);
-            }
-        }
-
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Dim / faint").strong());
+        });
         ui.add_space(4.0);
-        let before = self.config.terminal_colors.dim_blend;
-        let resp = ui.add(
-            egui::Slider::new(&mut self.config.terminal_colors.dim_blend, 0.0..=0.90)
-                .text("Dim blend (toward background)")
-                .fixed_decimals(2),
-        );
-        if resp.changed() && (resp.drag_released() || !resp.dragged()) {
-            if (self.config.terminal_colors.dim_blend - before).abs() > f32::EPSILON {
-                changed = true;
-            }
-        }
         ui.label(
             egui::RichText::new(
-                "Higher values make SGR 2 (dim/faint) text darker. 0.0 disables dimming.",
+                "Loads WezTerm-compatible TOML schemes from ./term and applies them instantly.",
             )
             .color(theme.muted)
             .size(12.0),
         );
 
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(10.0);
-
-        ui.label(egui::RichText::new("ANSI 16-color palette").strong());
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new("Used for most CLI theming (folders, prompts, etc).")
+        let mut selected_theme_to_apply: Option<String> = None;
+        let loaded_themes = self.terminal_theme_registry.themes().to_vec();
+        if self.terminal_theme_registry.is_empty() {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "No valid terminal themes found in term/. Using current/fallback terminal colors.",
+                )
                 .color(theme.muted)
                 .size(12.0),
-        );
-        ui.add_space(8.0);
-
-        const NAMES: [&str; 8] = [
-            "Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White",
-        ];
-        egui::Grid::new("terminal_palette16_grid")
-            .num_columns(4)
-            .spacing(Vec2::new(12.0, 10.0))
-            .show(ui, |ui| {
-                for i in 0..8usize {
-                    ui.label(NAMES[i]);
-                    let mut c0 = self.config.terminal_colors.palette16[i].to_array();
-                    let r0 = ui.color_edit_button_srgb(&mut c0);
-                    if r0.changed() {
-                        self.config.terminal_colors.palette16[i] = config::RgbColor::from_array(c0);
-                        changed = true;
-                    }
-
-                    ui.label(format!("Bright {}", NAMES[i]));
-                    let mut c1 = self.config.terminal_colors.palette16[i + 8].to_array();
-                    let r1 = ui.color_edit_button_srgb(&mut c1);
-                    if r1.changed() {
-                        self.config.terminal_colors.palette16[i + 8] =
-                            config::RgbColor::from_array(c1);
-                        changed = true;
-                    }
-                    ui.end_row();
-                }
-            });
-
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            if ui.button("Reset to defaults").clicked() {
-                self.config.terminal_colors = config::TerminalColorsConfig::default();
-                changed = true;
+            );
+            for dir in self.terminal_theme_registry.search_dirs() {
+                ui.label(
+                    egui::RichText::new(format!("Searched: {}", dir.display()))
+                        .color(theme.muted)
+                        .size(11.0),
+                );
             }
-            ui.label(
-                egui::RichText::new("256-color cube and grayscale are fixed.")
+        } else {
+            for term_theme in &loaded_themes {
+                let selected = self
+                    .config
+                    .selected_terminal_theme
+                    .as_deref()
+                    .map(|s| s.eq_ignore_ascii_case(&term_theme.id))
+                    .unwrap_or(false);
+                let resp = Self::draw_terminal_theme_preview_card(ui, theme, term_theme, selected);
+                if resp.clicked() {
+                    selected_theme_to_apply = Some(term_theme.id.clone());
+                }
+                ui.add_space(8.0);
+            }
+        }
+
+        if let Some(theme_id) = selected_theme_to_apply {
+            if self.apply_terminal_theme_selection(&theme_id, true) {
+                ui.ctx().request_repaint();
+            }
+        }
+
+        if let Some(selected) = self.config.selected_terminal_theme.as_deref() {
+            if let Some(term_theme) = self.terminal_theme_registry.find_by_id_or_name(selected) {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Selected theme: {} ({})",
+                        term_theme.name, term_theme.id
+                    ))
                     .color(theme.muted)
                     .size(12.0),
-            );
-        });
-
-        if changed {
-            self.config_saver.request_save(self.config.clone());
+                );
+            }
         }
+    }
+
+    fn rgb_to_color32(color: config::RgbColor) -> Color32 {
+        Color32::from_rgb(color.r, color.g, color.b)
+    }
+
+    fn draw_terminal_theme_preview_card(
+        ui: &mut egui::Ui,
+        app_theme: UiTheme,
+        term_theme: &crate::terminal_themes::TerminalTheme,
+        selected: bool,
+    ) -> Response {
+        let card_width = ui.available_width().max(120.0);
+        let fill = if selected {
+            adjust_color(app_theme.top_bg, 0.16)
+        } else {
+            adjust_color(app_theme.top_bg, 0.08)
+        };
+        let stroke = if selected {
+            Stroke::new(1.0, app_theme.accent)
+        } else {
+            Stroke::new(1.0, app_theme.top_border)
+        };
+
+        let inner = egui::Frame::none()
+            .fill(fill)
+            .stroke(stroke)
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.set_min_width((card_width - 20.0).max(100.0));
+                ui.horizontal(|ui| {
+                    let title = if selected {
+                        egui::RichText::new(&term_theme.name)
+                            .strong()
+                            .color(app_theme.accent)
+                    } else {
+                        egui::RichText::new(&term_theme.name).strong().color(app_theme.fg)
+                    };
+                    ui.label(title);
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(term_theme.kind_label())
+                                .size(11.0)
+                                .color(app_theme.muted),
+                        );
+                    });
+                });
+
+                if let Some(comment) = term_theme.comment.as_deref() {
+                    ui.label(
+                        egui::RichText::new(comment)
+                            .size(11.0)
+                            .color(app_theme.muted),
+                    );
+                }
+
+                ui.add_space(6.0);
+                let preview_bg = Self::rgb_to_color32(term_theme.background);
+                let preview_fg = Self::rgb_to_color32(term_theme.foreground);
+                let preview_border = adjust_color(preview_bg, if term_theme.light { -0.18 } else { 0.25 });
+                egui::Frame::none()
+                    .fill(preview_bg)
+                    .stroke(Stroke::new(1.0, preview_border))
+                    .rounding(egui::Rounding::same(6.0))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        ui.visuals_mut().override_text_color = Some(preview_fg);
+                        let palette = &term_theme.palette16;
+                        ui.label(
+                            egui::RichText::new("user@host:~$ ls -la")
+                                .monospace()
+                                .color(preview_fg),
+                        );
+                        ui.label(
+                            egui::RichText::new("connected")
+                                .monospace()
+                                .color(Self::rgb_to_color32(palette[10])),
+                        );
+                        ui.label(
+                            egui::RichText::new("error: permission denied")
+                                .monospace()
+                                .color(Self::rgb_to_color32(palette[9])),
+                        );
+                        ui.label(
+                            egui::RichText::new("selected text")
+                                .monospace()
+                                .color(Self::rgb_to_color32(term_theme.selection_fg))
+                                .background_color(Self::rgb_to_color32(term_theme.selection_bg)),
+                        );
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("cursor")
+                                    .monospace()
+                                    .color(preview_fg),
+                            );
+                            let (cursor_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(8.0, 14.0), Sense::hover());
+                            ui.painter().rect_filled(
+                                cursor_rect,
+                                1.0,
+                                Self::rgb_to_color32(term_theme.cursor),
+                            );
+                        });
+
+                        ui.add_space(3.0);
+                        let strip_w = ui.available_width().max(16.0);
+                        let (strip, _) =
+                            ui.allocate_exact_size(Vec2::new(strip_w, 10.0), Sense::hover());
+                        let sw = strip.width() / 16.0;
+                        for (i, color) in palette.iter().enumerate() {
+                            let x0 = strip.left() + sw * i as f32;
+                            let x1 = if i == 15 {
+                                strip.right()
+                            } else {
+                                strip.left() + sw * (i as f32 + 1.0)
+                            };
+                            let rect = Rect::from_min_max(
+                                Pos2::new(x0, strip.top()),
+                                Pos2::new(x1, strip.bottom()),
+                            );
+                            ui.painter()
+                                .rect_filled(rect, 0.0, Self::rgb_to_color32(*color));
+                        }
+                    });
+            });
+
+        inner.response.interact(Sense::click())
     }
 
     fn draw_settings_page_profiles_and_account(&mut self, ui: &mut egui::Ui) {

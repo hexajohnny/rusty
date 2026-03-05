@@ -1,0 +1,17 @@
+light = false
+comment = "PaperColor Dark"
+
+[metadata]
+name = "PaperColor Dark"
+author = "Rusty"
+
+[colors]
+foreground = "#D0D0D0"
+background = "#1C1C1C"
+cursor_bg = "#D0D0D0"
+cursor_fg = "#1C1C1C"
+cursor_border = "#D0D0D0"
+selection_bg = "#444444"
+selection_fg = "#FFFFFF"
+ansi = ["#1C1C1C", "#AF005F", "#5FAF00", "#D7AF5F", "#5FAFD7", "#808080", "#D7875F", "#D0D0D0"]
+brights = ["#585858", "#5FAF5F", "#AFD700", "#AF87D7", "#FFAF00", "#FF5FAF", "#00AFAF", "#FFFFFF"]

@@ -1,0 +1,17 @@
+light = false
+comment = "Rose Pine"
+
+[metadata]
+name = "Rose Pine"
+author = "Rusty"
+
+[colors]
+foreground = "#E0DEF4"
+background = "#191724"
+cursor_bg = "#EBBCBA"
+cursor_fg = "#191724"
+cursor_border = "#EBBCBA"
+selection_bg = "#403D52"
+selection_fg = "#E0DEF4"
+ansi = ["#26233A", "#EB6F92", "#31748F", "#F6C177", "#9CCFD8", "#C4A7E7", "#EBBCBA", "#E0DEF4"]
+brights = ["#6E6A86", "#EB6F92", "#31748F", "#F6C177", "#9CCFD8", "#C4A7E7", "#EBBCBA", "#E0DEF4"]

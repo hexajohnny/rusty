@@ -1,0 +1,17 @@
+light = false
+comment = "Monokai"
+
+[metadata]
+name = "Monokai"
+author = "Rusty"
+
+[colors]
+foreground = "#F8F8F2"
+background = "#272822"
+cursor_bg = "#F8F8F0"
+cursor_fg = "#272822"
+cursor_border = "#F8F8F0"
+selection_bg = "#49483E"
+selection_fg = "#F8F8F2"
+ansi = ["#272822", "#F92672", "#A6E22E", "#F4BF75", "#66D9EF", "#AE81FF", "#A1EFE4", "#F8F8F2"]
+brights = ["#75715E", "#F92672", "#A6E22E", "#F4BF75", "#66D9EF", "#AE81FF", "#A1EFE4", "#F9F8F5"]

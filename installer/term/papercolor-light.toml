@@ -1,0 +1,17 @@
+light = true
+comment = "PaperColor Light"
+
+[metadata]
+name = "PaperColor Light"
+author = "Rusty"
+
+[colors]
+foreground = "#444444"
+background = "#EEEEEE"
+cursor_bg = "#444444"
+cursor_fg = "#EEEEEE"
+cursor_border = "#444444"
+selection_bg = "#B0D0FF"
+selection_fg = "#000000"
+ansi = ["#EEEEEE", "#AF0000", "#008700", "#5F8700", "#0087AF", "#878787", "#005F87", "#444444"]
+brights = ["#B2B2B2", "#D70000", "#008700", "#AF8700", "#0087AF", "#878787", "#005F87", "#000000"]

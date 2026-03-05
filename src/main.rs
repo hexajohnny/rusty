@@ -8,6 +8,7 @@ mod logger;
 mod model;
 mod ssh;
 mod terminal_emulator;
+mod terminal_themes;
 mod tray;
 
 fn main() -> eframe::Result<()> {

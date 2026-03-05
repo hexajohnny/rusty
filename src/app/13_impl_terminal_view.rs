@@ -103,9 +103,17 @@ impl AppState {
             if let Some(sel) = draw_sel {
                 // Draw selection *after* the galley so it stays visible even when ANSI background
                 // colors are present.
-                Self::draw_selection_galley(&painter, tab, origin, &galley, sel);
+                Self::draw_selection_galley(&painter, tab, origin, &galley, &term_theme, sel);
             }
-            Self::draw_cursor_galley(&painter, tab, origin, &galley, cursor_visible, term_theme.fg, ppp);
+            Self::draw_cursor_galley(
+                &painter,
+                tab,
+                origin,
+                &galley,
+                cursor_visible,
+                term_theme.cursor,
+                ppp,
+            );
 
             Self::handle_terminal_io(ctx, clipboard, ui, tab, rect, origin, cell_w, cell_h, Some(&galley), &response);
         } else {

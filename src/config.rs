@@ -36,7 +36,7 @@ pub struct SavedWindow {
     pub maximized: bool,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RgbColor {
     pub r: u8,
     pub g: u8,
@@ -46,18 +46,6 @@ pub struct RgbColor {
 impl RgbColor {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
-    }
-
-    pub fn to_array(self) -> [u8; 3] {
-        [self.r, self.g, self.b]
-    }
-
-    pub fn from_array(v: [u8; 3]) -> Self {
-        Self {
-            r: v[0],
-            g: v[1],
-            b: v[2],
-        }
     }
 }
 
@@ -71,6 +59,18 @@ fn default_terminal_bg() -> RgbColor {
 
 fn default_terminal_fg() -> RgbColor {
     RgbColor::new(220, 220, 220)
+}
+
+fn default_terminal_cursor() -> RgbColor {
+    default_terminal_fg()
+}
+
+fn default_terminal_selection_bg() -> RgbColor {
+    RgbColor::new(255, 184, 108)
+}
+
+fn default_terminal_selection_fg() -> RgbColor {
+    RgbColor::new(20, 20, 20)
 }
 
 fn default_terminal_palette16() -> [RgbColor; 16] {
@@ -94,12 +94,18 @@ fn default_terminal_palette16() -> [RgbColor; 16] {
     ]
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TerminalColorsConfig {
     #[serde(default = "default_terminal_bg")]
     pub bg: RgbColor,
     #[serde(default = "default_terminal_fg")]
     pub fg: RgbColor,
+    #[serde(default = "default_terminal_cursor")]
+    pub cursor: RgbColor,
+    #[serde(default = "default_terminal_selection_bg")]
+    pub selection_bg: RgbColor,
+    #[serde(default = "default_terminal_selection_fg")]
+    pub selection_fg: RgbColor,
     #[serde(default = "default_terminal_palette16")]
     pub palette16: [RgbColor; 16],
     #[serde(default = "default_dim_blend")]
@@ -111,6 +117,9 @@ impl Default for TerminalColorsConfig {
         Self {
             bg: default_terminal_bg(),
             fg: default_terminal_fg(),
+            cursor: default_terminal_cursor(),
+            selection_bg: default_terminal_selection_bg(),
+            selection_fg: default_terminal_selection_fg(),
             palette16: default_terminal_palette16(),
             dim_blend: default_dim_blend(),
         }
@@ -175,6 +184,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub terminal_colors: TerminalColorsConfig,
     #[serde(default)]
+    pub selected_terminal_theme: Option<String>,
+    #[serde(default)]
     pub transfer_history: Vec<TransferHistoryEntry>,
     #[serde(default)]
     pub update_last_check_unix: Option<u64>,
@@ -200,6 +211,7 @@ impl Default for AppConfig {
             saved_session_layout_json: None,
             saved_window: None,
             terminal_colors: TerminalColorsConfig::default(),
+            selected_terminal_theme: None,
             transfer_history: Vec::new(),
             update_last_check_unix: None,
             update_available_version: None,

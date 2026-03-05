@@ -1,0 +1,17 @@
+light = false
+comment = "GitHub Dark"
+
+[metadata]
+name = "GitHub Dark"
+author = "Rusty"
+
+[colors]
+foreground = "#C9D1D9"
+background = "#0D1117"
+cursor_bg = "#58A6FF"
+cursor_fg = "#0D1117"
+cursor_border = "#58A6FF"
+selection_bg = "#264F78"
+selection_fg = "#C9D1D9"
+ansi = ["#484F58", "#FF7B72", "#3FB950", "#D29922", "#58A6FF", "#BC8CFF", "#39C5CF", "#B1BAC4"]
+brights = ["#6E7681", "#FFA198", "#56D364", "#E3B341", "#79C0FF", "#D2A8FF", "#56D4DD", "#F0F6FC"]

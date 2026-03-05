@@ -34,6 +34,43 @@ impl AppState {
             .saturating_add(1)
             .max(1);
 
+        let terminal_theme_registry = ThemeRegistry::load();
+        let mut terminal_theme_changed = false;
+        if let Some(selected_raw) = config.selected_terminal_theme.clone() {
+            let selected = selected_raw.trim();
+            if selected.is_empty() {
+                config.selected_terminal_theme = None;
+                terminal_theme_changed = true;
+            } else if let Some(theme) = terminal_theme_registry.find_by_id_or_name(selected) {
+                let themed_colors =
+                    theme.to_terminal_colors_config(config.terminal_colors.dim_blend);
+                if config.terminal_colors != themed_colors {
+                    config.terminal_colors = themed_colors;
+                    terminal_theme_changed = true;
+                }
+                if !selected.eq_ignore_ascii_case(&theme.id) {
+                    config.selected_terminal_theme = Some(theme.id.clone());
+                    terminal_theme_changed = true;
+                }
+            } else {
+                let fallback = terminal_theme_registry.default_theme();
+                config.terminal_colors =
+                    fallback.to_terminal_colors_config(config.terminal_colors.dim_blend);
+                crate::logger::log_line(
+                    "logs\\terminal-themes.log",
+                    &format!(
+                        "Selected terminal theme '{selected}' was not found; applied fallback theme '{}'.",
+                        fallback.name
+                    ),
+                );
+                config.selected_terminal_theme = None;
+                terminal_theme_changed = true;
+            }
+        }
+        if terminal_theme_changed {
+            config_saver.request_save(config.clone());
+        }
+
         // Resolve the default profile index (if any). If the saved default no longer exists,
         // clear it so we don't get stuck on startup behavior.
         let mut default_profile_idx: Option<usize> = None;
@@ -148,6 +185,7 @@ impl AppState {
             theme,
             theme_source,
             term_theme: TermTheme::from_config(&config.terminal_colors),
+            terminal_theme_registry,
             config,
             config_saver,
             settings_dialog,
@@ -188,6 +226,63 @@ impl AppState {
             update_manual_open_if_newer: false,
             update_manual_status: None,
         }
+    }
+
+    fn refresh_terminal_theme_registry(&mut self) {
+        self.terminal_theme_registry = ThemeRegistry::load();
+        if let Some(selected) = self.config.selected_terminal_theme.clone() {
+            if self
+                .terminal_theme_registry
+                .find_by_id_or_name(&selected)
+                .is_none()
+            {
+                crate::logger::log_line(
+                    "logs\\terminal-themes.log",
+                    &format!(
+                        "Selected terminal theme '{selected}' is no longer available after reload."
+                    ),
+                );
+                self.config.selected_terminal_theme = None;
+                self.config_saver.request_save(self.config.clone());
+            }
+        }
+    }
+
+    fn apply_terminal_theme_selection(&mut self, selected: &str, persist: bool) -> bool {
+        let Some(theme) = self
+            .terminal_theme_registry
+            .find_by_id_or_name(selected)
+            .cloned()
+        else {
+            crate::logger::log_line(
+                "logs\\terminal-themes.log",
+                &format!("Requested terminal theme '{selected}' was not found."),
+            );
+            return false;
+        };
+
+        let mut changed = false;
+        let new_colors = theme.to_terminal_colors_config(self.config.terminal_colors.dim_blend);
+        if self.config.terminal_colors != new_colors {
+            self.config.terminal_colors = new_colors;
+            changed = true;
+        }
+
+        if self
+            .config
+            .selected_terminal_theme
+            .as_deref()
+            .map(|s| !s.eq_ignore_ascii_case(&theme.id))
+            .unwrap_or(true)
+        {
+            self.config.selected_terminal_theme = Some(theme.id.clone());
+            changed = true;
+        }
+
+        if changed && persist {
+            self.config_saver.request_save(self.config.clone());
+        }
+        changed
     }
 
     fn now_unix_secs() -> u64 {

@@ -1,0 +1,17 @@
+light = true
+comment = "GitHub Light"
+
+[metadata]
+name = "GitHub Light"
+author = "Rusty"
+
+[colors]
+foreground = "#24292E"
+background = "#FFFFFF"
+cursor_bg = "#24292E"
+cursor_fg = "#FFFFFF"
+cursor_border = "#24292E"
+selection_bg = "#C8E1FF"
+selection_fg = "#24292E"
+ansi = ["#24292E", "#D73A49", "#22863A", "#B08800", "#0366D6", "#6F42C1", "#005CC5", "#6A737D"]
+brights = ["#959DA5", "#CB2431", "#28A745", "#DBAB09", "#2188FF", "#8A63D2", "#79B8FF", "#24292E"]

@@ -1,0 +1,17 @@
+light = false
+comment = "Balanced dark blue"
+
+[metadata]
+name = "Tokyo Night"
+author = "Rusty"
+
+[colors]
+foreground = "#C0CAF5"
+background = "#1A1B26"
+cursor_bg = "#C0CAF5"
+cursor_fg = "#1A1B26"
+cursor_border = "#C0CAF5"
+selection_bg = "#33467C"
+selection_fg = "#C0CAF5"
+ansi = ["#15161E", "#F7768E", "#9ECE6A", "#E0AF68", "#7AA2F7", "#BB9AF7", "#7DCFFF", "#A9B1D6"]
+brights = ["#414868", "#F7768E", "#9ECE6A", "#E0AF68", "#7AA2F7", "#BB9AF7", "#7DCFFF", "#C0CAF5"]

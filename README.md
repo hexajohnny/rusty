@@ -10,7 +10,18 @@ It focuses on:
 - Profile-based connections.
 - Theme support.
 
-Theme format details: [THEMES.md](THEMES.md)
+## Theming
+
+- UI chrome themes use `.thm` files in `./theme` (details: [THEMES.md](THEMES.md)).
+- Terminal color themes use WezTerm-compatible TOML schemes in `./term` (for example `term/tokyo-night.toml`).
+
+Terminal theme behavior:
+- Open **Settings -> Terminal Colors** to browse scrollable theme cards.
+- Click a card to apply immediately (including existing terminal sessions).
+- Add your own `.toml` files to `./term`, then click **Reload from term/**.
+
+WezTerm scheme reference:
+- https://wezterm.org/config/lua/wezterm.color/load_scheme.html
 
 ## Screenshots
 

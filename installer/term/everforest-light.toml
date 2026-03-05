@@ -1,0 +1,17 @@
+light = true
+comment = "Everforest Light"
+
+[metadata]
+name = "Everforest Light"
+author = "Rusty"
+
+[colors]
+foreground = "#5C6A72"
+background = "#F3EAD3"
+cursor_bg = "#5C6A72"
+cursor_fg = "#F3EAD3"
+cursor_border = "#5C6A72"
+selection_bg = "#E5D8BA"
+selection_fg = "#3A4A52"
+ansi = ["#5C6A72", "#F85552", "#8DA101", "#DFA000", "#3A94C5", "#DF69BA", "#35A77C", "#5C6A72"]
+brights = ["#A6B0A0", "#F57D26", "#8DA101", "#DFA000", "#3A94C5", "#DF69BA", "#35A77C", "#3A4A52"]

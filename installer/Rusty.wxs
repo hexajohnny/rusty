@@ -3,7 +3,7 @@
   <Package
     Name="Rusty"
     Manufacturer="hexajohnny"
-    Version="0.1.3"
+    Version="0.1.4"
     UpgradeCode="{A77A6E2E-8A7F-4C9F-9CF0-9D44E1A44F1A}"
     Language="1033"
     Scope="perMachine">
@@ -19,6 +19,7 @@
     <StandardDirectory Id="$(var.ProgramFilesRoot)">
       <Directory Id="INSTALLFOLDER" Name="Rusty">
         <Directory Id="THEMEFOLDER" Name="theme" />
+        <Directory Id="TERMFOLDER" Name="term" />
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
@@ -78,40 +79,101 @@
       </Component>
 
       <Component Id="cmpThemeDark" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeDark" Source="installer\\theme\\Dark.thm" />
+        <File Id="filThemeDark" Source="dist\\theme\\Dark.thm" />
       </Component>
       <Component Id="cmpThemeLight" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeLight" Source="installer\\theme\\Light.thm" />
+        <File Id="filThemeLight" Source="dist\\theme\\Light.thm" />
       </Component>
       <Component Id="cmpThemeCrimsonDusk" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeCrimsonDusk" Source="installer\\theme\\CrimsonDusk.thm" />
+        <File Id="filThemeCrimsonDusk" Source="dist\\theme\\CrimsonDusk.thm" />
       </Component>
       <Component Id="cmpThemeEmeraldMist" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeEmeraldMist" Source="installer\\theme\\EmeraldMist.thm" />
+        <File Id="filThemeEmeraldMist" Source="dist\\theme\\EmeraldMist.thm" />
       </Component>
       <Component Id="cmpThemeForestNight" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeForestNight" Source="installer\\theme\\ForestNight.thm" />
+        <File Id="filThemeForestNight" Source="dist\\theme\\ForestNight.thm" />
       </Component>
       <Component Id="cmpThemeGraphite" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeGraphite" Source="installer\\theme\\Graphite.thm" />
+        <File Id="filThemeGraphite" Source="dist\\theme\\Graphite.thm" />
       </Component>
       <Component Id="cmpThemeMidnightBlue" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeMidnightBlue" Source="installer\\theme\\MidnightBlue.thm" />
+        <File Id="filThemeMidnightBlue" Source="dist\\theme\\MidnightBlue.thm" />
       </Component>
       <Component Id="cmpThemeMonochromeSlate" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeMonochromeSlate" Source="installer\\theme\\MonochromeSlate.thm" />
+        <File Id="filThemeMonochromeSlate" Source="dist\\theme\\MonochromeSlate.thm" />
       </Component>
       <Component Id="cmpThemeOceanBreeze" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeOceanBreeze" Source="installer\\theme\\OceanBreeze.thm" />
+        <File Id="filThemeOceanBreeze" Source="dist\\theme\\OceanBreeze.thm" />
       </Component>
       <Component Id="cmpThemeSandstone" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeSandstone" Source="installer\\theme\\Sandstone.thm" />
+        <File Id="filThemeSandstone" Source="dist\\theme\\Sandstone.thm" />
       </Component>
       <Component Id="cmpThemeSolarizedDark" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeSolarizedDark" Source="installer\\theme\\SolarizedDark.thm" />
+        <File Id="filThemeSolarizedDark" Source="dist\\theme\\SolarizedDark.thm" />
       </Component>
       <Component Id="cmpThemeSolarizedLight" Guid="*" Directory="THEMEFOLDER">
-        <File Id="filThemeSolarizedLight" Source="installer\\theme\\SolarizedLight.thm" />
+        <File Id="filThemeSolarizedLight" Source="dist\\theme\\SolarizedLight.thm" />
+      </Component>
+
+      <Component Id="cmpTermAyuLight" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermAyuLight" Source="dist\\term\\ayu-light.toml" />
+      </Component>
+      <Component Id="cmpTermCatppuccinLatte" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermCatppuccinLatte" Source="dist\\term\\catppuccin-latte.toml" />
+      </Component>
+      <Component Id="cmpTermCatppuccinMocha" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermCatppuccinMocha" Source="dist\\term\\catppuccin-mocha.toml" />
+      </Component>
+      <Component Id="cmpTermDracula" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermDracula" Source="dist\\term\\dracula.toml" />
+      </Component>
+      <Component Id="cmpTermEverforestDark" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermEverforestDark" Source="dist\\term\\everforest-dark.toml" />
+      </Component>
+      <Component Id="cmpTermEverforestLight" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermEverforestLight" Source="dist\\term\\everforest-light.toml" />
+      </Component>
+      <Component Id="cmpTermGithubDark" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermGithubDark" Source="dist\\term\\github-dark.toml" />
+      </Component>
+      <Component Id="cmpTermGithubLight" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermGithubLight" Source="dist\\term\\github-light.toml" />
+      </Component>
+      <Component Id="cmpTermGruvboxDark" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermGruvboxDark" Source="dist\\term\\gruvbox-dark.toml" />
+      </Component>
+      <Component Id="cmpTermGruvboxLight" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermGruvboxLight" Source="dist\\term\\gruvbox-light.toml" />
+      </Component>
+      <Component Id="cmpTermKanagawa" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermKanagawa" Source="dist\\term\\kanagawa.toml" />
+      </Component>
+      <Component Id="cmpTermMonokai" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermMonokai" Source="dist\\term\\monokai.toml" />
+      </Component>
+      <Component Id="cmpTermNord" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermNord" Source="dist\\term\\nord.toml" />
+      </Component>
+      <Component Id="cmpTermOneDark" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermOneDark" Source="dist\\term\\one-dark.toml" />
+      </Component>
+      <Component Id="cmpTermPapercolorDark" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermPapercolorDark" Source="dist\\term\\papercolor-dark.toml" />
+      </Component>
+      <Component Id="cmpTermPapercolorLight" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermPapercolorLight" Source="dist\\term\\papercolor-light.toml" />
+      </Component>
+      <Component Id="cmpTermRosePine" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermRosePine" Source="dist\\term\\rose-pine.toml" />
+      </Component>
+      <Component Id="cmpTermSolarizedDark" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermSolarizedDark" Source="dist\\term\\solarized-dark.toml" />
+      </Component>
+      <Component Id="cmpTermSolarizedLight" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermSolarizedLight" Source="dist\\term\\solarized-light.toml" />
+      </Component>
+      <Component Id="cmpTermTokyoNight" Guid="*" Directory="TERMFOLDER">
+        <File Id="filTermTokyoNight" Source="dist\\term\\tokyo-night.toml" />
       </Component>
     </ComponentGroup>
   </Fragment>

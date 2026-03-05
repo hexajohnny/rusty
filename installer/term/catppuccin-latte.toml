@@ -1,0 +1,17 @@
+light = true
+comment = "Catppuccin Latte"
+
+[metadata]
+name = "Catppuccin Latte"
+author = "Rusty"
+
+[colors]
+foreground = "#4C4F69"
+background = "#EFF1F5"
+cursor_bg = "#4C4F69"
+cursor_fg = "#EFF1F5"
+cursor_border = "#4C4F69"
+selection_bg = "#CCD0DA"
+selection_fg = "#4C4F69"
+ansi = ["#5C5F77", "#D20F39", "#40A02B", "#DF8E1D", "#1E66F5", "#EA76CB", "#179299", "#ACB0BE"]
+brights = ["#6C6F85", "#D20F39", "#40A02B", "#DF8E1D", "#1E66F5", "#EA76CB", "#179299", "#BCC0CC"]

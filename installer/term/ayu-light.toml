@@ -1,0 +1,17 @@
+light = true
+comment = "Ayu Light"
+
+[metadata]
+name = "Ayu Light"
+author = "Rusty"
+
+[colors]
+foreground = "#5C6773"
+background = "#FAFAFA"
+cursor_bg = "#FF9940"
+cursor_fg = "#FAFAFA"
+cursor_border = "#FF9940"
+selection_bg = "#E6B450"
+selection_fg = "#1F2430"
+ansi = ["#000000", "#F51818", "#86B300", "#F2AE49", "#399EE6", "#A37ACC", "#4CBF99", "#5C6773"]
+brights = ["#828C99", "#FF3333", "#A6CC70", "#E7C547", "#4CBFEE", "#B89FE3", "#A3D9C9", "#1F2430"]

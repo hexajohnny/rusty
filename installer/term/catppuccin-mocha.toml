@@ -1,0 +1,17 @@
+light = false
+comment = "Catppuccin Mocha"
+
+[metadata]
+name = "Catppuccin Mocha"
+author = "Rusty"
+
+[colors]
+foreground = "#CDD6F4"
+background = "#1E1E2E"
+cursor_bg = "#F5E0DC"
+cursor_fg = "#1E1E2E"
+cursor_border = "#F5E0DC"
+selection_bg = "#45475A"
+selection_fg = "#CDD6F4"
+ansi = ["#45475A", "#F38BA8", "#A6E3A1", "#F9E2AF", "#89B4FA", "#F5C2E7", "#94E2D5", "#BAC2DE"]
+brights = ["#585B70", "#F38BA8", "#A6E3A1", "#F9E2AF", "#89B4FA", "#F5C2E7", "#94E2D5", "#A6ADC8"]

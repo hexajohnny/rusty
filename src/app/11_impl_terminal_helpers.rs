@@ -1072,14 +1072,16 @@ impl AppState {
         tab: &SshTab,
         origin: Pos2,
         galley: &egui::Galley,
+        term_theme: &TermTheme,
         sel: TermSelection,
     ) {
-        // Slightly stronger than a typical text selection so it's visible over dense ANSI color output.
+        // Flash brighter on copy, then selection disappears (handled in the AppState update loop).
+        let with_alpha =
+            |c: Color32, a: u8| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
         let selection_bg = if tab.copy_flash_until.is_some() {
-            // Flash brighter on copy, then selection disappears (handled in the AppState update loop).
-            Color32::from_rgba_unmultiplied(255, 184, 108, 190)
+            with_alpha(adjust_color(term_theme.selection_bg, 0.18), 210)
         } else {
-            Color32::from_rgba_unmultiplied(255, 184, 108, 96)
+            with_alpha(term_theme.selection_bg, 120)
         };
         let (rows, cols) = tab.screen.size();
         if rows == 0 || cols == 0 {
@@ -1119,6 +1121,7 @@ impl AppState {
             let y1 = origin.y + row_g.rect.bottom();
             let rect = Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1));
             painter.rect_filled(rect, 0.0, selection_bg);
+            painter.rect_stroke(rect, 0.0, Stroke::new(1.0, with_alpha(term_theme.selection_fg, 70)));
         }
     }
 
