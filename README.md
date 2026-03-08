@@ -20,9 +20,8 @@ Terminal theme behavior:
 - Click a card to apply immediately (including existing terminal sessions).
 - Add your own `.toml` files to `./term`, then click **Reload from term/**.
 
-WezTerm scheme reference:
-- https://wezterm.org/config/lua/wezterm.color/load_scheme.html
-
+WezTerm templates:
+[iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes/tree/master/wezterm)
 ## Screenshots
 
 <p align="center">
