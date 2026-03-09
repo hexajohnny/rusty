@@ -6,9 +6,7 @@ impl AppState {
             return 1;
         }
         let remaining = blink_period.saturating_sub(elapsed);
-        remaining
-            .as_millis()
-            .clamp(1, u64::MAX as u128) as u64
+        remaining.as_millis().clamp(1, u64::MAX as u128) as u64
     }
 
     fn update_cursor_blink(&mut self) {
@@ -237,81 +235,6 @@ impl AppState {
 
     fn draw_settings_page_appearance(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
-        let ctx = ui.ctx().clone();
-
-        let before_theme_file = self.config.ui_theme_file.clone();
-        ui.label("Theme file (.thm)");
-        let mode_file = default_theme_file_name(self.config.ui_theme_mode).to_string();
-        let available_theme_files = available_theme_file_names();
-        let selected_theme_text = match self.config.ui_theme_file.as_deref() {
-            Some(name) => {
-                if available_theme_files
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(name))
-                {
-                    name.to_string()
-                } else {
-                    format!("{name} (missing)")
-                }
-            }
-            None => format!("Mode default ({mode_file})"),
-        };
-        let mut chosen_theme_file = self.config.ui_theme_file.clone();
-        egui::ComboBox::from_id_source("ui_theme_file_combo")
-            .selected_text(selected_theme_text)
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                let mode_label = format!("Mode default ({mode_file})");
-                if ui
-                    .selectable_label(chosen_theme_file.is_none(), mode_label)
-                    .clicked()
-                {
-                    chosen_theme_file = None;
-                }
-
-                for file in &available_theme_files {
-                    let selected = chosen_theme_file
-                        .as_deref()
-                        .map(|s| s.eq_ignore_ascii_case(file))
-                        .unwrap_or(false);
-                    if ui.selectable_label(selected, file).clicked() {
-                        chosen_theme_file = Some(file.clone());
-                    }
-                }
-            });
-        self.config.ui_theme_file = chosen_theme_file;
-
-        let theme_file_changed = self.config.ui_theme_file != before_theme_file;
-        if theme_file_changed {
-            let (new_theme, source) = load_ui_theme(
-                self.config.ui_theme_mode,
-                self.config.ui_theme_file.as_deref(),
-            );
-            self.theme = new_theme;
-            self.theme_source = source;
-            self.apply_global_style(&ctx);
-            self.style_initialized = true;
-            self.config_saver.request_save(self.config.clone());
-        }
-
-        if let Some(path) = self.theme_source.as_ref() {
-            ui.label(
-                egui::RichText::new(format!("Loaded from {}", path.display()))
-                    .color(theme.muted)
-                    .size(12.0),
-            );
-        } else {
-            let msg = if let Some(file) = self.config.ui_theme_file.as_deref() {
-                format!("Using built-in fallback (theme file '{file}' not found or invalid).")
-            } else {
-                format!(
-                    "Using built-in fallback (missing {mode_file} in ./theme, ./dist/theme, or near the executable)."
-                )
-            };
-            ui.label(egui::RichText::new(msg).color(theme.muted).size(12.0));
-        }
-
-        ui.add_space(8.0);
         let before_focus_shade = self.config.focus_shade;
         ui.checkbox(
             &mut self.config.focus_shade,
@@ -389,20 +312,159 @@ impl AppState {
         );
     }
 
+    fn draw_settings_page_ui_theme(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme;
+        let ctx = ui.ctx().clone();
+        let mode_file = default_theme_file_name(self.config.ui_theme_mode).to_string();
+        let available_theme_files = available_theme_file_names();
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Theme presets").strong());
+            if ui.button("Refresh list").clicked() {
+                ui.ctx().request_repaint();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Loads .thm UI themes from ./theme and applies them instantly.")
+                .color(theme.muted)
+                .size(12.0),
+        );
+
+        let mut selected_theme_to_apply: Option<Option<String>> = None;
+        let list_height = ui.available_height().max(150.0);
+        egui::ScrollArea::vertical()
+            .id_source("settings_ui_theme_list_scroll")
+            .auto_shrink([false, false])
+            .max_height(list_height)
+            .show(ui, |ui| {
+                let default_title = format!("Mode default ({mode_file})");
+                let (default_preview, default_source) =
+                    load_ui_theme(self.config.ui_theme_mode, None);
+                let default_label = if default_source.is_some() {
+                    "Mode default"
+                } else {
+                    "Built-in fallback"
+                };
+                let default_selected = self.config.ui_theme_file.is_none();
+                let resp = Self::draw_ui_theme_preview_card(
+                    ui,
+                    theme,
+                    default_preview,
+                    &default_title,
+                    default_label,
+                    default_selected,
+                );
+                if resp.clicked() {
+                    selected_theme_to_apply = Some(None);
+                }
+
+                if !available_theme_files.is_empty() {
+                    ui.add_space(4.0);
+                }
+
+                for file in &available_theme_files {
+                    let selected = self
+                        .config
+                        .ui_theme_file
+                        .as_deref()
+                        .map(|s| s.eq_ignore_ascii_case(file))
+                        .unwrap_or(false);
+                    let (preview, source) = load_ui_theme(self.config.ui_theme_mode, Some(file));
+                    let source_is_file = source
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .and_then(|f| f.to_str())
+                        .map(|f| f.eq_ignore_ascii_case(file))
+                        .unwrap_or(false);
+                    let source_label = if source_is_file {
+                        "Custom .thm"
+                    } else {
+                        "Fallback"
+                    };
+
+                    let resp = Self::draw_ui_theme_preview_card(
+                        ui,
+                        theme,
+                        preview,
+                        file,
+                        source_label,
+                        selected,
+                    );
+                    if resp.clicked() {
+                        selected_theme_to_apply = Some(Some(file.clone()));
+                    }
+                    ui.add_space(4.0);
+                }
+
+                if available_theme_files.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("No .thm files found in UI theme directories.")
+                            .color(theme.muted)
+                            .size(12.0),
+                    );
+                    for dir in theme_dir_paths() {
+                        ui.label(
+                            egui::RichText::new(format!("Searched: {}", dir.display()))
+                                .color(theme.muted)
+                                .size(11.0),
+                        );
+                    }
+                }
+            });
+
+        if let Some(theme_file) = selected_theme_to_apply {
+            if self.apply_ui_theme_file_selection(theme_file, &ctx) {
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+
+    fn apply_ui_theme_file_selection(
+        &mut self,
+        selected_theme_file: Option<String>,
+        ctx: &egui::Context,
+    ) -> bool {
+        let normalized_selected = normalize_theme_file_name(selected_theme_file.as_deref());
+        let changed = match (
+            self.config.ui_theme_file.as_deref(),
+            normalized_selected.as_deref(),
+        ) {
+            (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b),
+            (None, None) => false,
+            _ => true,
+        };
+        if !changed {
+            return false;
+        }
+
+        self.config.ui_theme_file = normalized_selected;
+        let (new_theme, source) = load_ui_theme(
+            self.config.ui_theme_mode,
+            self.config.ui_theme_file.as_deref(),
+        );
+        self.theme = new_theme;
+        self.theme_source = source;
+        self.apply_global_style(ctx);
+        self.style_initialized = true;
+        self.config_saver.request_save(self.config.clone());
+        true
+    }
+
     fn draw_settings_page_updates(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
 
         ui.label(
-            egui::RichText::new(format!(
-                "Current version: v{}",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .strong(),
+            egui::RichText::new(format!("Current version: v{}", env!("CARGO_PKG_VERSION")))
+                .strong(),
         );
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("Checks GitHub releases and opens the release page when a newer version is found.")
-                .color(theme.muted),
+            egui::RichText::new(
+                "Checks GitHub releases and opens the release page when a newer version is found.",
+            )
+            .color(theme.muted),
         );
         ui.add_space(10.0);
 
@@ -447,7 +509,7 @@ impl AppState {
         ui.separator();
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new("Automatic checks still run at most once every 12 hours.")
+            egui::RichText::new("Checks are manual-only and run when you click the button above.")
                 .color(theme.muted)
                 .size(12.0),
         );
@@ -501,7 +563,7 @@ impl AppState {
                 if resp.clicked() {
                     selected_theme_to_apply = Some(term_theme.id.clone());
                 }
-                ui.add_space(8.0);
+                ui.add_space(4.0);
             }
         }
 
@@ -524,6 +586,120 @@ impl AppState {
                 );
             }
         }
+    }
+
+    fn draw_ui_theme_preview_card(
+        ui: &mut egui::Ui,
+        app_theme: UiTheme,
+        preview_theme: UiTheme,
+        title: &str,
+        source_label: &str,
+        selected: bool,
+    ) -> Response {
+        let card_width = ui.available_width().max(120.0);
+        let fill = if selected {
+            adjust_color(app_theme.top_bg, 0.16)
+        } else {
+            adjust_color(app_theme.top_bg, 0.08)
+        };
+        let stroke = if selected {
+            Stroke::new(1.0, app_theme.accent)
+        } else {
+            Stroke::new(1.0, app_theme.top_border)
+        };
+
+        let inner = egui::Frame::none()
+            .fill(fill)
+            .stroke(stroke)
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::same(8.0))
+            .show(ui, |ui| {
+                ui.set_min_width((card_width - 16.0).max(96.0));
+                ui.horizontal(|ui| {
+                    let title = if selected {
+                        egui::RichText::new(title)
+                            .strong()
+                            .size(13.0)
+                            .color(app_theme.accent)
+                    } else {
+                        egui::RichText::new(title)
+                            .strong()
+                            .size(13.0)
+                            .color(app_theme.fg)
+                    };
+                    ui.label(title);
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(source_label)
+                                .size(11.0)
+                                .color(app_theme.muted),
+                        );
+                    });
+                });
+
+                ui.add_space(3.0);
+                egui::Frame::none()
+                    .fill(preview_theme.bg)
+                    .stroke(Stroke::new(1.0, preview_theme.top_border))
+                    .rounding(egui::Rounding::same(5.0))
+                    .inner_margin(egui::Margin::same(6.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (accent_dot, _) =
+                                ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
+                            ui.painter()
+                                .rect_filled(accent_dot, 2.0, preview_theme.accent);
+                            ui.label(
+                                egui::RichText::new("Rusty Settings")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(preview_theme.fg),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    egui::RichText::new("Preview")
+                                        .size(10.0)
+                                        .color(preview_theme.muted),
+                                );
+                            });
+                        });
+
+                        ui.add_space(3.0);
+                        let preview_w = ui.available_width().max(28.0);
+                        let row_h = 10.0;
+
+                        let (top_row, _) =
+                            ui.allocate_exact_size(Vec2::new(preview_w, row_h), Sense::hover());
+                        ui.painter().rect_filled(top_row, 2.0, preview_theme.top_bg);
+                        let top_accent = Rect::from_min_max(
+                            Pos2::new(top_row.left() + 2.0, top_row.top() + 2.0),
+                            Pos2::new(top_row.left() + 24.0, top_row.bottom() - 2.0),
+                        );
+                        ui.painter()
+                            .rect_filled(top_accent, 1.0, preview_theme.accent);
+
+                        let (mid_row, _) =
+                            ui.allocate_exact_size(Vec2::new(preview_w, row_h), Sense::hover());
+                        ui.painter().rect_filled(
+                            mid_row,
+                            2.0,
+                            adjust_color(preview_theme.top_bg, 0.06),
+                        );
+                        let muted_chip = Rect::from_min_max(
+                            Pos2::new(mid_row.left() + 2.0, mid_row.top() + 2.0),
+                            Pos2::new(mid_row.left() + 20.0, mid_row.bottom() - 2.0),
+                        );
+                        ui.painter()
+                            .rect_filled(muted_chip, 1.0, preview_theme.muted);
+                        let fg_chip = Rect::from_min_max(
+                            Pos2::new(mid_row.left() + 24.0, mid_row.top() + 2.0),
+                            Pos2::new(mid_row.left() + 52.0, mid_row.bottom() - 2.0),
+                        );
+                        ui.painter().rect_filled(fg_chip, 1.0, preview_theme.fg);
+                    });
+            });
+
+        inner.response.interact(Sense::click())
     }
 
     fn rgb_to_color32(color: config::RgbColor) -> Color32 {
@@ -551,17 +727,21 @@ impl AppState {
         let inner = egui::Frame::none()
             .fill(fill)
             .stroke(stroke)
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::same(10.0))
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::same(8.0))
             .show(ui, |ui| {
-                ui.set_min_width((card_width - 20.0).max(100.0));
+                ui.set_min_width((card_width - 16.0).max(96.0));
                 ui.horizontal(|ui| {
                     let title = if selected {
                         egui::RichText::new(&term_theme.name)
                             .strong()
+                            .size(13.0)
                             .color(app_theme.accent)
                     } else {
-                        egui::RichText::new(&term_theme.name).strong().color(app_theme.fg)
+                        egui::RichText::new(&term_theme.name)
+                            .strong()
+                            .size(13.0)
+                            .color(app_theme.fg)
                     };
                     ui.label(title);
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -573,67 +753,49 @@ impl AppState {
                     });
                 });
 
-                if let Some(comment) = term_theme.comment.as_deref() {
+                if let Some(comment) = term_theme
+                    .comment
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case(&term_theme.name))
+                {
                     ui.label(
                         egui::RichText::new(comment)
-                            .size(11.0)
+                            .size(10.0)
                             .color(app_theme.muted),
-                    );
+                    )
+                    .on_hover_text(comment);
                 }
 
-                ui.add_space(6.0);
+                ui.add_space(3.0);
                 let preview_bg = Self::rgb_to_color32(term_theme.background);
                 let preview_fg = Self::rgb_to_color32(term_theme.foreground);
-                let preview_border = adjust_color(preview_bg, if term_theme.light { -0.18 } else { 0.25 });
+                let preview_border =
+                    adjust_color(preview_bg, if term_theme.light { -0.18 } else { 0.25 });
                 egui::Frame::none()
                     .fill(preview_bg)
                     .stroke(Stroke::new(1.0, preview_border))
-                    .rounding(egui::Rounding::same(6.0))
-                    .inner_margin(egui::Margin::same(8.0))
+                    .rounding(egui::Rounding::same(5.0))
+                    .inner_margin(egui::Margin::same(6.0))
                     .show(ui, |ui| {
                         ui.visuals_mut().override_text_color = Some(preview_fg);
                         let palette = &term_theme.palette16;
                         ui.label(
                             egui::RichText::new("user@host:~$ ls -la")
                                 .monospace()
+                                .size(11.0)
                                 .color(preview_fg),
-                        );
-                        ui.label(
-                            egui::RichText::new("connected")
-                                .monospace()
-                                .color(Self::rgb_to_color32(palette[10])),
                         );
                         ui.label(
                             egui::RichText::new("error: permission denied")
                                 .monospace()
+                                .size(11.0)
                                 .color(Self::rgb_to_color32(palette[9])),
                         );
-                        ui.label(
-                            egui::RichText::new("selected text")
-                                .monospace()
-                                .color(Self::rgb_to_color32(term_theme.selection_fg))
-                                .background_color(Self::rgb_to_color32(term_theme.selection_bg)),
-                        );
-
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("cursor")
-                                    .monospace()
-                                    .color(preview_fg),
-                            );
-                            let (cursor_rect, _) =
-                                ui.allocate_exact_size(Vec2::new(8.0, 14.0), Sense::hover());
-                            ui.painter().rect_filled(
-                                cursor_rect,
-                                1.0,
-                                Self::rgb_to_color32(term_theme.cursor),
-                            );
-                        });
-
-                        ui.add_space(3.0);
+                        ui.add_space(2.0);
                         let strip_w = ui.available_width().max(16.0);
                         let (strip, _) =
-                            ui.allocate_exact_size(Vec2::new(strip_w, 10.0), Sense::hover());
+                            ui.allocate_exact_size(Vec2::new(strip_w, 8.0), Sense::hover());
                         let sw = strip.width() / 16.0;
                         for (i, color) in palette.iter().enumerate() {
                             let x0 = strip.left() + sw * i as f32;
@@ -657,10 +819,11 @@ impl AppState {
 
     fn draw_settings_page_profiles_and_account(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
+        ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
         ui.label(egui::RichText::new("Profiles").strong());
         egui::ScrollArea::vertical()
             .id_source("settings_profiles_list_scroll")
-            .max_height(140.0)
+            .max_height(120.0)
             .show(ui, |ui| {
                 let mut load_idx: Option<usize> = None;
                 let mut delete_idx: Option<usize> = None;
@@ -731,7 +894,6 @@ impl AppState {
                 }
             });
 
-        ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             if ui.button("New").clicked() {
                 self.settings_dialog.selected_profile = None;
@@ -769,86 +931,95 @@ impl AppState {
             }
         });
 
-        ui.add_space(8.0);
-        ui.label("Profile name");
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut self.settings_dialog.profile_name)
-                .hint_text("e.g. prod-1")
-                .desired_width(ui.available_width()),
-        );
+        ui.horizontal(|ui| {
+            ui.label("Profile name");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.settings_dialog.profile_name)
+                    .hint_text("e.g. prod-1")
+                    .desired_width((ui.available_width() - 96.0).max(120.0)),
+            );
+            if self.settings_dialog.just_opened {
+                resp.request_focus();
+                self.settings_dialog.just_opened = false;
+            }
+        });
         if self.settings_dialog.just_opened {
-            resp.request_focus();
             self.settings_dialog.just_opened = false;
         }
 
-        ui.add_space(6.0);
-        ui.checkbox(
-            &mut self.settings_dialog.remember_password,
-            "Remember password",
-        );
-        if self.settings_dialog.remember_password {
-            ui.label(
-                egui::RichText::new("Stored encrypted in a local config file (Windows DPAPI).")
-                    .color(theme.muted)
-                    .size(12.0),
-            );
-        }
-
-        ui.add_space(12.0);
         ui.separator();
-        ui.add_space(10.0);
-
         ui.label(egui::RichText::new("Connection").strong());
-        ui.add_space(6.0);
+        egui::Grid::new("settings_profile_connection_grid")
+            .num_columns(2)
+            .spacing(Vec2::new(10.0, 6.0))
+            .show(ui, |ui| {
+                ui.label("Host");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings_dialog.draft.host)
+                        .hint_text("example.com")
+                        .desired_width(ui.available_width()),
+                );
+                ui.end_row();
 
-        ui.label("Host");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.settings_dialog.draft.host)
-                .hint_text("example.com")
-                .desired_width(ui.available_width()),
-        );
-        ui.add_space(6.0);
+                ui.label("Port");
+                ui.add(
+                    egui::DragValue::new(&mut self.settings_dialog.draft.port)
+                        .speed(1.0)
+                        .clamp_range(1..=65535),
+                );
+                ui.end_row();
 
-        ui.label("Port");
-        ui.add(
-            egui::DragValue::new(&mut self.settings_dialog.draft.port)
-                .speed(1.0)
-                .clamp_range(1..=65535),
-        );
-        ui.add_space(6.0);
+                ui.label("User");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings_dialog.draft.username)
+                        .desired_width(ui.available_width()),
+                );
+                ui.end_row();
+            });
 
-        ui.label("User");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.settings_dialog.draft.username)
-                .desired_width(ui.available_width()),
-        );
-        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Advanced authentication").strong());
+        egui::Grid::new("settings_profile_advanced_grid")
+            .num_columns(2)
+            .spacing(Vec2::new(10.0, 6.0))
+            .show(ui, |ui| {
+                ui.label("Password (optional)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings_dialog.draft.password)
+                        .password(true)
+                        .desired_width(ui.available_width()),
+                );
+                ui.end_row();
 
-        ui.label("Password (optional)");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.settings_dialog.draft.password)
-                .password(true)
-                .desired_width(ui.available_width()),
-        );
-        ui.add_space(6.0);
+                ui.label("Remember password");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.settings_dialog.remember_password, "Enable");
+                    ui.label(egui::RichText::new("(i)").color(theme.muted))
+                        .on_hover_text("Stored encrypted in local config using Windows DPAPI.");
+                });
+                ui.end_row();
 
-        ui.label("Private key (optional)");
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.settings_dialog.draft.private_key_path)
-                    .hint_text("C:\\\\Users\\\\you\\\\.ssh\\\\id_ed25519")
-                    .desired_width(ui.available_width() - 92.0),
-            );
-            if ui.button("Browse...").clicked() {
-                let mut dlg = rfd::FileDialog::new();
-                if let Some(profile_dir) = user_profile_dir() {
-                    dlg = dlg.set_directory(profile_dir);
-                }
-                if let Some(path) = dlg.pick_file() {
-                    self.settings_dialog.draft.private_key_path = path.display().to_string();
-                }
-            }
-        });
+                ui.label("Private key (optional)");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(
+                            &mut self.settings_dialog.draft.private_key_path,
+                        )
+                        .hint_text("C:\\\\Users\\\\you\\\\.ssh\\\\id_ed25519")
+                        .desired_width((ui.available_width() - 92.0).max(120.0)),
+                    );
+                    if ui.button("Browse...").clicked() {
+                        let mut dlg = rfd::FileDialog::new();
+                        if let Some(profile_dir) = user_profile_dir() {
+                            dlg = dlg.set_directory(profile_dir);
+                        }
+                        if let Some(path) = dlg.pick_file() {
+                            self.settings_dialog.draft.private_key_path =
+                                path.display().to_string();
+                        }
+                    }
+                });
+                ui.end_row();
+            });
 
         // Status (only show failures to keep noise down).
         let status_tile = self
@@ -859,13 +1030,13 @@ impl AppState {
         if let Some(tile_id) = status_tile {
             if let Some(tab) = self.pane(tile_id) {
                 if tab.last_status.to_lowercase().contains("failed") {
-                    ui.add_space(8.0);
+                    ui.separator();
                     ui.label(egui::RichText::new(&tab.last_status).color(theme.muted));
                 }
             }
         }
 
-        ui.add_space(12.0);
+        ui.add_space(4.0);
 
         let can_save = !self.settings_dialog.profile_name.trim().is_empty();
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -914,27 +1085,103 @@ impl AppState {
     fn draw_settings_contents(
         &mut self,
         ui: &mut egui::Ui,
+        ctx: &egui::Context,
         theme: UiTheme,
+        embedded: bool,
         _section_frame: &egui::Frame,
     ) {
         ui.visuals_mut().override_text_color = Some(theme.fg);
         ui.spacing_mut().item_spacing = Vec2::new(8.0, 10.0);
 
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Settings")
-                    .strong()
-                    .size(22.0)
-                    .color(theme.accent),
-            );
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Close").clicked() {
-                    self.settings_dialog.open = false;
+        let btn_fill = adjust_color(theme.top_bg, 0.10);
+        let controls_enabled = !embedded;
+        egui::Frame::none()
+            .fill(adjust_color(theme.top_bg, 0.08))
+            .stroke(Stroke::new(1.0, theme.top_border))
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::symmetric(TITLE_PAD_X, 2.0))
+            .show(ui, |ui| {
+                ui.set_min_height(TITLE_BAR_H);
+
+                let bar_rect = ui.max_rect();
+                let drag_resp = ui.interact(
+                    bar_rect,
+                    Id::new("rusty_settings_title_drag"),
+                    Sense::click_and_drag(),
+                );
+                let mut title_controls_hot = false;
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Rusty Settings")
+                            .strong()
+                            .size(16.0)
+                            .color(theme.accent),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        let close_icon =
+                            egui::Image::new(egui::include_image!("../../assets/x.png"))
+                                .tint(theme.fg);
+                        let close_resp = title_bar_image_button(
+                            ui,
+                            close_icon,
+                            Vec2::splat(12.0),
+                            btn_fill,
+                            theme.top_border,
+                        );
+                        title_controls_hot |= close_resp.hovered();
+                        if close_resp.clicked() {
+                            self.settings_dialog.open = false;
+                        }
+
+                        if controls_enabled {
+                            let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                            let maximize_icon =
+                                egui::Image::new(egui::include_image!("../../assets/square.png"))
+                                    .tint(theme.fg);
+                            let maximize_resp = title_bar_image_button(
+                                ui,
+                                maximize_icon,
+                                Vec2::splat(12.0),
+                                btn_fill,
+                                theme.top_border,
+                            );
+                            title_controls_hot |= maximize_resp.hovered();
+                            if maximize_resp.clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                            }
+
+                            let minimize_icon =
+                                egui::Image::new(egui::include_image!("../../assets/minus.png"))
+                                    .tint(theme.fg);
+                            let minimize_resp = title_bar_image_button(
+                                ui,
+                                minimize_icon,
+                                Vec2::new(14.0, 14.0),
+                                btn_fill,
+                                theme.top_border,
+                            );
+                            title_controls_hot |= minimize_resp.hovered();
+                            if minimize_resp.clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                            }
+                        }
+                    });
+                });
+
+                if controls_enabled {
+                    let pressed_on_title =
+                        drag_resp.hovered() && ctx.input(|i| i.pointer.primary_pressed());
+                    if drag_resp.drag_started() || (pressed_on_title && !title_controls_hot) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    if drag_resp.double_clicked() && !title_controls_hot {
+                        let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                    }
                 }
             });
-        });
-        ui.separator();
-        ui.add_space(6.0);
+        ui.add_space(8.0);
 
         // Settings layout that scales: left section list (listbox-style) + right content pane.
         let avail_h = ui.available_height();
@@ -1035,6 +1282,7 @@ impl AppState {
                     item(ui, SettingsPage::Behavior);
                     item(ui, SettingsPage::Appearance);
                     item(ui, SettingsPage::Updates);
+                    item(ui, SettingsPage::UiTheme);
                     item(ui, SettingsPage::TerminalColors);
                     item(ui, SettingsPage::ProfilesAndAccount);
                 });
@@ -1062,6 +1310,7 @@ impl AppState {
                     SettingsPage::Behavior => self.draw_settings_page_behavior(ui),
                     SettingsPage::Appearance => self.draw_settings_page_appearance(ui),
                     SettingsPage::Updates => self.draw_settings_page_updates(ui),
+                    SettingsPage::UiTheme => self.draw_settings_page_ui_theme(ui),
                     SettingsPage::TerminalColors => self.draw_settings_page_terminal_colors(ui),
                     SettingsPage::ProfilesAndAccount => {
                         self.draw_settings_page_profiles_and_account(ui)
@@ -1079,8 +1328,9 @@ impl AppState {
         let force_front = self.settings_dialog.just_opened;
         let mut builder = egui::ViewportBuilder::default()
             .with_title("Rusty Settings")
-            .with_inner_size(Vec2::new(640.0, 720.0))
-            .with_min_inner_size(Vec2::new(420.0, 520.0))
+            .with_inner_size(Vec2::new(640.0, 576.0))
+            .with_min_inner_size(Vec2::new(420.0, 416.0))
+            .with_decorations(false)
             .with_resizable(true);
         if force_front {
             builder = builder.with_active(true);
@@ -1099,10 +1349,19 @@ impl AppState {
             }
 
             let theme = self.theme;
+            if !matches!(class, egui::ViewportClass::Embedded) {
+                paint_window_chrome(ctx, theme);
+                handle_window_resize(ctx);
+            }
             let outer_frame = egui::Frame::none()
                 .fill(adjust_color(theme.top_bg, 0.06))
                 .stroke(Stroke::new(1.0, theme.top_border))
-                .inner_margin(egui::Margin::same(14.0));
+                .inner_margin(egui::Margin {
+                    left: 14.0,
+                    right: 14.0,
+                    top: 4.0,
+                    bottom: 14.0,
+                });
             let section_frame = egui::Frame::none()
                 .fill(adjust_color(theme.top_bg, 0.10))
                 .stroke(Stroke::new(1.0, theme.top_border))
@@ -1118,7 +1377,7 @@ impl AppState {
                         .open(&mut open)
                         .frame(outer_frame)
                         .show(ctx, |ui| {
-                            self.draw_settings_contents(ui, theme, &section_frame);
+                            self.draw_settings_contents(ui, ctx, theme, true, &section_frame);
                         });
                     if !open {
                         self.settings_dialog.open = false;
@@ -1128,7 +1387,7 @@ impl AppState {
                     egui::CentralPanel::default()
                         .frame(outer_frame)
                         .show(ctx, |ui| {
-                            self.draw_settings_contents(ui, theme, &section_frame);
+                            self.draw_settings_contents(ui, ctx, theme, false, &section_frame);
                         });
                 }
             }

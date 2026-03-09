@@ -23,6 +23,8 @@ impl eframe::App for AppState {
         }
 
         self.maybe_restore_window(ctx);
+        // Keep the root viewport explicitly resizable across long uptime / tray restore cycles.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
 
         // Tray integration (created lazily when enabled).
         // If tray minimize was turned off while hidden, bring the window back.
@@ -61,7 +63,6 @@ impl eframe::App for AppState {
         self.poll_download_manager_events();
         self.sync_file_panes_with_sources();
         self.poll_update_check_result();
-        self.start_update_check_if_due();
 
         let any_live_session = live_session_count > 0;
         let any_active_download = self.has_active_downloads();
@@ -219,15 +220,9 @@ impl eframe::App for AppState {
                     Id::new("rusty_title_drag"),
                     Sense::click_and_drag(),
                 );
-                if drag_resp.drag_started() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                if drag_resp.double_clicked() {
-                    let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
-                }
 
                 let btn_fill = adjust_color(theme.top_bg, 0.10);
+                let mut title_controls_hot = false;
 
                 ui.horizontal(|ui| {
                     ui.label(
@@ -241,15 +236,15 @@ impl eframe::App for AppState {
                         let close_icon =
                             egui::Image::new(egui::include_image!("../../assets/x.png"))
                                 .tint(theme.fg);
-                        if title_bar_image_button(
+                        let close_resp = title_bar_image_button(
                             ui,
                             close_icon,
                             Vec2::splat(12.0),
                             btn_fill,
                             theme.top_border,
-                        )
-                        .clicked()
-                        {
+                        );
+                        title_controls_hot |= close_resp.hovered();
+                        if close_resp.clicked() {
                             global_actions.push(TilesAction::Exit);
                         }
 
@@ -257,15 +252,15 @@ impl eframe::App for AppState {
                         let maximize_icon =
                             egui::Image::new(egui::include_image!("../../assets/square.png"))
                                 .tint(theme.fg);
-                        if title_bar_image_button(
+                        let maximize_resp = title_bar_image_button(
                             ui,
                             maximize_icon,
                             Vec2::splat(12.0),
                             btn_fill,
                             theme.top_border,
-                        )
-                        .clicked()
-                        {
+                        );
+                        title_controls_hot |= maximize_resp.hovered();
+                        if maximize_resp.clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
                         }
 
@@ -273,15 +268,15 @@ impl eframe::App for AppState {
                         let minimize_icon =
                             egui::Image::new(egui::include_image!("../../assets/minus.png"))
                                 .tint(theme.fg);
-                        if title_bar_image_button(
+                        let minimize_resp = title_bar_image_button(
                             ui,
                             minimize_icon,
                             Vec2::new(14.0, 14.0),
                             btn_fill,
                             theme.top_border,
-                        )
-                        .clicked()
-                        {
+                        );
+                        title_controls_hot |= minimize_resp.hovered();
+                        if minimize_resp.clicked() {
                             if self.config.minimize_to_tray {
                                 self.minimize_to_tray_requested = true;
                             } else {
@@ -302,6 +297,7 @@ impl eframe::App for AppState {
                             theme.top_border,
                         )
                         .on_hover_text("Open Settings");
+                        title_controls_hot |= settings_resp.hovered();
                         if settings_resp.clicked() {
                             if let Some(tile_id) = target {
                                 global_actions.push(TilesAction::OpenSettings(tile_id));
@@ -312,21 +308,31 @@ impl eframe::App for AppState {
                         let download_icon =
                             egui::Image::new(egui::include_image!("../../assets/download.png"))
                                 .tint(theme.fg);
-                        if title_bar_image_button(
+                        let downloads_resp = title_bar_image_button(
                             ui,
                             download_icon,
                             Vec2::splat(14.0),
                             btn_fill,
                             theme.top_border,
                         )
-                        .on_hover_text("Open Transfers Manager")
-                        .clicked()
-                        {
+                        .on_hover_text("Open Transfers Manager");
+                        title_controls_hot |= downloads_resp.hovered();
+                        if downloads_resp.clicked() {
                             self.open_downloads_window();
                         }
 
                     });
                 });
+
+                let pressed_on_title =
+                    drag_resp.hovered() && ctx.input(|i| i.pointer.primary_pressed());
+                if drag_resp.drag_started() || (pressed_on_title && !title_controls_hot) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if drag_resp.double_clicked() && !title_controls_hot {
+                    let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                }
             });
 
         let mut behavior = SshTilesBehavior::new(

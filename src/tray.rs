@@ -66,6 +66,7 @@ fn direct_show_from_tray() {
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             HIDDEN_TO_TRAY.store(false, Ordering::Relaxed);
             ctx.request_repaint();

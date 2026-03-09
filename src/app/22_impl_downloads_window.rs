@@ -128,6 +128,105 @@ impl AppState {
         );
     }
 
+    fn draw_downloads_window_title_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        embedded: bool,
+    ) {
+        let theme = self.theme;
+        let btn_fill = adjust_color(theme.top_bg, 0.10);
+        let controls_enabled = !embedded;
+
+        egui::Frame::none()
+            .fill(adjust_color(theme.top_bg, 0.08))
+            .stroke(Stroke::new(1.0, theme.top_border))
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::symmetric(TITLE_PAD_X, 2.0))
+            .show(ui, |ui| {
+                ui.set_min_height(TITLE_BAR_H);
+
+                let bar_rect = ui.max_rect();
+                let drag_resp = ui.interact(
+                    bar_rect,
+                    Id::new("rusty_transfers_title_drag"),
+                    Sense::click_and_drag(),
+                );
+                let mut title_controls_hot = false;
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Rusty Transfers")
+                            .strong()
+                            .size(16.0)
+                            .color(theme.accent),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        let close_icon =
+                            egui::Image::new(egui::include_image!("../../assets/x.png"))
+                                .tint(theme.fg);
+                        let close_resp = title_bar_image_button(
+                            ui,
+                            close_icon,
+                            Vec2::splat(12.0),
+                            btn_fill,
+                            theme.top_border,
+                        );
+                        title_controls_hot |= close_resp.hovered();
+                        if close_resp.clicked() {
+                            self.downloads_window_open = false;
+                            self.transfer_delete_dialog = None;
+                        }
+
+                        if controls_enabled {
+                            let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                            let maximize_icon =
+                                egui::Image::new(egui::include_image!("../../assets/square.png"))
+                                    .tint(theme.fg);
+                            let maximize_resp = title_bar_image_button(
+                                ui,
+                                maximize_icon,
+                                Vec2::splat(12.0),
+                                btn_fill,
+                                theme.top_border,
+                            );
+                            title_controls_hot |= maximize_resp.hovered();
+                            if maximize_resp.clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                            }
+
+                            let minimize_icon =
+                                egui::Image::new(egui::include_image!("../../assets/minus.png"))
+                                    .tint(theme.fg);
+                            let minimize_resp = title_bar_image_button(
+                                ui,
+                                minimize_icon,
+                                Vec2::new(14.0, 14.0),
+                                btn_fill,
+                                theme.top_border,
+                            );
+                            title_controls_hot |= minimize_resp.hovered();
+                            if minimize_resp.clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                            }
+                        }
+                    });
+                });
+
+                if controls_enabled {
+                    let pressed_on_title =
+                        drag_resp.hovered() && ctx.input(|i| i.pointer.primary_pressed());
+                    if drag_resp.drag_started() || (pressed_on_title && !title_controls_hot) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    if drag_resp.double_clicked() && !title_controls_hot {
+                        let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                    }
+                }
+            });
+    }
+
     fn draw_downloads_manager_contents(&mut self, ui: &mut egui::Ui) {
         ui.visuals_mut().override_text_color = Some(self.theme.fg);
         if self.download_jobs.is_empty() {
@@ -389,6 +488,7 @@ impl AppState {
             .with_title("Rusty Transfers")
             .with_inner_size(Vec2::new(900.0, 560.0))
             .with_min_inner_size(Vec2::new(640.0, 380.0))
+            .with_decorations(false)
             .with_resizable(true);
         if force_front {
             builder = builder.with_active(true);
@@ -407,10 +507,19 @@ impl AppState {
                 return;
             }
 
+            if !matches!(class, egui::ViewportClass::Embedded) {
+                paint_window_chrome(ctx, self.theme);
+                handle_window_resize(ctx);
+            }
             let outer_frame = egui::Frame::none()
                 .fill(adjust_color(self.theme.top_bg, 0.06))
                 .stroke(Stroke::new(1.0, self.theme.top_border))
-                .inner_margin(egui::Margin::same(10.0));
+                .inner_margin(egui::Margin {
+                    left: 10.0,
+                    right: 10.0,
+                    top: 4.0,
+                    bottom: 10.0,
+                });
             match class {
                 egui::ViewportClass::Embedded => {
                     let mut open = true;
@@ -420,6 +529,8 @@ impl AppState {
                         .resizable(true)
                         .frame(outer_frame)
                         .show(ctx, |ui| {
+                            self.draw_downloads_window_title_bar(ui, ctx, true);
+                            ui.add_space(8.0);
                             self.draw_downloads_manager_contents(ui);
                         });
                     if !open {
@@ -431,6 +542,8 @@ impl AppState {
                     egui::CentralPanel::default()
                         .frame(outer_frame)
                         .show(ctx, |ui| {
+                            self.draw_downloads_window_title_bar(ui, ctx, false);
+                            ui.add_space(8.0);
                             self.draw_downloads_manager_contents(ui);
                         });
                 }

@@ -188,8 +188,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub transfer_history: Vec<TransferHistoryEntry>,
     #[serde(default)]
-    pub update_last_check_unix: Option<u64>,
-    #[serde(default)]
     pub update_available_version: Option<String>,
     #[serde(default)]
     pub update_available_url: Option<String>,
@@ -213,7 +211,6 @@ impl Default for AppConfig {
             terminal_colors: TerminalColorsConfig::default(),
             selected_terminal_theme: None,
             transfer_history: Vec::new(),
-            update_last_check_unix: None,
             update_available_version: None,
             update_available_url: None,
         }

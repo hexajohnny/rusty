@@ -179,8 +179,6 @@ impl AppState {
                 config_saver.request_save(config.clone());
             }
         }
-        let update_next_check_at = Self::next_update_check_at(config.update_last_check_unix);
-
         Self {
             theme,
             theme_source,
@@ -220,7 +218,6 @@ impl AppState {
             upload_refresh_targets: HashMap::new(),
             update_check_in_progress: false,
             update_check_rx: None,
-            update_next_check_at,
             update_available_version,
             update_available_url,
             update_manual_open_if_newer: false,
@@ -285,13 +282,6 @@ impl AppState {
         changed
     }
 
-    fn now_unix_secs() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
-
     fn parse_version_triplet(raw: &str) -> Option<(u64, u64, u64)> {
         let base = raw
             .trim()
@@ -319,36 +309,16 @@ impl AppState {
         latest > current
     }
 
-    fn next_update_check_at(last_check_unix: Option<u64>) -> Instant {
-        let now_unix = Self::now_unix_secs();
-        let wait_secs = last_check_unix
-            .and_then(|last| last.checked_add(UPDATE_CHECK_INTERVAL_SECS))
-            .map(|next| next.saturating_sub(now_unix))
-            .unwrap_or(0);
-        Instant::now() + Duration::from_secs(wait_secs)
-    }
-
-    fn start_update_check_if_due(&mut self) {
-        self.start_update_check(false);
-    }
-
     fn start_update_check_now_open_if_newer(&mut self) {
         self.update_manual_open_if_newer = true;
         self.update_manual_status = Some("Checking for updates...".to_string());
-        self.start_update_check(true);
+        self.start_update_check();
     }
 
-    fn start_update_check(&mut self, force: bool) {
+    fn start_update_check(&mut self) {
         if self.update_check_in_progress {
             return;
         }
-        if !force && Instant::now() < self.update_next_check_at {
-            return;
-        }
-
-        self.update_next_check_at = Instant::now() + Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS);
-        self.config.update_last_check_unix = Some(Self::now_unix_secs());
-        self.config_saver.request_save(self.config.clone());
 
         let (tx, rx) = mpsc::channel::<UpdateCheckResult>();
         self.update_check_rx = Some(rx);
@@ -1956,6 +1926,7 @@ impl AppState {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         // Then make visible and focus
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         self.hidden_to_tray = false;
         crate::tray::set_hidden_to_tray_state(false);
@@ -1990,6 +1961,7 @@ impl AppState {
                             // Idempotent "show/raise" behavior.
                             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                             ctx.request_repaint();
                         }

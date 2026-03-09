@@ -63,7 +63,6 @@ const CONTENT_PAD: f32 = 0.0;
 const RESIZE_MARGIN: f32 = 6.0;
 
 const APP_TITLE_TEXT: &str = concat!("Rusty - v", env!("CARGO_PKG_VERSION"));
-const UPDATE_CHECK_INTERVAL_SECS: u64 = 12 * 60 * 60;
 const UPDATE_CHECK_API_URL: &str = "https://api.github.com/repos/hexajohnny/rusty/releases/latest";
 const UPDATE_RELEASES_URL: &str = "https://github.com/hexajohnny/rusty/releases/latest";
 
@@ -461,6 +460,7 @@ enum SettingsPage {
     Autostart,
     Behavior,
     Appearance,
+    UiTheme,
     Updates,
     TerminalColors,
     ProfilesAndAccount,
@@ -472,6 +472,7 @@ impl SettingsPage {
             Self::Autostart => "Autostart",
             Self::Behavior => "Behavior",
             Self::Appearance => "Appearance",
+            Self::UiTheme => "UI Theme",
             Self::Updates => "Updates",
             Self::TerminalColors => "Terminal Colors",
             Self::ProfilesAndAccount => "Profiles and Account",
@@ -931,7 +932,6 @@ pub struct AppState {
     upload_refresh_targets: HashMap<u64, TileId>,
     update_check_in_progress: bool,
     update_check_rx: Option<Receiver<UpdateCheckResult>>,
-    update_next_check_at: Instant,
     update_available_version: Option<String>,
     update_available_url: Option<String>,
     update_manual_open_if_newer: bool,

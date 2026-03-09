@@ -29,28 +29,35 @@ fn handle_window_resize(ctx: &egui::Context) {
     }
 
     let rect = ctx.screen_rect();
-    let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else {
-        return;
+    let resize_dir_for = |pos: Pos2| {
+        let left = pos.x <= rect.left() + RESIZE_MARGIN;
+        let right = pos.x >= rect.right() - RESIZE_MARGIN;
+        let top = pos.y <= rect.top() + RESIZE_MARGIN;
+        let bottom = pos.y >= rect.bottom() - RESIZE_MARGIN;
+        match (left, right, top, bottom) {
+            (true, _, true, _) => Some(egui::ResizeDirection::NorthWest),
+            (_, true, true, _) => Some(egui::ResizeDirection::NorthEast),
+            (true, _, _, true) => Some(egui::ResizeDirection::SouthWest),
+            (_, true, _, true) => Some(egui::ResizeDirection::SouthEast),
+            (true, _, _, _) => Some(egui::ResizeDirection::West),
+            (_, true, _, _) => Some(egui::ResizeDirection::East),
+            (_, _, true, _) => Some(egui::ResizeDirection::North),
+            (_, _, _, true) => Some(egui::ResizeDirection::South),
+            _ => None,
+        }
     };
 
-    let left = pos.x <= rect.left() + RESIZE_MARGIN;
-    let right = pos.x >= rect.right() - RESIZE_MARGIN;
-    let top = pos.y <= rect.top() + RESIZE_MARGIN;
-    let bottom = pos.y >= rect.bottom() - RESIZE_MARGIN;
+    let hover_pos = ctx.input(|i| {
+        i.pointer
+            .interact_pos()
+            .or_else(|| i.pointer.latest_pos())
+            .or_else(|| i.pointer.press_origin())
+    });
+    let hover_dir = hover_pos.and_then(resize_dir_for);
+    let press_dir = ctx.input(|i| i.pointer.press_origin().and_then(resize_dir_for));
+    let active_dir = hover_dir.or(press_dir);
 
-    let dir = match (left, right, top, bottom) {
-        (true, _, true, _) => Some(egui::ResizeDirection::NorthWest),
-        (_, true, true, _) => Some(egui::ResizeDirection::NorthEast),
-        (true, _, _, true) => Some(egui::ResizeDirection::SouthWest),
-        (_, true, _, true) => Some(egui::ResizeDirection::SouthEast),
-        (true, _, _, _) => Some(egui::ResizeDirection::West),
-        (_, true, _, _) => Some(egui::ResizeDirection::East),
-        (_, _, true, _) => Some(egui::ResizeDirection::North),
-        (_, _, _, true) => Some(egui::ResizeDirection::South),
-        _ => None,
-    };
-
-    let Some(dir) = dir else { return };
+    let Some(dir) = active_dir else { return };
 
     let icon = match dir {
         egui::ResizeDirection::East | egui::ResizeDirection::West => {
@@ -68,7 +75,9 @@ fn handle_window_resize(ctx: &egui::Context) {
     };
     ctx.output_mut(|o| o.cursor_icon = icon);
 
-    if ctx.input(|i| i.pointer.primary_pressed()) {
+    let begin_now = ctx.input(|i| i.pointer.primary_pressed())
+        || (ctx.input(|i| i.pointer.primary_down()) && press_dir.is_some());
+    if begin_now {
         ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
     }
 }
