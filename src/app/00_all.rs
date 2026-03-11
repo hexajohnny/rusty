@@ -17,7 +17,7 @@ use egui_tiles::{
 use crate::async_config::AsyncConfigSaver;
 use crate::config;
 use crate::model::ConnectionSettings;
-use crate::ssh::{self, UiMessage, WorkerMessage};
+use crate::ssh::{self, SftpUiMessage, SftpWorkerMessage, UiMessage, WorkerMessage};
 use crate::terminal_themes::ThemeRegistry;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
@@ -531,6 +531,7 @@ struct DownloadJob {
     settings: ConnectionSettings,
     remote_path: String,
     local_path: String,
+    source_terminal: Option<TileId>,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
     speed_bps: f64,
@@ -544,13 +545,15 @@ enum PaneKind {
     FileManager(Box<FileBrowserState>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct FileBrowserState {
     source_terminal: TileId,
     source_connected: bool,
     cwd: String,
     path_input: String,
     entries: Vec<ssh::SftpEntry>,
+    ui_rx: Option<Receiver<SftpUiMessage>>,
+    worker_tx: Option<Sender<SftpWorkerMessage>>,
     selected_name: Option<String>,
     rename_to: String,
     rename_from: Option<String>,
@@ -574,6 +577,8 @@ impl FileBrowserState {
             cwd: path.clone(),
             path_input: path,
             entries: Vec::new(),
+            ui_rx: None,
+            worker_tx: None,
             selected_name: None,
             rename_to: String::new(),
             rename_from: None,
@@ -582,6 +587,28 @@ impl FileBrowserState {
             mkdir_dialog_open: false,
             busy: false,
             status: "Not connected".to_string(),
+        }
+    }
+}
+
+impl Clone for FileBrowserState {
+    fn clone(&self) -> Self {
+        Self {
+            source_terminal: self.source_terminal,
+            source_connected: self.source_connected,
+            cwd: self.cwd.clone(),
+            path_input: self.path_input.clone(),
+            entries: self.entries.clone(),
+            ui_rx: None,
+            worker_tx: None,
+            selected_name: self.selected_name.clone(),
+            rename_to: self.rename_to.clone(),
+            rename_from: self.rename_from.clone(),
+            rename_dialog_open: self.rename_dialog_open,
+            mkdir_name: self.mkdir_name.clone(),
+            mkdir_dialog_open: self.mkdir_dialog_open,
+            busy: self.busy,
+            status: self.status.clone(),
         }
     }
 }
@@ -611,6 +638,7 @@ struct SshTab {
     last_sent_size: Option<(u16, u16, u32, u32)>,
     pending_resize: Option<(u16, u16, u32, u32)>,
     focus_terminal_next_frame: bool,
+    last_view_rect: Option<Rect>,
 
     log_path: String,
 
@@ -664,6 +692,7 @@ impl SshTab {
             last_sent_size: None,
             pending_resize: None,
             focus_terminal_next_frame: false,
+            last_view_rect: None,
             log_path,
             selection: None,
             abs_selection: None,
@@ -711,10 +740,6 @@ impl SshTab {
         matches!(self.kind, PaneKind::Terminal)
     }
 
-    fn is_file_manager(&self) -> bool {
-        matches!(self.kind, PaneKind::FileManager(_))
-    }
-
     fn file_browser(&self) -> Option<&FileBrowserState> {
         match &self.kind {
             PaneKind::FileManager(f) => Some(f.as_ref()),
@@ -734,6 +759,9 @@ impl SshTab {
     }
 
     fn start_connect(&mut self) {
+        if !self.is_terminal() {
+            return;
+        }
         if self.connected || self.connecting {
             return;
         }
@@ -772,11 +800,23 @@ impl SshTab {
     }
 
     fn disconnect(&mut self) {
-        if let Some(tx) = self.worker_tx.take() {
-            let _ = tx.send(WorkerMessage::Disconnect);
+        match &mut self.kind {
+            PaneKind::Terminal => {
+                if let Some(tx) = self.worker_tx.take() {
+                    let _ = tx.send(WorkerMessage::Disconnect);
+                }
+                self.ui_rx = None;
+                self.host_key_tx = None;
+            }
+            PaneKind::FileManager(file) => {
+                if let Some(tx) = file.worker_tx.take() {
+                    let _ = tx.send(SftpWorkerMessage::Disconnect);
+                }
+                file.ui_rx = None;
+                file.source_connected = false;
+                file.busy = false;
+            }
         }
-        self.ui_rx = None;
-        self.host_key_tx = None;
         self.connected = false;
         self.connecting = false;
         self.last_status = "Disconnected".to_string();
@@ -793,92 +833,136 @@ impl SshTab {
         self.pending_host_key = None;
         self.pending_scrollback = None;
         self.last_selection_autoscroll = Instant::now();
+        self.pending_sftp_events.clear();
     }
 
     fn poll_messages(&mut self) -> bool {
-        let Some(rx) = self.ui_rx.as_ref() else {
-            return false;
-        };
         const MAX_MSGS_PER_FRAME: usize = 256;
         let mut processed = 0usize;
         let mut saw_message = false;
-        let mut latest_screen: Option<Box<crate::terminal_emulator::Screen>> = None;
-        let mut latest_scrollback_max: Option<usize> = None;
-        loop {
-            if processed >= MAX_MSGS_PER_FRAME {
-                break;
-            }
-            match rx.try_recv() {
-                Ok(UiMessage::Status(s)) => {
-                    saw_message = true;
-                    self.last_status = s;
+        match &mut self.kind {
+            PaneKind::Terminal => {
+                let Some(rx) = self.ui_rx.as_ref() else {
+                    return false;
+                };
+                let mut latest_screen: Option<Box<crate::terminal_emulator::Screen>> = None;
+                let mut latest_scrollback_max: Option<usize> = None;
+                loop {
+                    if processed >= MAX_MSGS_PER_FRAME {
+                        break;
+                    }
+                    match rx.try_recv() {
+                        Ok(UiMessage::Status(s)) => {
+                            saw_message = true;
+                            self.last_status = s;
+                        }
+                        Ok(UiMessage::Screen(screen)) => {
+                            saw_message = true;
+                            latest_screen = Some(screen);
+                        }
+                        Ok(UiMessage::ScrollbackMax(max)) => {
+                            saw_message = true;
+                            latest_scrollback_max = Some(max);
+                        }
+                        Ok(UiMessage::Connected(ok)) => {
+                            saw_message = true;
+                            self.connected = ok;
+                            self.connecting = false;
+                            self.pending_auth = None;
+                            self.pending_host_key = None;
+                            if ok {
+                                // A new shell starts at server-default PTY size (often 80x24).
+                                // Reset cached size so the next frame always sends current viewport size.
+                                self.last_sent_size = None;
+                                self.pending_resize = None;
+                                self.focus_terminal_next_frame = true;
+                            }
+                        }
+                        Ok(UiMessage::AuthPrompt(p)) => {
+                            saw_message = true;
+                            self.pending_auth = Some(p);
+                        }
+                        Ok(UiMessage::HostKeyPrompt(p)) => {
+                            saw_message = true;
+                            self.pending_host_key = Some(p);
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            saw_message = true;
+                            self.connected = false;
+                            self.connecting = false;
+                            self.pending_auth = None;
+                            self.pending_host_key = None;
+                            break;
+                        }
+                    }
+                    processed += 1;
                 }
-                Ok(UiMessage::Screen(screen)) => {
-                    saw_message = true;
-                    latest_screen = Some(screen);
+
+                if let Some(screen) = latest_screen {
+                    self.screen = *screen;
+                    if let Some(target) = self.pending_scrollback {
+                        let clamped = target.min(self.scrollback_max);
+                        self.screen.set_scrollback(clamped);
+                        if self.screen.scrollback() == clamped {
+                            self.pending_scrollback = None;
+                        }
+                    }
+                    // Keep local tab naming stable. Some remote shells/TUIs set OSC titles
+                    // like "wezterm", which should not replace user-facing tab labels.
                 }
-                Ok(UiMessage::ScrollbackMax(max)) => {
-                    saw_message = true;
-                    latest_scrollback_max = Some(max);
-                }
-                Ok(UiMessage::Connected(ok)) => {
-                    saw_message = true;
-                    self.connected = ok;
-                    self.connecting = false;
-                    if ok {
-                        // A new shell starts at server-default PTY size (often 80x24).
-                        // Reset cached size so the next frame always sends current viewport size.
-                        self.last_sent_size = None;
-                        self.pending_resize = None;
-                        self.focus_terminal_next_frame = true;
+
+                if let Some(max) = latest_scrollback_max {
+                    self.scrollback_max = max;
+                    if let Some(target) = self.pending_scrollback {
+                        let clamped = target.min(max);
+                        if clamped != target {
+                            self.pending_scrollback = Some(clamped);
+                        }
+                        self.screen.set_scrollback(clamped);
+                        if self.screen.scrollback() == clamped {
+                            self.pending_scrollback = None;
+                        }
                     }
                 }
-                Ok(UiMessage::AuthPrompt(p)) => {
-                    saw_message = true;
-                    self.pending_auth = Some(p);
-                }
-                Ok(UiMessage::HostKeyPrompt(p)) => {
-                    saw_message = true;
-                    self.pending_host_key = Some(p);
-                }
-                Ok(UiMessage::SftpEvent(event)) => {
-                    saw_message = true;
-                    self.pending_sftp_events.push(event);
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    saw_message = true;
-                    self.connected = false;
-                    self.connecting = false;
-                    break;
-                }
             }
-            processed += 1;
-        }
-
-        if let Some(screen) = latest_screen {
-            self.screen = *screen;
-            if let Some(target) = self.pending_scrollback {
-                let clamped = target.min(self.scrollback_max);
-                self.screen.set_scrollback(clamped);
-                if self.screen.scrollback() == clamped {
-                    self.pending_scrollback = None;
-                }
-            }
-            // Keep local tab naming stable. Some remote shells/TUIs set OSC titles
-            // like "wezterm", which should not replace user-facing tab labels.
-        }
-
-        if let Some(max) = latest_scrollback_max {
-            self.scrollback_max = max;
-            if let Some(target) = self.pending_scrollback {
-                let clamped = target.min(max);
-                if clamped != target {
-                    self.pending_scrollback = Some(clamped);
-                }
-                self.screen.set_scrollback(clamped);
-                if self.screen.scrollback() == clamped {
-                    self.pending_scrollback = None;
+            PaneKind::FileManager(file) => {
+                let Some(rx) = file.ui_rx.as_ref() else {
+                    return false;
+                };
+                loop {
+                    if processed >= MAX_MSGS_PER_FRAME {
+                        break;
+                    }
+                    match rx.try_recv() {
+                        Ok(SftpUiMessage::Status(s)) => {
+                            saw_message = true;
+                            self.last_status = s.clone();
+                            if !file.busy || !self.connected {
+                                file.status = s;
+                            }
+                        }
+                        Ok(SftpUiMessage::Connected(ok)) => {
+                            saw_message = true;
+                            self.connected = ok;
+                            self.connecting = false;
+                        }
+                        Ok(SftpUiMessage::Event(event)) => {
+                            saw_message = true;
+                            self.pending_sftp_events.push(event);
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            saw_message = true;
+                            self.connected = false;
+                            self.connecting = false;
+                            file.source_connected = false;
+                            file.ui_rx = None;
+                            file.worker_tx = None;
+                            break;
+                        }
+                    }
+                    processed += 1;
                 }
             }
         }
@@ -936,4 +1020,5 @@ pub struct AppState {
     update_available_url: Option<String>,
     update_manual_open_if_newer: bool,
     update_manual_status: Option<String>,
+    startup_notice: Option<String>,
 }

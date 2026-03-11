@@ -288,7 +288,6 @@ pub struct Parser {
     scrollback: usize,
     mode_state: ModeState,
     seq_filter: SeqFilter,
-    disable_alt_screen: bool,
 }
 
 impl Parser {
@@ -317,17 +316,13 @@ impl Parser {
             scrollback: 0,
             mode_state: ModeState::default(),
             seq_filter: SeqFilter::default(),
-            // Preserve inline history while running TUIs by neutralizing alt-screen toggles.
-            disable_alt_screen: true,
         };
         parser.refresh_screen();
         parser
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
-        let filtered =
-            self.seq_filter
-                .transform(bytes, &mut self.mode_state, self.disable_alt_screen);
+        let filtered = self.seq_filter.transform(bytes, &mut self.mode_state);
         if !filtered.is_empty() {
             self.terminal.advance_bytes(filtered);
         }
@@ -531,12 +526,7 @@ struct SeqFilter {
 }
 
 impl SeqFilter {
-    fn transform(
-        &mut self,
-        bytes: &[u8],
-        mode_state: &mut ModeState,
-        disable_alt_screen: bool,
-    ) -> Vec<u8> {
+    fn transform(&mut self, bytes: &[u8], mode_state: &mut ModeState) -> Vec<u8> {
         let mut input = Vec::with_capacity(self.pending.len() + bytes.len());
         input.extend_from_slice(&self.pending);
         input.extend_from_slice(bytes);
@@ -569,9 +559,7 @@ impl SeqFilter {
                 let b = input[j];
                 if (0x40..=0x7e).contains(&b) {
                     let seq = &input[seq_start..=j];
-                    if let Some(transformed) =
-                        transform_csi_sequence(seq, mode_state, disable_alt_screen)
-                    {
+                    if let Some(transformed) = transform_csi_sequence(seq, mode_state) {
                         out.extend_from_slice(&transformed);
                     }
                     i = j + 1;
@@ -597,11 +585,7 @@ impl SeqFilter {
     }
 }
 
-fn transform_csi_sequence(
-    seq: &[u8],
-    mode_state: &mut ModeState,
-    disable_alt_screen: bool,
-) -> Option<Vec<u8>> {
+fn transform_csi_sequence(seq: &[u8], mode_state: &mut ModeState) -> Option<Vec<u8>> {
     if seq.len() < 3 || seq[0] != 0x1b || seq[1] != b'[' {
         return Some(seq.to_vec());
     }
@@ -613,26 +597,6 @@ fn transform_csi_sequence(
             let enabled = final_byte == b'h';
             for mode in &modes {
                 mode_state.apply_private_mode(*mode, enabled);
-            }
-
-            if disable_alt_screen {
-                let filtered: Vec<u16> = modes
-                    .into_iter()
-                    .filter(|m| *m != 47 && *m != 1047 && *m != 1049)
-                    .collect();
-                if filtered.is_empty() {
-                    return None;
-                }
-                let mut out = Vec::new();
-                out.extend_from_slice(b"\x1b[?");
-                for (idx, mode) in filtered.iter().enumerate() {
-                    if idx > 0 {
-                        out.push(b';');
-                    }
-                    out.extend_from_slice(mode.to_string().as_bytes());
-                }
-                out.push(final_byte);
-                return Some(out);
             }
         }
     }
@@ -668,5 +632,33 @@ fn map_color(attr: ColorAttribute) -> Color {
             let (r, g, b, _) = rgb.as_rgba_u8();
             Color::Rgb(r, g, b)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alt_screen_private_modes_are_passed_through() {
+        let mut mode_state = ModeState::default();
+        let seq = b"\x1b[?1049h";
+        assert_eq!(
+            transform_csi_sequence(seq, &mut mode_state),
+            Some(seq.to_vec())
+        );
+    }
+
+    #[test]
+    fn private_modes_still_update_cursor_and_mouse_tracking_state() {
+        let mut mode_state = ModeState::default();
+        let seq = b"\x1b[?1;1002;1006h";
+        assert_eq!(
+            transform_csi_sequence(seq, &mut mode_state),
+            Some(seq.to_vec())
+        );
+        assert!(mode_state.application_cursor);
+        assert_eq!(mode_state.mouse_mode(), MouseProtocolMode::Drag);
+        assert_eq!(mode_state.mouse_encoding, MouseProtocolEncoding::Sgr);
     }
 }

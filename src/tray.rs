@@ -44,9 +44,7 @@ fn menu_action_for(id: &MenuId) -> Option<&'static str> {
     let Ok(guard) = MENU_IDS.lock() else {
         return None;
     };
-    let Some((show_hide_id, exit_id)) = guard.as_ref() else {
-        return None;
-    };
+    let (show_hide_id, exit_id) = guard.as_ref()?;
 
     if id == show_hide_id {
         Some("show_hide")
@@ -177,17 +175,24 @@ fn find_process_window() -> Option<isize> {
 }
 
 #[cfg(target_os = "windows")]
+fn main_window_hwnd() -> Option<isize> {
+    let cached = MAIN_HWND.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Some(cached);
+    }
+
+    let found = find_process_window()?;
+    MAIN_HWND.store(found, Ordering::Relaxed);
+    Some(found)
+}
+
+#[cfg(target_os = "windows")]
 fn native_show_window() -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         SetForegroundWindow, ShowWindowAsync, SW_RESTORE, SW_SHOW,
     };
 
-    let cached = MAIN_HWND.load(Ordering::Relaxed);
-    let hwnd = if cached != 0 {
-        cached
-    } else if let Some(found) = find_process_window() {
-        found
-    } else {
+    let Some(hwnd) = main_window_hwnd() else {
         return false;
     };
 
@@ -203,16 +208,67 @@ fn native_show_window() -> bool {
 fn native_close_window() -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 
-    let cached = MAIN_HWND.load(Ordering::Relaxed);
-    let hwnd = if cached != 0 {
-        cached
-    } else if let Some(found) = find_process_window() {
-        found
-    } else {
+    let Some(hwnd) = main_window_hwnd() else {
         return false;
     };
 
     unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 }
+}
+
+#[cfg(target_os = "windows")]
+pub fn begin_native_drag() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, HTCAPTION, WM_NCLBUTTONDOWN};
+
+    let Some(hwnd) = main_window_hwnd() else {
+        return false;
+    };
+
+    unsafe {
+        let _ = ReleaseCapture();
+        let _ = SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+    }
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn begin_native_drag() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+pub fn begin_native_resize(dir: egui::ResizeDirection) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SendMessageW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
+        HTTOPRIGHT, WM_NCLBUTTONDOWN,
+    };
+
+    let hit = match dir {
+        egui::ResizeDirection::NorthWest => HTTOPLEFT,
+        egui::ResizeDirection::North => HTTOP,
+        egui::ResizeDirection::NorthEast => HTTOPRIGHT,
+        egui::ResizeDirection::East => HTRIGHT,
+        egui::ResizeDirection::SouthEast => HTBOTTOMRIGHT,
+        egui::ResizeDirection::South => HTBOTTOM,
+        egui::ResizeDirection::SouthWest => HTBOTTOMLEFT,
+        egui::ResizeDirection::West => HTLEFT,
+    };
+
+    let Some(hwnd) = main_window_hwnd() else {
+        return false;
+    };
+
+    unsafe {
+        let _ = ReleaseCapture();
+        let _ = SendMessageW(hwnd, WM_NCLBUTTONDOWN, hit as usize, 0);
+    }
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn begin_native_resize(_dir: egui::ResizeDirection) -> bool {
+    false
 }
 
 pub fn install_handlers() -> Receiver<TrayAppEvent> {

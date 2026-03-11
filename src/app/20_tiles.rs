@@ -75,29 +75,31 @@ struct SshTilesBehavior<'a> {
     active_tile: Option<TileId>,
 }
 
+struct SshTilesBehaviorInit<'a> {
+    theme: UiTheme,
+    term_theme: TermTheme,
+    cursor_visible: bool,
+    term_font_size: f32,
+    allow_resize: bool,
+    focus_shade: bool,
+    profiles: Vec<(String, ConnectionSettings)>,
+    clipboard: &'a mut Option<Clipboard>,
+    active_tile: Option<TileId>,
+}
+
 impl<'a> SshTilesBehavior<'a> {
-    fn new(
-        theme: UiTheme,
-        term_theme: TermTheme,
-        cursor_visible: bool,
-        term_font_size: f32,
-        allow_resize: bool,
-        focus_shade: bool,
-        profiles: Vec<(String, ConnectionSettings)>,
-        clipboard: &'a mut Option<Clipboard>,
-        active_tile: Option<TileId>,
-    ) -> Self {
+    fn new(init: SshTilesBehaviorInit<'a>) -> Self {
         Self {
-            theme,
-            term_theme,
-            cursor_visible,
-            term_font_size,
-            allow_resize,
-            focus_shade,
-            profiles,
-            clipboard,
+            theme: init.theme,
+            term_theme: init.term_theme,
+            cursor_visible: init.cursor_visible,
+            term_font_size: init.term_font_size,
+            allow_resize: init.allow_resize,
+            focus_shade: init.focus_shade,
+            profiles: init.profiles,
+            clipboard: init.clipboard,
             actions: Vec::new(),
-            active_tile,
+            active_tile: init.active_tile,
         }
     }
 
@@ -126,13 +128,15 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                 &ctx,
                 self.clipboard,
                 pane,
-                self.active_tile == Some(tile_id),
-                self.theme,
-                self.term_theme,
-                self.cursor_visible,
-                self.term_font_size,
-                self.allow_resize,
-                self.focus_shade,
+                TerminalViewOptions {
+                    is_active: self.active_tile == Some(tile_id),
+                    theme: self.theme,
+                    term_theme: self.term_theme,
+                    cursor_visible: self.cursor_visible,
+                    term_font_size: self.term_font_size,
+                    allow_resize: self.allow_resize,
+                    focus_shade: self.focus_shade,
+                },
             );
         } else {
             let actions = AppState::file_manager_view(ui, pane, self.theme, tile_id);

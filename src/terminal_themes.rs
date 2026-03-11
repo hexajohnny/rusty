@@ -8,6 +8,7 @@ use toml::value::Table;
 use wezterm_term::color::SrgbaTuple;
 
 const THEME_LOG_PATH: &str = "logs\\terminal-themes.log";
+type PalettePair = ([RgbColor; 8], [RgbColor; 8]);
 
 #[derive(Clone, Debug)]
 pub struct TerminalTheme {
@@ -397,7 +398,7 @@ fn read_palette16(root: &Table, colors: Option<&Table>) -> Result<[RgbColor; 16]
 fn read_palette_arrays(
     root: &Table,
     colors: Option<&Table>,
-) -> Result<Option<([RgbColor; 8], [RgbColor; 8])>, String> {
+) -> Result<Option<PalettePair>, String> {
     let ansi_vals = get_array(root, colors, "ansi");
     let bright_vals = get_array(root, colors, "brights");
 
@@ -831,7 +832,7 @@ indexed = { "link" = "#123456" }
         fs::write(dir.join("bad.toml"), "[colors]\nbackground = \"#000000\"\n").expect("write bad");
         fs::write(dir.join("notes.txt"), "ignored").expect("write txt");
 
-        let (registry, logs) = ThemeRegistry::load_for_tests(&[dir.clone()]);
+        let (registry, logs) = ThemeRegistry::load_for_tests(std::slice::from_ref(&dir));
         assert_eq!(registry.themes().len(), 1);
         assert_eq!(registry.themes()[0].name, "Good");
         assert!(logs
@@ -851,7 +852,7 @@ indexed = { "link" = "#123456" }
         .expect("write tokyo");
         fs::write(dir.join("nord.toml"), valid_wezterm_toml("Nord")).expect("write nord");
 
-        let (registry, _) = ThemeRegistry::load_for_tests(&[dir.clone()]);
+        let (registry, _) = ThemeRegistry::load_for_tests(std::slice::from_ref(&dir));
         assert!(registry.find_by_id_or_name("tokyo-night").is_some());
         assert!(registry.find_by_id_or_name("Tokyo Night").is_some());
         assert!(registry.find_by_id_or_name("missing-theme").is_none());

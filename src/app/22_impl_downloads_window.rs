@@ -217,7 +217,7 @@ impl AppState {
                     let pressed_on_title =
                         drag_resp.hovered() && ctx.input(|i| i.pointer.primary_pressed());
                     if drag_resp.drag_started() || (pressed_on_title && !title_controls_hot) {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        begin_window_drag(ctx);
                     }
                     if drag_resp.double_clicked() && !title_controls_hot {
                         let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));

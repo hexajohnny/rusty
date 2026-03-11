@@ -1,3 +1,24 @@
+struct TerminalIoContext<'a> {
+    ctx: &'a egui::Context,
+    clipboard: &'a mut Option<Clipboard>,
+    ui: &'a mut egui::Ui,
+    term_rect: Rect,
+    origin: Pos2,
+    cell_w: f32,
+    cell_h: f32,
+    galley: Option<&'a egui::Galley>,
+    response: &'a egui::Response,
+}
+
+struct CellLookup<'a> {
+    origin: Pos2,
+    cell_w: f32,
+    cell_h: f32,
+    galley: Option<&'a egui::Galley>,
+    rows: u16,
+    cols: u16,
+}
+
 impl AppState {
     fn visible_cell_to_abs(tab: &SshTab, row: u16, col: u16) -> (i64, u16) {
         let top_abs = (tab.scrollback_max as i64 - tab.screen.scrollback() as i64).max(0);
@@ -293,27 +314,36 @@ impl AppState {
         }
     }
 
-    fn handle_terminal_io(
-        ctx: &egui::Context,
-        clipboard: &mut Option<Clipboard>,
-        ui: &mut egui::Ui,
-        tab: &mut SshTab,
-        term_rect: Rect,
-        origin: Pos2,
-        cell_w: f32,
-        cell_h: f32,
-        galley: Option<&egui::Galley>,
-        response: &egui::Response,
-    ) {
+    fn handle_terminal_io(io: TerminalIoContext<'_>, tab: &mut SshTab) {
+        let TerminalIoContext {
+            ctx,
+            clipboard,
+            ui,
+            term_rect,
+            origin,
+            cell_w,
+            cell_h,
+            galley,
+            response,
+        } = io;
         let events = ui.input(|i| i.events.clone());
         let global_mods = ui.input(|i| i.modifiers);
         let has_copy_event = events.iter().any(|e| matches!(e, egui::Event::Copy));
+        let has_cut_event = events.iter().any(|e| matches!(e, egui::Event::Cut));
         let has_paste_event = events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
         let has_text_event = events
             .iter()
             .any(|e| matches!(e, egui::Event::Text(t) if !t.is_empty()));
 
         let (screen_rows, screen_cols) = tab.screen.size();
+        let cell_lookup = CellLookup {
+            origin,
+            cell_w,
+            cell_h,
+            galley,
+            rows: screen_rows,
+            cols: screen_cols,
+        };
         let remote_mouse_enabled =
             tab.connected && tab.screen.mouse_protocol_mode() != crate::terminal_emulator::MouseProtocolMode::None;
         let local_select_enabled = !remote_mouse_enabled || global_mods.shift;
@@ -446,16 +476,8 @@ impl AppState {
 
                     if local_select_enabled {
                         tab.pending_remote_click = None;
-                        if let Some((row, col)) = Self::pos_to_cell(
-                            pos,
-                            origin,
-                            cell_w,
-                            cell_h,
-                            &tab.screen,
-                            galley,
-                            screen_rows,
-                            screen_cols,
-                        ) {
+                        if let Some((row, col)) = Self::pos_to_cell(pos, &cell_lookup, &tab.screen)
+                        {
                             tab.selection = Some(TermSelection {
                                 anchor: (row, col),
                                 cursor: (row, col),
@@ -473,16 +495,8 @@ impl AppState {
                         // in which case we switch into local selection mode.
                         tab.selection = None;
                         tab.abs_selection = None;
-                        if let Some((row, col)) = Self::pos_to_cell(
-                            pos,
-                            origin,
-                            cell_w,
-                            cell_h,
-                            &tab.screen,
-                            galley,
-                            screen_rows,
-                            screen_cols,
-                        ) {
+                        if let Some((row, col)) = Self::pos_to_cell(pos, &cell_lookup, &tab.screen)
+                        {
                             tab.pending_remote_click = Some(PendingRemoteClick {
                                 start_pos: pos,
                                 start_cell: (row, col),
@@ -505,16 +519,8 @@ impl AppState {
                 let pos = clamp_pos_to_grid(raw_pos);
                 if let Some(sel) = tab.selection.as_mut() {
                     if sel.dragging {
-                        if let Some((row, col)) = Self::pos_to_cell(
-                            pos,
-                            origin,
-                            cell_w,
-                            cell_h,
-                            &tab.screen,
-                            galley,
-                            screen_rows,
-                            screen_cols,
-                        ) {
+                        if let Some((row, col)) = Self::pos_to_cell(pos, &cell_lookup, &tab.screen)
+                        {
                             sel.cursor = (row, col);
                             let abs_cursor = Self::visible_cell_to_abs(tab, row, col);
                             if let Some(abs_sel) = tab.abs_selection.as_mut() {
@@ -528,16 +534,9 @@ impl AppState {
                     if let Some(pending) = tab.pending_remote_click {
                         let d = pos - pending.start_pos;
                         if d.length_sq() >= 6.0 * 6.0 {
-                            if let Some((row, col)) = Self::pos_to_cell(
-                                pos,
-                                origin,
-                                cell_w,
-                                cell_h,
-                                &tab.screen,
-                                galley,
-                                screen_rows,
-                                screen_cols,
-                            ) {
+                            if let Some((row, col)) =
+                                Self::pos_to_cell(pos, &cell_lookup, &tab.screen)
+                            {
                                 tab.selection = Some(TermSelection {
                                     anchor: pending.start_cell,
                                     cursor: (row, col),
@@ -631,18 +630,7 @@ impl AppState {
 
                     let release_cell = pointer_pos
                         .map(clamp_pos_to_grid)
-                        .and_then(|pos| {
-                            Self::pos_to_cell(
-                                pos,
-                                origin,
-                                cell_w,
-                                cell_h,
-                                &tab.screen,
-                                galley,
-                                screen_rows,
-                                screen_cols,
-                            )
-                        })
+                        .and_then(|pos| Self::pos_to_cell(pos, &cell_lookup, &tab.screen))
                         .unwrap_or(pending.start_cell);
 
                     // xterm mouse protocol is 1-based coordinates.
@@ -699,6 +687,11 @@ impl AppState {
                             // Treat Ctrl+C as SIGINT when nothing is selected.
                             Self::send_bytes(tab, vec![0x03]);
                         }
+                    }
+                    egui::Event::Cut => {
+                        // Some platforms surface Ctrl+X as a high-level cut command instead of a
+                        // raw key event. In a terminal, that should still reach the remote app.
+                        Self::send_bytes(tab, vec![0x18]);
                     }
                     egui::Event::Text(t) => {
                         if !t.is_empty() {
@@ -765,6 +758,11 @@ impl AppState {
                             continue;
                         }
 
+                        if modifiers.ctrl && !modifiers.shift && *key == egui::Key::X && has_cut_event
+                        {
+                            continue;
+                        }
+
                         Self::send_key(tab, *key, *modifiers);
                     }
                     _ => {}
@@ -776,32 +774,29 @@ impl AppState {
 
     fn pos_to_cell(
         pos: Pos2,
-        origin: Pos2,
-        cell_w: f32,
-        cell_h: f32,
+        lookup: &CellLookup<'_>,
         screen: &crate::terminal_emulator::Screen,
-        galley: Option<&egui::Galley>,
-        rows: u16,
-        cols: u16,
     ) -> Option<(u16, u16)> {
-        if let Some(g) = galley {
-            if let Some((r, c)) = Self::pos_to_cell_galley(pos, origin, screen, g, rows, cols) {
+        if let Some(g) = lookup.galley {
+            if let Some((r, c)) =
+                Self::pos_to_cell_galley(pos, lookup.origin, screen, g, lookup.rows, lookup.cols)
+            {
                 return Some((r, c));
             }
         }
 
-        if rows == 0 || cols == 0 {
+        if lookup.rows == 0 || lookup.cols == 0 {
             return None;
         }
 
-        let col = ((pos.x - origin.x) / cell_w).floor() as i32;
-        let row = ((pos.y - origin.y) / cell_h).floor() as i32;
+        let col = ((pos.x - lookup.origin.x) / lookup.cell_w).floor() as i32;
+        let row = ((pos.y - lookup.origin.y) / lookup.cell_h).floor() as i32;
         if col < 0 || row < 0 {
             return None;
         }
 
-        let col = (col as u16).min(cols.saturating_sub(1));
-        let row = (row as u16).min(rows.saturating_sub(1));
+        let col = (col as u16).min(lookup.cols.saturating_sub(1));
+        let row = (row as u16).min(lookup.rows.saturating_sub(1));
         Some((row, col))
     }
 
@@ -1205,4 +1200,14 @@ impl AppState {
         painter.rect_filled(thumb, 3.0, with_alpha(theme.accent, 150));
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_x_maps_to_terminal_control_byte() {
+        assert_eq!(AppState::key_to_ctrl_byte(egui::Key::X), Some(0x18));
+    }
 }

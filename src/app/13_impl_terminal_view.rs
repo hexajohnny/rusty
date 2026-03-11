@@ -1,21 +1,26 @@
+struct TerminalViewOptions {
+    is_active: bool,
+    theme: UiTheme,
+    term_theme: TermTheme,
+    cursor_visible: bool,
+    term_font_size: f32,
+    allow_resize: bool,
+    focus_shade: bool,
+}
+
 impl AppState {
     fn terminal_view(
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         clipboard: &mut Option<Clipboard>,
         tab: &mut SshTab,
-        is_active: bool,
-        theme: UiTheme,
-        term_theme: TermTheme,
-        cursor_visible: bool,
-        term_font_size: f32,
-        allow_resize: bool,
-        focus_shade: bool,
+        options: TerminalViewOptions,
     ) {
         let avail = ui.available_size();
         let (rect, _) = ui.allocate_exact_size(avail, Sense::hover());
         let term_id = Id::new(("terminal_view", tab.id));
         let response = ui.interact(rect, term_id, Sense::click_and_drag());
+        tab.last_view_rect = Some(rect);
 
         // Keep terminal focus locked to the terminal for common terminal keys (arrows/tab/escape).
         // Without this, egui may move focus to other widgets (e.g. the settings cog) on arrow keys.
@@ -41,11 +46,11 @@ impl AppState {
 
         let painter = ui.painter().with_clip_rect(rect);
         let rounding = egui::Rounding::ZERO;
-        painter.rect_filled(rect, rounding, term_theme.bg);
+        painter.rect_filled(rect, rounding, options.term_theme.bg);
 
         // Compute visible rows/cols and keep the remote PTY in sync.
         let ppp = ctx.pixels_per_point().max(1.0);
-        let snapped_term_font_size = ((term_font_size * ppp).round() / ppp).max(8.0);
+        let snapped_term_font_size = ((options.term_font_size * ppp).round() / ppp).max(8.0);
         let font_id = FontId::monospace(snapped_term_font_size);
         let (cell_w, cell_h) = Self::cell_metrics(ctx, &font_id);
 
@@ -55,7 +60,7 @@ impl AppState {
         let width_px = (inner_size.x * ctx.pixels_per_point()).round().max(1.0) as u32;
         let height_px = (inner_size.y * ctx.pixels_per_point()).round().max(1.0) as u32;
 
-        if allow_resize && tab.connected {
+        if options.allow_resize && tab.connected {
             if let Some(tx) = tab.worker_tx.as_ref() {
                 // Avoid resizing to a "degenerate" 1x1 while minimized/hidden or during transient layouts.
                 // Keeping the last good PTY size prevents the screen from effectively going blank.
@@ -92,7 +97,7 @@ impl AppState {
         let origin = Pos2::new((origin.x * ppp).round() / ppp, (origin.y * ppp).round() / ppp);
 
         if tab.connected {
-            let job = Self::screen_to_layout_job(&tab.screen, font_id, &term_theme);
+            let job = Self::screen_to_layout_job(&tab.screen, font_id, &options.term_theme);
             let galley = ui.fonts(|fonts| fonts.layout_job(job));
             painter.galley(origin, galley.clone(), Color32::WHITE);
             let draw_sel = if let Some(sel) = tab.abs_selection {
@@ -103,19 +108,39 @@ impl AppState {
             if let Some(sel) = draw_sel {
                 // Draw selection *after* the galley so it stays visible even when ANSI background
                 // colors are present.
-                Self::draw_selection_galley(&painter, tab, origin, &galley, &term_theme, sel);
+                Self::draw_selection_galley(
+                    &painter,
+                    tab,
+                    origin,
+                    &galley,
+                    &options.term_theme,
+                    sel,
+                );
             }
             Self::draw_cursor_galley(
                 &painter,
                 tab,
                 origin,
                 &galley,
-                cursor_visible,
-                term_theme.cursor,
+                options.cursor_visible,
+                options.term_theme.cursor,
                 ppp,
             );
 
-            Self::handle_terminal_io(ctx, clipboard, ui, tab, rect, origin, cell_w, cell_h, Some(&galley), &response);
+            Self::handle_terminal_io(
+                TerminalIoContext {
+                    ctx,
+                    clipboard,
+                    ui,
+                    term_rect: rect,
+                    origin,
+                    cell_w,
+                    cell_h,
+                    galley: Some(&galley),
+                    response: &response,
+                },
+                tab,
+            );
         } else {
             // Minimal empty state.
             let text = if tab.connecting {
@@ -130,10 +155,23 @@ impl AppState {
                 egui::Align2::LEFT_TOP,
                 text,
                 FontId::proportional(14.0),
-                theme.muted,
+                options.theme.muted,
             );
 
-            Self::handle_terminal_io(ctx, clipboard, ui, tab, rect, origin, cell_w, cell_h, None, &response);
+            Self::handle_terminal_io(
+                TerminalIoContext {
+                    ctx,
+                    clipboard,
+                    ui,
+                    term_rect: rect,
+                    origin,
+                    cell_w,
+                    cell_h,
+                    galley: None,
+                    response: &response,
+                },
+                tab,
+            );
         }
 
         // Hover-only scrollback bar (right side).
@@ -149,11 +187,11 @@ impl AppState {
                 visible_rows,
                 tab.screen.scrollback(),
                 tab.scrollback_max,
-                theme,
+                options.theme,
             );
         }
 
-        if focus_shade && !is_active && !response.has_focus() {
+        if options.focus_shade && !options.is_active && !response.has_focus() {
             painter.rect_filled(
                 rect,
                 rounding,
@@ -162,8 +200,8 @@ impl AppState {
         }
 
         // Active-pane affordance: subtle border/glow so it's obvious which terminal is "current".
-        if is_active || response.has_focus() {
-            let c = theme.accent;
+        if options.is_active || response.has_focus() {
+            let c = options.theme.accent;
             let (a_stroke, a_glow) = if response.has_focus() { (180u8, 70u8) } else { (110u8, 38u8) };
             let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a_stroke));
             let glow = Stroke::new(3.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a_glow));
@@ -172,6 +210,5 @@ impl AppState {
             painter.rect_stroke(r1, rounding, glow);
             painter.rect_stroke(r0, rounding, stroke);
         }
-
     }
 }

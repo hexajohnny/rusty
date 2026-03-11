@@ -24,9 +24,6 @@ const TERM_SCREEN_EMIT_INTERVAL_MEDIUM: Duration = Duration::from_millis(24);
 const TERM_SCREEN_EMIT_INTERVAL_HIGH: Duration = Duration::from_millis(33);
 const TERM_SCREEN_EMIT_INTERVAL_EXTREME: Duration = Duration::from_millis(40);
 const TERM_SCREEN_RATE_WINDOW: Duration = Duration::from_millis(250);
-const DETACHED_TRANSFER_RETRY_COUNT: u32 = 3;
-const DETACHED_TRANSFER_RETRY_BASE_DELAY_MS: u64 = 800;
-const DETACHED_TRANSFER_RETRY_MAX_DELAY_MS: u64 = 8_000;
 
 fn app_data_dir() -> PathBuf {
     std::env::current_exe()
@@ -64,6 +61,37 @@ fn app_known_hosts_path() -> PathBuf {
     path
 }
 
+fn remove_known_hosts_line(path: &Path, line_to_remove: usize) -> std::io::Result<()> {
+    let contents = std::fs::read_to_string(path)?;
+    let mut found = false;
+    let mut kept: Vec<&str> = Vec::new();
+
+    for (idx, line) in contents.lines().enumerate() {
+        let current_line = idx + 1;
+        if current_line == line_to_remove {
+            found = true;
+            continue;
+        }
+        kept.push(line);
+    }
+
+    if !found {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "known_hosts entry line {line_to_remove} was not found in {}",
+                path.display()
+            ),
+        ));
+    }
+
+    let mut rewritten = kept.join("\n");
+    if !rewritten.is_empty() {
+        rewritten.push('\n');
+    }
+    std::fs::write(path, rewritten)
+}
+
 #[derive(Debug)]
 pub enum UiMessage {
     Status(String),
@@ -72,7 +100,6 @@ pub enum UiMessage {
     Connected(bool),
     AuthPrompt(AuthPrompt),
     HostKeyPrompt(HostKeyPrompt),
-    SftpEvent(SftpEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +114,55 @@ pub struct AuthPromptItem {
     pub echo: bool,
 }
 
+fn auth_prompt_text(text: &str, echo: bool, index: usize) -> String {
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        return text.to_string();
+    }
+
+    if echo {
+        format!("Response {}:", index + 1)
+    } else if index == 0 {
+        "Secret response:".to_string()
+    } else {
+        format!("Secret response {}:", index + 1)
+    }
+}
+
+fn auth_prompt_items_from_keyboard<T>(prompts: &[T]) -> Vec<AuthPromptItem>
+where
+    T: std::borrow::Borrow<russh::client::Prompt>,
+{
+    prompts
+        .iter()
+        .enumerate()
+        .map(|(idx, prompt)| {
+            let prompt = prompt.borrow();
+            AuthPromptItem {
+                text: auth_prompt_text(&prompt.prompt, prompt.echo, idx),
+                echo: prompt.echo,
+            }
+        })
+        .collect()
+}
+
+fn looks_like_password_prompt_text(text: &str) -> bool {
+    let text = text.trim().to_ascii_lowercase();
+    text.is_empty() || text.contains("password")
+}
+
+fn can_auto_fill_cached_password<T>(prompts: &[T], password: &str) -> bool
+where
+    T: std::borrow::Borrow<russh::client::Prompt>,
+{
+    if password.is_empty() || prompts.len() != 1 {
+        return false;
+    }
+
+    let prompt = prompts[0].borrow();
+    !prompt.echo && looks_like_password_prompt_text(&prompt.prompt)
+}
+
 #[derive(Debug, Clone)]
 pub struct HostKeyPrompt {
     pub host: String,
@@ -94,11 +170,13 @@ pub struct HostKeyPrompt {
     pub algorithm: String,
     pub fingerprint: String,
     pub known_hosts_path: String,
+    pub changed_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostKeyDecision {
     TrustAndSave,
+    ReplaceAndSave,
     Reject,
 }
 
@@ -112,7 +190,12 @@ pub enum WorkerMessage {
         height_px: u32,
     },
     SetScrollback(usize),
-    SftpCommand(SftpCommand),
+    AttachSftpClient {
+        client_id: u64,
+        ui_tx: Sender<SftpUiMessage>,
+        worker_rx: Receiver<SftpWorkerMessage>,
+    },
+    TransferCommand(TransferCommand),
     AuthResponse(Vec<String>),
     Disconnect,
 }
@@ -164,6 +247,38 @@ pub enum SftpEvent {
     },
 }
 
+#[derive(Debug)]
+pub enum SftpWorkerMessage {
+    Command(SftpCommand),
+    Disconnect,
+}
+
+#[derive(Debug)]
+pub enum SftpUiMessage {
+    Status(String),
+    Connected(bool),
+    Event(SftpEvent),
+}
+
+#[derive(Debug)]
+pub enum TransferCommand {
+    Download {
+        request_id: u64,
+        remote_path: String,
+        local_path: String,
+        resume_from_local: bool,
+        event_tx: Sender<DownloadManagerEvent>,
+        cancel_rx: Receiver<()>,
+    },
+    Upload {
+        request_id: u64,
+        remote_path: String,
+        local_path: String,
+        event_tx: Sender<DownloadManagerEvent>,
+        cancel_rx: Receiver<()>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum DownloadManagerEvent {
     Started {
@@ -178,13 +293,6 @@ pub enum DownloadManagerEvent {
         downloaded_bytes: u64,
         total_bytes: Option<u64>,
         speed_bps: f64,
-    },
-    Retrying {
-        request_id: u64,
-        attempt: u32,
-        max_attempts: u32,
-        delay_ms: u64,
-        message: String,
     },
     Paused {
         request_id: u64,
@@ -436,29 +544,19 @@ fn adaptive_screen_emit_interval(window_bytes: u64, window_elapsed: Duration) ->
     }
 }
 
-async fn ensure_sftp_session(
-    session: &mut SshHandle,
-    sftp: &mut Option<SftpSession>,
-    log_path: &str,
-) -> Result<()> {
-    if sftp.is_none() {
-        logger::log_line(log_path, "Opening SFTP subsystem channel.");
-        let channel = session
-            .channel_open_session()
-            .await
-            .context("Failed to open SFTP channel")?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .context("Failed to request SFTP subsystem")?;
-        *sftp = Some(
-            SftpSession::new(channel.into_stream())
-                .await
-                .context("Failed to initialize SFTP session")?,
-        );
-    }
-
-    Ok(())
+async fn open_sftp_channel(session: &mut SshHandle, log_path: &str) -> Result<SftpSession> {
+    logger::log_line(log_path, "Opening SFTP channel.");
+    let channel = session
+        .channel_open_session()
+        .await
+        .context("Failed to open SFTP channel")?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .context("Failed to request SFTP subsystem")?;
+    SftpSession::new(channel.into_stream())
+        .await
+        .context("Failed to initialize SFTP session")
 }
 
 fn sort_sftp_entries(entries: &mut [SftpEntry]) {
@@ -471,19 +569,18 @@ fn sort_sftp_entries(entries: &mut [SftpEntry]) {
     });
 }
 
-async fn process_sftp_command(
-    session: &mut SshHandle,
-    sftp: &mut Option<SftpSession>,
-    ui_tx: &Sender<UiMessage>,
-    cmd: SftpCommand,
-    log_path: &str,
-) -> Result<()> {
+fn sftp_command_request_id(cmd: &SftpCommand) -> u64 {
+    match cmd {
+        SftpCommand::ListDir { request_id, .. }
+        | SftpCommand::MakeDir { request_id, .. }
+        | SftpCommand::Rename { request_id, .. }
+        | SftpCommand::Delete { request_id, .. } => *request_id,
+    }
+}
+
+async fn execute_sftp_command(sftp: &SftpSession, cmd: SftpCommand) -> Result<SftpEvent> {
     match cmd {
         SftpCommand::ListDir { request_id, path } => {
-            ensure_sftp_session(session, sftp, log_path).await?;
-            let sftp = sftp
-                .as_ref()
-                .ok_or_else(|| anyhow!("SFTP session unavailable"))?;
             let canonical = sftp.canonicalize(path.clone()).await.unwrap_or(path);
             let read_dir = sftp
                 .read_dir(canonical.clone())
@@ -509,51 +606,39 @@ async fn process_sftp_command(
                 .collect();
             sort_sftp_entries(&mut entries);
 
-            let _ = ui_tx.send(UiMessage::SftpEvent(SftpEvent::ListDir {
+            Ok(SftpEvent::ListDir {
                 request_id,
                 path: canonical,
                 entries,
-            }));
+            })
         }
         SftpCommand::MakeDir { request_id, path } => {
-            ensure_sftp_session(session, sftp, log_path).await?;
-            let sftp = sftp
-                .as_ref()
-                .ok_or_else(|| anyhow!("SFTP session unavailable"))?;
             sftp.create_dir(path.clone())
                 .await
                 .with_context(|| format!("Failed to create directory: {path}"))?;
-            let _ = ui_tx.send(UiMessage::SftpEvent(SftpEvent::OperationOk {
+            Ok(SftpEvent::OperationOk {
                 request_id,
                 message: format!("Created folder: {path}"),
-            }));
+            })
         }
         SftpCommand::Rename {
             request_id,
             old_path,
             new_path,
         } => {
-            ensure_sftp_session(session, sftp, log_path).await?;
-            let sftp = sftp
-                .as_ref()
-                .ok_or_else(|| anyhow!("SFTP session unavailable"))?;
             sftp.rename(old_path.clone(), new_path.clone())
                 .await
                 .with_context(|| format!("Failed to rename: {old_path} -> {new_path}"))?;
-            let _ = ui_tx.send(UiMessage::SftpEvent(SftpEvent::OperationOk {
+            Ok(SftpEvent::OperationOk {
                 request_id,
                 message: format!("Renamed to: {new_path}"),
-            }));
+            })
         }
         SftpCommand::Delete {
             request_id,
             path,
             is_dir,
         } => {
-            ensure_sftp_session(session, sftp, log_path).await?;
-            let sftp = sftp
-                .as_ref()
-                .ok_or_else(|| anyhow!("SFTP session unavailable"))?;
             if is_dir {
                 sftp.remove_dir(path.clone())
                     .await
@@ -563,181 +648,12 @@ async fn process_sftp_command(
                     .await
                     .with_context(|| format!("Failed to delete file: {path}"))?;
             }
-            let _ = ui_tx.send(UiMessage::SftpEvent(SftpEvent::OperationOk {
+            Ok(SftpEvent::OperationOk {
                 request_id,
                 message: format!("Deleted: {path}"),
-            }));
+            })
         }
     }
-
-    Ok(())
-}
-
-async fn authenticate_keyboard_interactive_with_password(
-    session: &mut SshHandle,
-    username: &str,
-    password: &str,
-) -> Result<AuthResult> {
-    let mut reply = session
-        .authenticate_keyboard_interactive_start(username, None::<String>)
-        .await
-        .context("SSH keyboard-interactive request failed")?;
-
-    loop {
-        match reply {
-            KeyboardInteractiveAuthResponse::Success => return Ok(AuthResult::Success),
-            KeyboardInteractiveAuthResponse::Failure {
-                remaining_methods,
-                partial_success,
-            } => {
-                return Ok(AuthResult::Failure {
-                    remaining_methods,
-                    partial_success,
-                });
-            }
-            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
-                if !prompts.is_empty() && !prompts.iter().all(|p| !p.echo) {
-                    return Err(anyhow!(
-                        "Interactive prompt requires user input; background download cannot continue"
-                    ));
-                }
-                let responses: Vec<String> = prompts.iter().map(|_| password.to_string()).collect();
-                reply = session
-                    .authenticate_keyboard_interactive_respond(responses)
-                    .await
-                    .context("SSH keyboard-interactive response failed")?;
-            }
-        }
-    }
-}
-
-async fn open_authenticated_session_for_download(
-    settings: &ConnectionSettings,
-    log_path: &str,
-) -> Result<SshHandle> {
-    if settings.host.trim().is_empty() {
-        return Err(anyhow!("Host is required"));
-    }
-    if settings.username.trim().is_empty() {
-        return Err(anyhow!("Username is required"));
-    }
-
-    let host = settings.host.trim().to_string();
-    let port = settings.port;
-    let addr = format!("{host}:{port}");
-    logger::log_line(
-        log_path,
-        &format!("Download manager connecting TCP to {addr}."),
-    );
-    let tcp = tokio::net::TcpStream::connect(&addr)
-        .await
-        .with_context(|| format!("Failed to connect to {addr}"))?;
-    let _ = tcp.set_nodelay(true);
-
-    let config = client::Config {
-        inactivity_timeout: None,
-        keepalive_interval: Some(Duration::from_secs(20)),
-        keepalive_max: 0,
-        ..Default::default()
-    };
-    let config = Arc::new(config);
-
-    let mut session =
-        client::connect_stream(config, tcp, KnownHostsClient::non_interactive(host, port))
-            .await
-            .context("SSH handshake failed")?;
-
-    let username = settings.username.trim();
-    let mut remaining_methods = MethodSet::empty();
-    let mut authenticated = false;
-
-    let probe = session
-        .authenticate_none(username)
-        .await
-        .context("Failed to query server auth methods")?;
-    match probe {
-        AuthResult::Success => authenticated = true,
-        AuthResult::Failure {
-            remaining_methods: methods,
-            ..
-        } => remaining_methods = methods,
-    }
-
-    let mut supports_kbd = supports_method(&remaining_methods, MethodKind::KeyboardInteractive);
-    let mut supports_pass = supports_method(&remaining_methods, MethodKind::Password);
-    let mut supports_pubkey = supports_method(&remaining_methods, MethodKind::PublicKey);
-
-    let best_rsa_hash = if supports_pubkey {
-        match session.best_supported_rsa_hash().await {
-            Ok(v) => v.flatten(),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-
-    if !authenticated && supports_pubkey && !settings.private_key_path.trim().is_empty() {
-        let private_key = Path::new(settings.private_key_path.trim());
-        if private_key.exists() {
-            let saved_passphrase = if settings.key_passphrase.trim().is_empty() {
-                None
-            } else {
-                Some(settings.key_passphrase.as_str())
-            };
-            if let Ok(auth_result) = authenticate_with_private_key(
-                &mut session,
-                username,
-                private_key,
-                saved_passphrase,
-                best_rsa_hash,
-            )
-            .await
-            {
-                let _ = apply_auth_result(auth_result, &mut authenticated, &mut remaining_methods);
-                supports_kbd = supports_method(&remaining_methods, MethodKind::KeyboardInteractive);
-                supports_pass = supports_method(&remaining_methods, MethodKind::Password);
-                supports_pubkey = supports_method(&remaining_methods, MethodKind::PublicKey);
-            }
-        }
-    }
-
-    if !authenticated && supports_pubkey {
-        if let Ok(auth_result) = authenticate_via_agent(&mut session, username, best_rsa_hash).await
-        {
-            let _ = apply_auth_result(auth_result, &mut authenticated, &mut remaining_methods);
-            supports_kbd = supports_method(&remaining_methods, MethodKind::KeyboardInteractive);
-            supports_pass = supports_method(&remaining_methods, MethodKind::Password);
-        }
-    }
-
-    if !authenticated && supports_kbd && !settings.password.is_empty() {
-        if let Ok(auth_result) = authenticate_keyboard_interactive_with_password(
-            &mut session,
-            username,
-            &settings.password,
-        )
-        .await
-        {
-            let _ = apply_auth_result(auth_result, &mut authenticated, &mut remaining_methods);
-            supports_pass = supports_method(&remaining_methods, MethodKind::Password);
-        }
-    }
-
-    if !authenticated && supports_pass && !settings.password.is_empty() {
-        let auth_result = session
-            .authenticate_password(username, settings.password.clone())
-            .await
-            .context("SSH password authentication failed")?;
-        let _ = apply_auth_result(auth_result, &mut authenticated, &mut remaining_methods);
-    }
-
-    if !authenticated {
-        return Err(anyhow!(
-            "SSH authentication failed for background download (requires stored credentials)"
-        ));
-    }
-
-    Ok(session)
 }
 
 fn transfer_cancel_requested(cancel_rx: &Receiver<()>) -> bool {
@@ -747,106 +663,15 @@ fn transfer_cancel_requested(cancel_rx: &Receiver<()>) -> bool {
     )
 }
 
-fn transfer_retry_delay_ms(attempt: u32) -> u64 {
-    let shift = attempt.saturating_sub(1).min(4);
-    let scaled = DETACHED_TRANSFER_RETRY_BASE_DELAY_MS.saturating_mul(1u64 << shift);
-    scaled.min(DETACHED_TRANSFER_RETRY_MAX_DELAY_MS)
-}
-
-fn is_retryable_transfer_error(err: &anyhow::Error) -> bool {
-    for cause in err.chain() {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            match io_err.kind() {
-                std::io::ErrorKind::Interrupted
-                | std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::NotConnected
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::UnexpectedEof => return true,
-                std::io::ErrorKind::PermissionDenied
-                | std::io::ErrorKind::NotFound
-                | std::io::ErrorKind::InvalidInput
-                | std::io::ErrorKind::InvalidData
-                | std::io::ErrorKind::AlreadyExists => return false,
-                _ => {}
-            }
-        }
-    }
-
-    let msg = err.to_string().to_ascii_lowercase();
-    if msg.contains("authentication failed")
-        || msg.contains("permission denied")
-        || msg.contains("no such file")
-        || msg.contains("failed to create local directory")
-        || msg.contains("failed to open local file")
-        || msg.contains("failed to create local file")
-        || msg.contains("failed to create remote file")
-    {
-        return false;
-    }
-
-    msg.contains("timed out")
-        || msg.contains("timeout")
-        || msg.contains("connection reset")
-        || msg.contains("connection aborted")
-        || msg.contains("connection closed")
-        || msg.contains("connection lost")
-        || msg.contains("broken pipe")
-        || msg.contains("unexpected eof")
-        || msg.contains("channel closed")
-}
-
-async fn wait_for_retry_or_cancel(cancel_rx: &Receiver<()>, delay_ms: u64) -> bool {
-    let deadline = Instant::now() + Duration::from_millis(delay_ms);
-    loop {
-        if transfer_cancel_requested(cancel_rx) {
-            return true;
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        let remaining = deadline.saturating_duration_since(now);
-        let sleep_for = remaining.min(Duration::from_millis(100));
-        tokio::time::sleep(sleep_for).await;
-    }
-}
-
-async fn run_detached_sftp_download_attempt(
-    settings: &ConnectionSettings,
+async fn run_sftp_download_with_session(
+    sftp: SftpSession,
     request_id: u64,
     remote_path: String,
     local_path: String,
     resume_from_local: bool,
     event_tx: &Sender<DownloadManagerEvent>,
     cancel_rx: &Receiver<()>,
-    log_path: &str,
 ) -> Result<()> {
-    if transfer_cancel_requested(cancel_rx) {
-        let _ = event_tx.send(DownloadManagerEvent::Canceled {
-            request_id,
-            local_path,
-        });
-        return Ok(());
-    }
-
-    let session = open_authenticated_session_for_download(settings, log_path).await?;
-
-    let channel = session
-        .channel_open_session()
-        .await
-        .context("Failed to open SFTP channel")?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .context("Failed to request SFTP subsystem")?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .context("Failed to initialize SFTP session")?;
-
     let mut remote = sftp
         .open(remote_path.clone())
         .await
@@ -965,119 +790,14 @@ async fn run_detached_sftp_download_attempt(
     Ok(())
 }
 
-async fn run_detached_sftp_download(
-    settings: ConnectionSettings,
-    request_id: u64,
-    remote_path: String,
-    local_path: String,
-    resume_from_local: bool,
-    event_tx: &Sender<DownloadManagerEvent>,
-    cancel_rx: &Receiver<()>,
-    log_path: &str,
-) -> Result<()> {
-    let mut resume_next_attempt = resume_from_local;
-
-    for retry_index in 0..=DETACHED_TRANSFER_RETRY_COUNT {
-        let result = run_detached_sftp_download_attempt(
-            &settings,
-            request_id,
-            remote_path.clone(),
-            local_path.clone(),
-            resume_next_attempt,
-            event_tx,
-            cancel_rx,
-            log_path,
-        )
-        .await;
-
-        match result {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                let retryable = is_retryable_transfer_error(&err);
-                if retryable && retry_index < DETACHED_TRANSFER_RETRY_COUNT {
-                    let attempt = retry_index + 1;
-                    let delay_ms = transfer_retry_delay_ms(attempt);
-                    let message = format!(
-                        "Transient download error: {err}. Retrying ({attempt}/{}) in {:.1}s...",
-                        DETACHED_TRANSFER_RETRY_COUNT,
-                        delay_ms as f64 / 1000.0
-                    );
-                    logger::log_line(log_path, &message);
-                    let _ = event_tx.send(DownloadManagerEvent::Retrying {
-                        request_id,
-                        attempt,
-                        max_attempts: DETACHED_TRANSFER_RETRY_COUNT,
-                        delay_ms,
-                        message,
-                    });
-                    if wait_for_retry_or_cancel(cancel_rx, delay_ms).await {
-                        let _ = event_tx.send(DownloadManagerEvent::Canceled {
-                            request_id,
-                            local_path: local_path.clone(),
-                        });
-                        return Ok(());
-                    }
-                    resume_next_attempt = true;
-                    continue;
-                }
-
-                if retryable {
-                    let message = format!(
-                        "Download paused after {} retries: {err}. Click retry to resume.",
-                        DETACHED_TRANSFER_RETRY_COUNT
-                    );
-                    logger::log_line(log_path, &message);
-                    let _ = event_tx.send(DownloadManagerEvent::Paused {
-                        request_id,
-                        message,
-                    });
-                    return Ok(());
-                }
-
-                return Err(err);
-            }
-        }
-    }
-
-    let message = "Download paused: retry loop ended unexpectedly.".to_string();
-    let _ = event_tx.send(DownloadManagerEvent::Paused {
-        request_id,
-        message,
-    });
-    Ok(())
-}
-
-async fn run_detached_sftp_upload_attempt(
-    settings: &ConnectionSettings,
+async fn run_sftp_upload_with_session(
+    sftp: SftpSession,
     request_id: u64,
     remote_path: String,
     local_path: String,
     event_tx: &Sender<DownloadManagerEvent>,
     cancel_rx: &Receiver<()>,
-    log_path: &str,
 ) -> Result<()> {
-    if transfer_cancel_requested(cancel_rx) {
-        let _ = event_tx.send(DownloadManagerEvent::Canceled {
-            request_id,
-            local_path,
-        });
-        return Ok(());
-    }
-
-    let session = open_authenticated_session_for_download(settings, log_path).await?;
-
-    let channel = session
-        .channel_open_session()
-        .await
-        .context("Failed to open SFTP channel")?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .context("Failed to request SFTP subsystem")?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .context("Failed to initialize SFTP session")?;
-
     let mut local = tokio::fs::File::open(local_path.clone())
         .await
         .with_context(|| format!("Failed to open local file: {local_path}"))?;
@@ -1149,153 +869,61 @@ async fn run_detached_sftp_upload_attempt(
     Ok(())
 }
 
-async fn run_detached_sftp_upload(
-    settings: ConnectionSettings,
-    request_id: u64,
-    remote_path: String,
-    local_path: String,
-    event_tx: &Sender<DownloadManagerEvent>,
-    cancel_rx: &Receiver<()>,
-    log_path: &str,
+async fn run_sftp_client_async(
+    client_id: u64,
+    sftp: SftpSession,
+    ui_tx: Sender<SftpUiMessage>,
+    worker_rx: Receiver<SftpWorkerMessage>,
+    log_path: String,
 ) -> Result<()> {
-    for retry_index in 0..=DETACHED_TRANSFER_RETRY_COUNT {
-        let result = run_detached_sftp_upload_attempt(
-            &settings,
-            request_id,
-            remote_path.clone(),
-            local_path.clone(),
-            event_tx,
-            cancel_rx,
-            log_path,
-        )
-        .await;
+    logger::log_line(&log_path, &format!("SFTP client {client_id} connected."));
+    let _ = ui_tx.send(SftpUiMessage::Status("Connected".to_string()));
+    let _ = ui_tx.send(SftpUiMessage::Connected(true));
 
-        match result {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                let retryable = is_retryable_transfer_error(&err);
-                if retryable && retry_index < DETACHED_TRANSFER_RETRY_COUNT {
-                    let attempt = retry_index + 1;
-                    let delay_ms = transfer_retry_delay_ms(attempt);
-                    let message = format!(
-                        "Transient upload error: {err}. Retrying ({attempt}/{}) in {:.1}s...",
-                        DETACHED_TRANSFER_RETRY_COUNT,
-                        delay_ms as f64 / 1000.0
-                    );
-                    logger::log_line(log_path, &message);
-                    let _ = event_tx.send(DownloadManagerEvent::Retrying {
-                        request_id,
-                        attempt,
-                        max_attempts: DETACHED_TRANSFER_RETRY_COUNT,
-                        delay_ms,
-                        message,
-                    });
-                    if wait_for_retry_or_cancel(cancel_rx, delay_ms).await {
-                        let _ = event_tx.send(DownloadManagerEvent::Canceled {
-                            request_id,
-                            local_path: local_path.clone(),
-                        });
-                        return Ok(());
+    loop {
+        let mut disconnected = false;
+
+        loop {
+            match worker_rx.try_recv() {
+                Ok(SftpWorkerMessage::Command(cmd)) => {
+                    let request_id = sftp_command_request_id(&cmd);
+                    match execute_sftp_command(&sftp, cmd).await {
+                        Ok(event) => {
+                            let _ = ui_tx.send(SftpUiMessage::Event(event));
+                        }
+                        Err(err) => {
+                            logger::log_line(
+                                &log_path,
+                                &format!("SFTP client {client_id} command failed: {err}"),
+                            );
+                            let _ = ui_tx.send(SftpUiMessage::Event(SftpEvent::OperationErr {
+                                request_id,
+                                message: err.to_string(),
+                            }));
+                        }
                     }
-                    continue;
                 }
-
-                if retryable {
-                    let message = format!(
-                        "Upload paused after {} retries: {err}. Click retry to restart upload.",
-                        DETACHED_TRANSFER_RETRY_COUNT
-                    );
-                    logger::log_line(log_path, &message);
-                    let _ = event_tx.send(DownloadManagerEvent::Paused {
-                        request_id,
-                        message,
-                    });
-                    return Ok(());
+                Ok(SftpWorkerMessage::Disconnect) => {
+                    disconnected = true;
+                    break;
                 }
-
-                return Err(err);
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             }
         }
+
+        if disconnected {
+            logger::log_line(&log_path, &format!("SFTP client {client_id} disconnected."));
+            let _ = ui_tx.send(SftpUiMessage::Status("Disconnected".to_string()));
+            let _ = ui_tx.send(SftpUiMessage::Connected(false));
+            return Ok(());
+        }
+
+        tokio::time::sleep(READ_POLL_INTERVAL).await;
     }
-
-    let message = "Upload paused: retry loop ended unexpectedly.".to_string();
-    let _ = event_tx.send(DownloadManagerEvent::Paused {
-        request_id,
-        message,
-    });
-    Ok(())
-}
-
-pub fn start_sftp_download_detached(
-    settings: ConnectionSettings,
-    request_id: u64,
-    remote_path: String,
-    local_path: String,
-    resume_from_local: bool,
-    event_tx: Sender<DownloadManagerEvent>,
-    cancel_rx: Receiver<()>,
-    log_path: String,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let result = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt.block_on(run_detached_sftp_download(
-                settings,
-                request_id,
-                remote_path.clone(),
-                local_path.clone(),
-                resume_from_local,
-                &event_tx,
-                &cancel_rx,
-                &log_path,
-            )),
-            Err(err) => Err(anyhow!("Failed to create async runtime: {err}")),
-        };
-
-        if let Err(err) = result {
-            let _ = event_tx.send(DownloadManagerEvent::Failed {
-                request_id,
-                message: err.to_string(),
-            });
-        }
-    })
-}
-
-pub fn start_sftp_upload_detached(
-    settings: ConnectionSettings,
-    request_id: u64,
-    remote_path: String,
-    local_path: String,
-    event_tx: Sender<DownloadManagerEvent>,
-    cancel_rx: Receiver<()>,
-    log_path: String,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let result = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt.block_on(run_detached_sftp_upload(
-                settings,
-                request_id,
-                remote_path.clone(),
-                local_path.clone(),
-                &event_tx,
-                &cancel_rx,
-                &log_path,
-            )),
-            Err(err) => Err(anyhow!("Failed to create async runtime: {err}")),
-        };
-
-        if let Err(err) = result {
-            let _ = event_tx.send(DownloadManagerEvent::Failed {
-                request_id,
-                message: err.to_string(),
-            });
-        }
-    })
 }
 
 fn request_auth_responses(
@@ -1306,7 +934,7 @@ fn request_auth_responses(
     prompts: Vec<AuthPromptItem>,
     log_path: &str,
 ) -> Result<Vec<String>> {
-    if prompts.is_empty() || prompts.iter().all(|p| p.text.trim().is_empty()) {
+    if prompts.is_empty() {
         logger::log_line(
             log_path,
             &format!("Auth prompt requires no user input (user={username:?}); auto-continuing."),
@@ -1426,17 +1054,13 @@ async fn authenticate_keyboard_interactive(
                 prompts,
                 ..
             } => {
-                let responses = if let Some(pw) = cached_password {
-                    if !pw.is_empty() && !prompts.is_empty() && prompts.iter().all(|p| !p.echo) {
-                        prompts.iter().map(|_| pw.to_string()).collect()
+                let items = auth_prompt_items_from_keyboard(&prompts);
+                let responses = if items.is_empty() {
+                    Vec::new()
+                } else if let Some(pw) = cached_password {
+                    if can_auto_fill_cached_password(&prompts, pw) {
+                        vec![pw.to_string()]
                     } else {
-                        let items: Vec<AuthPromptItem> = prompts
-                            .iter()
-                            .map(|p| AuthPromptItem {
-                                text: p.prompt.clone(),
-                                echo: p.echo,
-                            })
-                            .collect();
                         request_auth_responses(
                             ui_tx,
                             worker_rx,
@@ -1447,13 +1071,6 @@ async fn authenticate_keyboard_interactive(
                         )?
                     }
                 } else {
-                    let items: Vec<AuthPromptItem> = prompts
-                        .iter()
-                        .map(|p| AuthPromptItem {
-                            text: p.prompt.clone(),
-                            echo: p.echo,
-                        })
-                        .collect();
                     request_auth_responses(
                         ui_tx,
                         worker_rx,
@@ -1545,13 +1162,54 @@ async fn authenticate_via_agent(
 
 type SshHandle = client::Handle<KnownHostsClient>;
 
+struct ActiveSftpClient {
+    client_id: u64,
+    ui_tx: Sender<SftpUiMessage>,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+fn stop_sftp_client(client: ActiveSftpClient, message: &str) {
+    if client.abort_handle.is_finished() {
+        return;
+    }
+    client.abort_handle.abort();
+    let _ = client
+        .ui_tx
+        .send(SftpUiMessage::Status(message.to_string()));
+    let _ = client.ui_tx.send(SftpUiMessage::Connected(false));
+}
+
+fn stop_active_sftp_clients(active_clients: &mut Vec<ActiveSftpClient>, message: &str) {
+    for client in active_clients.drain(..) {
+        stop_sftp_client(client, message);
+    }
+}
+
+struct ActiveTransfer {
+    request_id: u64,
+    event_tx: Sender<DownloadManagerEvent>,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+fn stop_active_transfers(active_transfers: &mut Vec<ActiveTransfer>, message: &str) {
+    for transfer in active_transfers.drain(..) {
+        if transfer.abort_handle.is_finished() {
+            continue;
+        }
+        transfer.abort_handle.abort();
+        let _ = transfer.event_tx.send(DownloadManagerEvent::Paused {
+            request_id: transfer.request_id,
+            message: message.to_string(),
+        });
+    }
+}
+
 enum HostKeyVerificationMode {
     Interactive {
         ui_tx: Sender<UiMessage>,
         decision_rx: Receiver<HostKeyDecision>,
         log_path: String,
     },
-    NonInteractive,
 }
 
 struct KnownHostsClient {
@@ -1581,15 +1239,6 @@ impl KnownHostsClient {
         }
     }
 
-    fn non_interactive(host: String, port: u16) -> Self {
-        Self {
-            host,
-            port,
-            known_hosts_path: app_known_hosts_path(),
-            mode: HostKeyVerificationMode::NonInteractive,
-        }
-    }
-
     fn verify_server_key(
         &mut self,
         server_public_key: &keys::PublicKey,
@@ -1601,18 +1250,20 @@ impl KnownHostsClient {
             &self.known_hosts_path,
         ) {
             Ok(true) => Ok(true),
-            Ok(false) => self.handle_unknown_key(server_public_key),
-            Err(keys::Error::KeyChanged { line }) => Err(russh::Error::KeyChanged { line }),
+            Ok(false) => self.handle_host_key_prompt(server_public_key, None),
+            Err(keys::Error::KeyChanged { line }) => {
+                self.handle_host_key_prompt(server_public_key, Some(line))
+            }
             Err(err) => Err(err.into()),
         }
     }
 
-    fn handle_unknown_key(
+    fn handle_host_key_prompt(
         &mut self,
         server_public_key: &keys::PublicKey,
+        changed_line: Option<usize>,
     ) -> Result<bool, russh::Error> {
         match &mut self.mode {
-            HostKeyVerificationMode::NonInteractive => Ok(false),
             HostKeyVerificationMode::Interactive {
                 ui_tx,
                 decision_rx,
@@ -1626,14 +1277,20 @@ impl KnownHostsClient {
                     algorithm: server_public_key.algorithm().to_string(),
                     fingerprint,
                     known_hosts_path: self.known_hosts_path.to_string_lossy().into_owned(),
+                    changed_line,
                 };
-                logger::log_line(
-                    log_path.as_str(),
-                    &format!(
+                let prompt_message = if let Some(line) = changed_line {
+                    format!(
+                        "Host key changed for {}:{} (known_hosts line {}); waiting for user decision.",
+                        self.host, self.port, line
+                    )
+                } else {
+                    format!(
                         "Unknown host key for {}:{}; waiting for user trust decision.",
                         self.host, self.port
-                    ),
-                );
+                    )
+                };
+                logger::log_line(log_path.as_str(), &prompt_message);
                 let _ = ui_tx.send(UiMessage::HostKeyPrompt(prompt));
 
                 match decision_rx.recv_timeout(Duration::from_secs(600)) {
@@ -1651,6 +1308,36 @@ impl KnownHostsClient {
                                 self.host,
                                 self.port,
                                 self.known_hosts_path.display()
+                            ),
+                        );
+                        Ok(true)
+                    }
+                    Ok(HostKeyDecision::ReplaceAndSave) => {
+                        let Some(line) = changed_line else {
+                            logger::log_line(
+                                log_path.as_str(),
+                                &format!(
+                                    "Ignoring replace-host-key decision for {}:{} because no existing entry was provided.",
+                                    self.host, self.port
+                                ),
+                            );
+                            return Ok(false);
+                        };
+                        remove_known_hosts_line(&self.known_hosts_path, line)?;
+                        keys::known_hosts::learn_known_hosts_path(
+                            &self.host,
+                            self.port,
+                            server_public_key,
+                            &self.known_hosts_path,
+                        )?;
+                        logger::log_line(
+                            log_path.as_str(),
+                            &format!(
+                                "Replaced pinned host key for {}:{} in {} (old line {}).",
+                                self.host,
+                                self.port,
+                                self.known_hosts_path.display(),
+                                line
                             ),
                         );
                         Ok(true)
@@ -1706,14 +1393,20 @@ pub fn start_shell(
             .enable_all()
             .build()
         {
-            Ok(rt) => rt.block_on(run_shell_async(
-                settings,
-                scrollback_len,
-                &ui_tx,
-                worker_rx,
-                host_key_rx,
-                &log_path,
-            )),
+            Ok(rt) => {
+                let local = tokio::task::LocalSet::new();
+                local.block_on(
+                    &rt,
+                    run_shell_async(
+                        settings,
+                        scrollback_len,
+                        &ui_tx,
+                        worker_rx,
+                        host_key_rx,
+                        &log_path,
+                    ),
+                )
+            }
             Err(err) => Err(anyhow!("Failed to create async runtime: {err}")),
         };
 
@@ -2125,7 +1818,6 @@ async fn run_shell_async(
     let len = if len == 0 { TERM_SCROLLBACK_LEN } else { len };
     let mut parser = Parser::new(24, 80, len);
     let mut scanner = CsiQueryScanner::default();
-    let mut sftp: Option<SftpSession> = None;
     let mut screen_dirty = true;
     let mut scrollback_dirty = true;
     let mut screen_emit_interval = TERM_SCREEN_EMIT_INTERVAL_BASE;
@@ -2134,11 +1826,15 @@ async fn run_shell_async(
         .unwrap_or_else(Instant::now);
     let mut screen_rate_window_started = Instant::now();
     let mut screen_rate_window_bytes: u64 = 0;
+    let mut active_sftp_clients: Vec<ActiveSftpClient> = Vec::new();
+    let mut active_transfers: Vec<ActiveTransfer> = Vec::new();
 
     let mut writer = channel.make_writer();
 
     loop {
         let mut disconnected = false;
+        active_sftp_clients.retain(|client| !client.abort_handle.is_finished());
+        active_transfers.retain(|transfer| !transfer.abort_handle.is_finished());
 
         loop {
             match worker_rx.try_recv() {
@@ -2168,24 +1864,194 @@ async fn run_shell_async(
                     parser.set_scrollback(rows);
                     screen_dirty = true;
                 }
-                Ok(WorkerMessage::SftpCommand(cmd)) => {
-                    if let Err(err) =
-                        process_sftp_command(&mut session, &mut sftp, ui_tx, cmd.clone(), log_path)
-                            .await
+                Ok(WorkerMessage::AttachSftpClient {
+                    client_id,
+                    ui_tx,
+                    worker_rx,
+                }) => {
+                    if let Some(index) = active_sftp_clients
+                        .iter()
+                        .position(|client| client.client_id == client_id)
                     {
-                        let request_id = match cmd {
-                            SftpCommand::ListDir { request_id, .. }
-                            | SftpCommand::MakeDir { request_id, .. }
-                            | SftpCommand::Rename { request_id, .. }
-                            | SftpCommand::Delete { request_id, .. } => request_id,
-                        };
-                        logger::log_line(log_path, &format!("SFTP command failed: {err}"));
-                        let _ = ui_tx.send(UiMessage::SftpEvent(SftpEvent::OperationErr {
-                            request_id,
-                            message: err.to_string(),
-                        }));
+                        let client = active_sftp_clients.swap_remove(index);
+                        stop_sftp_client(client, "SFTP session restarted.");
+                    }
+
+                    let _ = ui_tx.send(SftpUiMessage::Status(
+                        "Connecting SFTP session...".to_string(),
+                    ));
+
+                    match open_sftp_channel(&mut session, log_path).await {
+                        Ok(sftp) => {
+                            let log_path = log_path.to_string();
+                            let tracked_ui_tx = ui_tx.clone();
+                            let task = tokio::task::spawn_local(async move {
+                                if let Err(err) = run_sftp_client_async(
+                                    client_id,
+                                    sftp,
+                                    ui_tx.clone(),
+                                    worker_rx,
+                                    log_path.clone(),
+                                )
+                                .await
+                                {
+                                    logger::log_line(
+                                        &log_path,
+                                        &format!("SFTP client {client_id} failed: {err}"),
+                                    );
+                                    let _ = ui_tx.send(SftpUiMessage::Status(err.to_string()));
+                                    let _ = ui_tx.send(SftpUiMessage::Connected(false));
+                                }
+                            });
+                            active_sftp_clients.push(ActiveSftpClient {
+                                client_id,
+                                ui_tx: tracked_ui_tx,
+                                abort_handle: task.abort_handle(),
+                            });
+                            drop(task);
+                        }
+                        Err(err) => {
+                            logger::log_line(
+                                log_path,
+                                &format!("Failed to open SFTP client {client_id}: {err}"),
+                            );
+                            let _ = ui_tx.send(SftpUiMessage::Status(format!(
+                                "Failed to open SFTP session: {err}"
+                            )));
+                            let _ = ui_tx.send(SftpUiMessage::Connected(false));
+                        }
                     }
                 }
+                Ok(WorkerMessage::TransferCommand(cmd)) => match cmd {
+                    TransferCommand::Download {
+                        request_id,
+                        remote_path,
+                        local_path,
+                        resume_from_local,
+                        event_tx,
+                        cancel_rx,
+                    } => {
+                        if transfer_cancel_requested(&cancel_rx) {
+                            let _ = event_tx.send(DownloadManagerEvent::Canceled {
+                                request_id,
+                                local_path,
+                            });
+                            continue;
+                        }
+
+                        match open_sftp_channel(&mut session, log_path).await {
+                            Ok(sftp) => {
+                                let log_path = log_path.to_string();
+                                let tracked_event_tx = event_tx.clone();
+                                let task = tokio::task::spawn_local(async move {
+                                    if let Err(err) = run_sftp_download_with_session(
+                                        sftp,
+                                        request_id,
+                                        remote_path,
+                                        local_path,
+                                        resume_from_local,
+                                        &event_tx,
+                                        &cancel_rx,
+                                    )
+                                    .await
+                                    {
+                                        logger::log_line(
+                                            &log_path,
+                                            &format!(
+                                                "Live download transfer {request_id} failed: {err}"
+                                            ),
+                                        );
+                                        let _ = event_tx.send(DownloadManagerEvent::Failed {
+                                            request_id,
+                                            message: err.to_string(),
+                                        });
+                                    }
+                                });
+                                active_transfers.push(ActiveTransfer {
+                                    request_id,
+                                    event_tx: tracked_event_tx,
+                                    abort_handle: task.abort_handle(),
+                                });
+                                drop(task);
+                            }
+                            Err(err) => {
+                                logger::log_line(
+                                    log_path,
+                                    &format!(
+                                        "Failed to open live SFTP channel for download {request_id}: {err}"
+                                    ),
+                                );
+                                let _ = event_tx.send(DownloadManagerEvent::Failed {
+                                    request_id,
+                                    message: err.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    TransferCommand::Upload {
+                        request_id,
+                        remote_path,
+                        local_path,
+                        event_tx,
+                        cancel_rx,
+                    } => {
+                        if transfer_cancel_requested(&cancel_rx) {
+                            let _ = event_tx.send(DownloadManagerEvent::Canceled {
+                                request_id,
+                                local_path,
+                            });
+                            continue;
+                        }
+
+                        match open_sftp_channel(&mut session, log_path).await {
+                            Ok(sftp) => {
+                                let log_path = log_path.to_string();
+                                let tracked_event_tx = event_tx.clone();
+                                let task = tokio::task::spawn_local(async move {
+                                    if let Err(err) = run_sftp_upload_with_session(
+                                        sftp,
+                                        request_id,
+                                        remote_path,
+                                        local_path,
+                                        &event_tx,
+                                        &cancel_rx,
+                                    )
+                                    .await
+                                    {
+                                        logger::log_line(
+                                            &log_path,
+                                            &format!(
+                                                "Live upload transfer {request_id} failed: {err}"
+                                            ),
+                                        );
+                                        let _ = event_tx.send(DownloadManagerEvent::Failed {
+                                            request_id,
+                                            message: err.to_string(),
+                                        });
+                                    }
+                                });
+                                active_transfers.push(ActiveTransfer {
+                                    request_id,
+                                    event_tx: tracked_event_tx,
+                                    abort_handle: task.abort_handle(),
+                                });
+                                drop(task);
+                            }
+                            Err(err) => {
+                                logger::log_line(
+                                    log_path,
+                                    &format!(
+                                        "Failed to open live SFTP channel for upload {request_id}: {err}"
+                                    ),
+                                );
+                                let _ = event_tx.send(DownloadManagerEvent::Failed {
+                                    request_id,
+                                    message: err.to_string(),
+                                });
+                            }
+                        }
+                    }
+                },
                 Ok(WorkerMessage::Disconnect) => {
                     disconnected = true;
                     break;
@@ -2202,6 +2068,14 @@ async fn run_shell_async(
         }
 
         if disconnected {
+            stop_active_sftp_clients(
+                &mut active_sftp_clients,
+                "SFTP session disconnected. Reconnect the source terminal to continue.",
+            );
+            stop_active_transfers(
+                &mut active_transfers,
+                "Transfer paused because the SSH session disconnected. Reconnect the tab and click retry.",
+            );
             let _ = channel.eof().await;
             let _ = channel.close().await;
             let _ = session
@@ -2231,6 +2105,14 @@ async fn run_shell_async(
                 scrollback_dirty = true;
             }
             Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) => {
+                stop_active_sftp_clients(
+                    &mut active_sftp_clients,
+                    "SFTP session disconnected. Reconnect the source terminal to continue.",
+                );
+                stop_active_transfers(
+                    &mut active_transfers,
+                    "Transfer paused because the SSH session disconnected. Reconnect the tab and click retry.",
+                );
                 logger::log_line(log_path, "Channel EOF.");
                 let _ = ui_tx.send(UiMessage::Status("Disconnected".to_string()));
                 let _ = ui_tx.send(UiMessage::Connected(false));
@@ -2240,6 +2122,14 @@ async fn run_shell_async(
                 // Ignore other channel events for interactive shell mode.
             }
             Ok(None) => {
+                stop_active_sftp_clients(
+                    &mut active_sftp_clients,
+                    "SFTP session disconnected. Reconnect the source terminal to continue.",
+                );
+                stop_active_transfers(
+                    &mut active_transfers,
+                    "Transfer paused because the SSH session disconnected. Reconnect the tab and click retry.",
+                );
                 logger::log_line(log_path, "Channel closed.");
                 let _ = ui_tx.send(UiMessage::Status("Disconnected".to_string()));
                 let _ = ui_tx.send(UiMessage::Connected(false));
@@ -2268,5 +2158,70 @@ async fn run_shell_async(
             screen_dirty = false;
             last_screen_emit = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn blank_auth_prompt_gets_safe_label() {
+        assert_eq!(auth_prompt_text("", false, 0), "Secret response:");
+        assert_eq!(auth_prompt_text("   ", false, 1), "Secret response 2:");
+        assert_eq!(auth_prompt_text("", true, 0), "Response 1:");
+    }
+
+    #[test]
+    fn password_prompt_detection_is_narrow() {
+        assert!(looks_like_password_prompt_text(""));
+        assert!(looks_like_password_prompt_text("Password:"));
+        assert!(looks_like_password_prompt_text("Login password for alice:"));
+        assert!(!looks_like_password_prompt_text("Verification code:"));
+        assert!(!looks_like_password_prompt_text("Duo passcode or option:"));
+    }
+
+    #[test]
+    fn remove_known_hosts_line_rewrites_target_entry() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rusty-known-hosts-test-{}-{unique}.tmp",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "alpha ssh-ed25519 AAAA\nbeta ssh-ed25519 BBBB\ngamma ssh-ed25519 CCCC\n",
+        )
+        .unwrap();
+
+        remove_known_hosts_line(&path, 2).unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "alpha ssh-ed25519 AAAA\ngamma ssh-ed25519 CCCC\n");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn remove_known_hosts_line_errors_for_missing_line() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rusty-known-hosts-missing-line-{}-{unique}.tmp",
+            std::process::id()
+        ));
+        fs::write(&path, "alpha ssh-ed25519 AAAA\n").unwrap();
+
+        let err = remove_known_hosts_line(&path, 3).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+        let _ = fs::remove_file(path);
     }
 }

@@ -1,7 +1,9 @@
 impl AppState {
     pub fn new() -> Self {
         let _ = std::fs::create_dir_all("logs");
-        let mut config = config::load();
+        let load_outcome = config::load();
+        let mut config = load_outcome.config;
+        let startup_notice = load_outcome.notice;
         let config_saver = AsyncConfigSaver::new();
         let (download_event_tx, download_event_rx) = mpsc::channel::<ssh::DownloadManagerEvent>();
 
@@ -222,6 +224,7 @@ impl AppState {
             update_available_url,
             update_manual_open_if_newer: false,
             update_manual_status: None,
+            startup_notice,
         }
     }
 
@@ -497,6 +500,7 @@ impl AppState {
             settings: entry.settings.clone(),
             remote_path: entry.remote_path.clone(),
             local_path: entry.local_path.clone(),
+            source_terminal: None,
             downloaded_bytes: entry.transferred_bytes,
             total_bytes: entry.total_bytes,
             speed_bps: entry.speed_bps,
@@ -602,6 +606,85 @@ impl AppState {
             .into_iter()
             .filter(|id| self.pane(*id).map(|t| t.is_terminal()).unwrap_or(false))
             .collect()
+    }
+
+    fn visible_terminal_focus_order(&self) -> Vec<TileId> {
+        let mut terminals = Vec::new();
+        if let Some(root) = self.tree.root {
+            self.collect_visible_terminals(root, &mut terminals);
+        }
+
+        let mut ordered: Vec<(usize, TileId, Option<Rect>)> = terminals
+            .into_iter()
+            .enumerate()
+            .map(|(index, tile_id)| {
+                let rect = self.terminal_pane(tile_id).and_then(|pane| pane.last_view_rect);
+                (index, tile_id, rect)
+            })
+            .collect();
+
+        ordered.sort_by(|a, b| match (a.2, b.2) {
+            (Some(a_rect), Some(b_rect)) => {
+                let top_cmp = a_rect.min.y.total_cmp(&b_rect.min.y);
+                if top_cmp != std::cmp::Ordering::Equal {
+                    top_cmp
+                } else {
+                    let left_cmp = a_rect.min.x.total_cmp(&b_rect.min.x);
+                    if left_cmp != std::cmp::Ordering::Equal {
+                        left_cmp
+                    } else {
+                        a.0.cmp(&b.0)
+                    }
+                }
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.0.cmp(&b.0),
+        });
+
+        ordered.into_iter().map(|(_, tile_id, _)| tile_id).collect()
+    }
+
+    fn collect_visible_terminals(&self, tile_id: TileId, out: &mut Vec<TileId>) {
+        let Some(tile) = self.tree.tiles.get(tile_id) else {
+            return;
+        };
+
+        match tile {
+            Tile::Pane(tab) => {
+                if tab.is_terminal() {
+                    out.push(tile_id);
+                }
+            }
+            Tile::Container(Container::Tabs(tabs)) => {
+                let active = tabs
+                    .active
+                    .filter(|id| self.tree.tiles.is_visible(*id))
+                    .or_else(|| {
+                        tabs.children
+                            .iter()
+                            .copied()
+                            .find(|id| self.tree.tiles.is_visible(*id))
+                    });
+                if let Some(active) = active {
+                    self.collect_visible_terminals(active, out);
+                }
+            }
+            Tile::Container(Container::Linear(linear)) => {
+                for child in linear.children.iter().copied() {
+                    if self.tree.tiles.is_visible(child) {
+                        self.collect_visible_terminals(child, out);
+                    }
+                }
+            }
+            Tile::Container(Container::Grid(grid)) => {
+                for child in grid.children().copied() {
+                    if self.tree.tiles.is_visible(child) {
+                        self.collect_visible_terminals(child, out);
+                    }
+                }
+            }
+        }
     }
 
     fn first_pane_id(&self) -> Option<TileId> {
@@ -712,7 +795,6 @@ impl AppState {
         let mut tiles: Tiles<SshTab> = Tiles::default();
         let mut max_session_id = 0u64;
         let mut to_autoconnect_terminals: Vec<TileId> = Vec::new();
-        let mut to_connect_file_managers: Vec<TileId> = Vec::new();
 
         for (tile_id, tile) in restored.tree.tiles.iter() {
             match tile {
@@ -760,10 +842,6 @@ impl AppState {
                     tab.user_title = p.user_title.clone();
                     tab.color = p.color;
                     tab.focus_terminal_next_frame = false;
-                    if tab.is_file_manager() {
-                        tab.last_status = "Not connected".to_string();
-                        to_connect_file_managers.push(*tile_id);
-                    }
                     tiles.insert(*tile_id, Tile::Pane(tab));
                 }
                 Tile::Container(c) => {
@@ -777,16 +855,6 @@ impl AppState {
         for id in to_autoconnect_terminals {
             if let Some(Tile::Pane(tab)) = tree.tiles.get_mut(id) {
                 if tab.is_terminal()
-                    && !tab.settings.host.trim().is_empty()
-                    && !tab.settings.username.trim().is_empty()
-                {
-                    tab.start_connect();
-                }
-            }
-        }
-        for id in to_connect_file_managers {
-            if let Some(Tile::Pane(tab)) = tree.tiles.get_mut(id) {
-                if tab.is_file_manager()
                     && !tab.settings.host.trim().is_empty()
                     && !tab.settings.username.trim().is_empty()
                 {
@@ -993,16 +1061,86 @@ impl AppState {
         }
     }
 
-    fn sender_for_file_tile(
+    fn sender_for_terminal_tile(&self, terminal_tile: TileId) -> Option<Sender<WorkerMessage>> {
+        let pane = self.terminal_pane(terminal_tile)?;
+        if !pane.connected {
+            return None;
+        }
+        pane.worker_tx.as_ref().cloned()
+    }
+
+    fn transfer_sender_for_file_tile(
         &self,
         file_tile: TileId,
     ) -> Option<(TileId, Sender<WorkerMessage>)> {
-        let pane = self.pane(file_tile)?;
-        if !pane.is_file_manager() || !pane.connected {
+        let source_tile = self.file_pane(file_tile)?.source_terminal;
+        let tx = self.sender_for_terminal_tile(source_tile)?;
+        Some((source_tile, tx))
+    }
+
+    fn sender_for_file_tile(&self, file_tile: TileId) -> Option<Sender<ssh::SftpWorkerMessage>> {
+        let pane = self.file_pane(file_tile)?;
+        let tab = self.pane(file_tile)?;
+        if !tab.connected {
             return None;
         }
-        let tx = pane.worker_tx.as_ref()?.clone();
-        Some((file_tile, tx))
+        pane.worker_tx.as_ref().cloned()
+    }
+
+    fn attach_file_manager_to_source(&mut self, file_tile: TileId) -> bool {
+        let Some(source_tile) = self.file_pane(file_tile).map(|file| file.source_terminal) else {
+            return false;
+        };
+        let Some(source_tx) = self.sender_for_terminal_tile(source_tile) else {
+            if let Some(tab) = self.pane_mut(file_tile) {
+                tab.connected = false;
+                tab.connecting = false;
+                tab.last_status = "SFTP session is not connected".to_string();
+            }
+            if let Some(file) = self.file_pane_mut(file_tile) {
+                file.source_connected = false;
+                file.status = "SFTP session is not connected".to_string();
+                file.ui_rx = None;
+                file.worker_tx = None;
+            }
+            return false;
+        };
+
+        let client_id = self.pane(file_tile).map(|pane| pane.id).unwrap_or(0);
+        let (ui_tx, ui_rx) = mpsc::channel::<ssh::SftpUiMessage>();
+        let (worker_tx, worker_rx) = mpsc::channel::<ssh::SftpWorkerMessage>();
+        let send_result = source_tx.send(WorkerMessage::AttachSftpClient {
+            client_id,
+            ui_tx,
+            worker_rx,
+        });
+        if send_result.is_err() {
+            if let Some(tab) = self.pane_mut(file_tile) {
+                tab.connected = false;
+                tab.connecting = false;
+                tab.last_status = "Failed to open SFTP session".to_string();
+            }
+            if let Some(file) = self.file_pane_mut(file_tile) {
+                file.source_connected = false;
+                file.status = "Failed to open SFTP session".to_string();
+                file.ui_rx = None;
+                file.worker_tx = None;
+            }
+            return false;
+        }
+
+        if let Some(tab) = self.pane_mut(file_tile) {
+            tab.connected = false;
+            tab.connecting = true;
+            tab.last_status = "Connecting SFTP session...".to_string();
+        }
+        if let Some(file) = self.file_pane_mut(file_tile) {
+            file.source_connected = false;
+            file.status = "Connecting SFTP session...".to_string();
+            file.ui_rx = Some(ui_rx);
+            file.worker_tx = Some(worker_tx);
+        }
+        true
     }
 
     fn next_sftp_request_for_tile(&mut self, tile_id: TileId) -> u64 {
@@ -1029,7 +1167,7 @@ impl AppState {
             file.status = busy_status;
         }
 
-        let Some((_source_tile, tx)) = self.sender_for_file_tile(file_tile) else {
+        let Some(tx) = self.sender_for_file_tile(file_tile) else {
             self.pending_sftp_requests.remove(&request_id);
             if let Some(file) = self.file_pane_mut(file_tile) {
                 file.busy = false;
@@ -1040,11 +1178,16 @@ impl AppState {
         };
 
         let cmd = make_cmd(request_id);
-        if tx.send(WorkerMessage::SftpCommand(cmd)).is_err() {
+        if tx.send(ssh::SftpWorkerMessage::Command(cmd)).is_err() {
             self.pending_sftp_requests.remove(&request_id);
             if let Some(file) = self.file_pane_mut(file_tile) {
                 file.busy = false;
                 file.status = "Failed to send SFTP command".to_string();
+                file.source_connected = false;
+            }
+            if let Some(tab) = self.pane_mut(file_tile) {
+                tab.connected = false;
+                tab.connecting = false;
             }
         }
     }
@@ -1054,6 +1197,9 @@ impl AppState {
         let settings = source.settings.clone();
         let profile_name = source.profile_name.clone();
         let color = source.color;
+        let source_connected = source.connected;
+        let source_connecting = source.connecting;
+        let source_status = source.last_status.clone();
 
         let id = self.next_session_id;
         self.next_session_id += 1;
@@ -1083,8 +1229,17 @@ impl AppState {
 
         self.active_tile = Some(pane_id);
         self.settings_dialog.target_tile = Some(source_tile);
-        if let Some(tab) = self.pane_mut(pane_id) {
-            tab.start_connect();
+        if source_connected {
+            let _ = self.attach_file_manager_to_source(pane_id);
+        } else if let Some(file) = self.file_pane_mut(pane_id) {
+            file.source_connected = false;
+            file.status = if source_connecting {
+                "Connecting source terminal...".to_string()
+            } else if !source_status.trim().is_empty() {
+                source_status
+            } else {
+                "SFTP session is not connected".to_string()
+            };
         }
         Some(pane_id)
     }
@@ -1179,7 +1334,14 @@ impl AppState {
     }
 
     fn start_upload_for_file(&mut self, file_tile: TileId) -> bool {
-        let settings = self.pane(file_tile).map(|p| p.settings.clone());
+        let Some((source_tile, tx)) = self.transfer_sender_for_file_tile(file_tile) else {
+            if let Some(file) = self.file_pane_mut(file_tile) {
+                file.status = "SFTP session is not connected".to_string();
+                file.source_connected = false;
+            }
+            return false;
+        };
+        let settings = self.terminal_pane(source_tile).map(|p| p.settings.clone());
         let Some(settings) = settings else {
             if let Some(file) = self.file_pane_mut(file_tile) {
                 file.status = "Cannot resolve connection settings for upload".to_string();
@@ -1227,6 +1389,7 @@ impl AppState {
             settings: settings.clone(),
             remote_path: remote_path.clone(),
             local_path: local_path.clone(),
+            source_terminal: Some(source_tile),
             downloaded_bytes: 0,
             total_bytes: None,
             speed_bps: 0.0,
@@ -1237,16 +1400,30 @@ impl AppState {
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
         self.download_cancel_txs.insert(request_id, cancel_tx);
         self.upload_refresh_targets.insert(request_id, file_tile);
-        let log_path = format!("logs\\upload-{request_id}.log");
-        let _ = ssh::start_sftp_upload_detached(
-            settings,
+        let send_result = tx.send(WorkerMessage::TransferCommand(ssh::TransferCommand::Upload {
             request_id,
             remote_path,
             local_path,
-            self.download_event_tx.clone(),
+            event_tx: self.download_event_tx.clone(),
             cancel_rx,
-            log_path,
-        );
+        }));
+        if send_result.is_err() {
+            self.download_cancel_txs.remove(&request_id);
+            self.upload_refresh_targets.remove(&request_id);
+            if let Some(job) = self
+                .download_jobs
+                .iter_mut()
+                .find(|job| job.request_id == request_id)
+            {
+                job.state = DownloadState::Failed;
+                job.message = "Failed to queue upload on the live SSH session".to_string();
+            }
+            self.persist_transfer_history();
+            if let Some(file) = self.file_pane_mut(file_tile) {
+                file.status = "Failed to queue upload on the live SSH session".to_string();
+            }
+            return false;
+        }
         self.persist_transfer_history();
 
         if let Some(file) = self.file_pane_mut(file_tile) {
@@ -1265,7 +1442,14 @@ impl AppState {
             .file_pane(file_tile)
             .map(|f| Self::remote_join_path(&f.cwd, &name))
             .unwrap_or(name.clone());
-        let settings = self.pane(file_tile).map(|p| p.settings.clone());
+        let Some((source_tile, tx)) = self.transfer_sender_for_file_tile(file_tile) else {
+            if let Some(file) = self.file_pane_mut(file_tile) {
+                file.status = "SFTP session is not connected".to_string();
+                file.source_connected = false;
+            }
+            return;
+        };
+        let settings = self.terminal_pane(source_tile).map(|p| p.settings.clone());
         let Some(settings) = settings else {
             if let Some(file) = self.file_pane_mut(file_tile) {
                 file.status = "Cannot resolve connection settings for download".to_string();
@@ -1297,6 +1481,7 @@ impl AppState {
             settings: settings.clone(),
             remote_path: remote_path.clone(),
             local_path: local_path.clone(),
+            source_terminal: Some(source_tile),
             downloaded_bytes: 0,
             total_bytes: None,
             speed_bps: 0.0,
@@ -1306,18 +1491,30 @@ impl AppState {
 
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
         self.download_cancel_txs.insert(request_id, cancel_tx);
-        let log_path = format!("logs\\download-{request_id}.log");
-
-        let _ = ssh::start_sftp_download_detached(
-            settings,
+        let send_result = tx.send(WorkerMessage::TransferCommand(ssh::TransferCommand::Download {
             request_id,
             remote_path,
             local_path,
-            false,
-            self.download_event_tx.clone(),
+            resume_from_local: false,
+            event_tx: self.download_event_tx.clone(),
             cancel_rx,
-            log_path,
-        );
+        }));
+        if send_result.is_err() {
+            self.download_cancel_txs.remove(&request_id);
+            if let Some(job) = self
+                .download_jobs
+                .iter_mut()
+                .find(|job| job.request_id == request_id)
+            {
+                job.state = DownloadState::Failed;
+                job.message = "Failed to queue download on the live SSH session".to_string();
+            }
+            self.persist_transfer_history();
+            if let Some(file) = self.file_pane_mut(file_tile) {
+                file.status = "Failed to queue download on the live SSH session".to_string();
+            }
+            return;
+        }
         self.persist_transfer_history();
 
         if let Some(file) = self.file_pane_mut(file_tile) {
@@ -1342,10 +1539,29 @@ impl AppState {
             return;
         }
 
-        let settings = self.download_jobs[job_idx].settings.clone();
         let direction = self.download_jobs[job_idx].direction;
         let remote_path = self.download_jobs[job_idx].remote_path.clone();
         let local_path = self.download_jobs[job_idx].local_path.clone();
+        let source_terminal = self.download_jobs[job_idx].source_terminal;
+
+        let Some(source_tile) = source_terminal else {
+            let job = &mut self.download_jobs[job_idx];
+            job.state = DownloadState::Failed;
+            job.speed_bps = 0.0;
+            job.message =
+                "Retry requires the original SSH session to still be connected.".to_string();
+            self.persist_transfer_history();
+            return;
+        };
+        let Some(tx) = self.sender_for_terminal_tile(source_tile) else {
+            let job = &mut self.download_jobs[job_idx];
+            job.state = DownloadState::Failed;
+            job.speed_bps = 0.0;
+            job.message =
+                "Retry requires the original SSH session to still be connected.".to_string();
+            self.persist_transfer_history();
+            return;
+        };
 
         self.download_cancel_txs.remove(&request_id);
         let upload_refresh_target = self.upload_refresh_targets.remove(&request_id);
@@ -1359,40 +1575,39 @@ impl AppState {
             job.speed_bps = 0.0;
             job.state = DownloadState::Queued;
             job.message = "Retrying...".to_string();
+            job.source_terminal = Some(source_tile);
         }
 
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
         self.download_cancel_txs.insert(new_request_id, cancel_tx);
-        let _ = match direction {
-            TransferDirection::Download => {
-                let log_path = format!("logs\\download-{new_request_id}.log");
-                ssh::start_sftp_download_detached(
-                    settings,
-                    new_request_id,
-                    remote_path,
-                    local_path,
-                    true,
-                    self.download_event_tx.clone(),
-                    cancel_rx,
-                    log_path,
-                )
-            }
-            TransferDirection::Upload => {
-                if let Some(tile_id) = upload_refresh_target {
-                    self.upload_refresh_targets.insert(new_request_id, tile_id);
-                }
-                let log_path = format!("logs\\upload-{new_request_id}.log");
-                ssh::start_sftp_upload_detached(
-                    settings,
-                    new_request_id,
-                    remote_path,
-                    local_path,
-                    self.download_event_tx.clone(),
-                    cancel_rx,
-                    log_path,
-                )
-            }
+        if let Some(tile_id) = upload_refresh_target {
+            self.upload_refresh_targets.insert(new_request_id, tile_id);
+        }
+        let cmd = match direction {
+            TransferDirection::Download => ssh::TransferCommand::Download {
+                request_id: new_request_id,
+                remote_path,
+                local_path,
+                resume_from_local: true,
+                event_tx: self.download_event_tx.clone(),
+                cancel_rx,
+            },
+            TransferDirection::Upload => ssh::TransferCommand::Upload {
+                request_id: new_request_id,
+                remote_path,
+                local_path,
+                event_tx: self.download_event_tx.clone(),
+                cancel_rx,
+            },
         };
+        if tx.send(WorkerMessage::TransferCommand(cmd)).is_err() {
+            self.download_cancel_txs.remove(&new_request_id);
+            self.upload_refresh_targets.remove(&new_request_id);
+            let job = &mut self.download_jobs[job_idx];
+            job.state = DownloadState::Failed;
+            job.speed_bps = 0.0;
+            job.message = "Failed to queue retry on the live SSH session".to_string();
+        }
         self.persist_transfer_history();
     }
 
@@ -1589,27 +1804,6 @@ impl AppState {
                         };
                     }
                 }
-                ssh::DownloadManagerEvent::Retrying {
-                    request_id,
-                    attempt,
-                    max_attempts,
-                    delay_ms,
-                    message,
-                } => {
-                    if let Some(job) = self
-                        .download_jobs
-                        .iter_mut()
-                        .find(|j| j.request_id == request_id)
-                    {
-                        job.state = DownloadState::Running;
-                        job.speed_bps = 0.0;
-                        let delay_secs = delay_ms as f64 / 1000.0;
-                        job.message = format!(
-                            "{message} (retry {attempt}/{max_attempts} in {delay_secs:.1}s)"
-                        );
-                        persist_needed = true;
-                    }
-                }
                 ssh::DownloadManagerEvent::Finished {
                     request_id,
                     local_path,
@@ -1716,23 +1910,41 @@ impl AppState {
     fn sync_file_panes_with_sources(&mut self) {
         let pane_ids = self.pane_ids();
         let mut clear_pending_for: Vec<TileId> = Vec::new();
+        let mut attach_pending: Vec<TileId> = Vec::new();
+        let mut detach_pending: Vec<TileId> = Vec::new();
         let mut refresh_on_connect: Vec<(TileId, String)> = Vec::new();
         for pane_id in pane_ids {
-            let Some(tab) = self.pane(pane_id) else {
+            let Some(file) = self.file_pane(pane_id) else {
                 continue;
             };
-            if !tab.is_file_manager() {
-                continue;
-            }
-            let connected = tab.connected;
-            let connecting = tab.connecting;
-            let last_status = tab.last_status.clone();
+            let source_tile = file.source_terminal;
+            let has_worker = file.worker_tx.is_some() || file.ui_rx.is_some();
+            let (source_connected, source_connecting, source_status) = if let Some(source) =
+                self.terminal_pane(source_tile)
+            {
+                (
+                    source.connected,
+                    source.connecting,
+                    source.last_status.clone(),
+                )
+            } else {
+                (
+                    false,
+                    false,
+                    "Source terminal is not available".to_string(),
+                )
+            };
+            let (sftp_connected, sftp_connecting, pane_status) = self
+                .pane(pane_id)
+                .map(|pane| (pane.connected, pane.connecting, pane.last_status.clone()))
+                .unwrap_or((false, false, String::new()));
 
             if let Some(file) = self.file_pane_mut(pane_id) {
                 let was_connected = file.source_connected;
-                file.source_connected = connected;
+                let now_connected = source_connected && sftp_connected;
+                file.source_connected = now_connected;
 
-                if connected && !was_connected && !file.busy {
+                if now_connected && !was_connected && !file.busy {
                     let pending_path = file.path_input.trim();
                     let path = if pending_path.is_empty() {
                         file.cwd.clone()
@@ -1742,25 +1954,53 @@ impl AppState {
                     refresh_on_connect.push((pane_id, path));
                 }
 
-                if !connected && !connecting {
+                if (!source_connected || !sftp_connected) && !source_connecting && !sftp_connecting {
                     if file.busy {
                         file.busy = false;
                     }
                     clear_pending_for.push(pane_id);
                 }
 
-                if !connected && !file.busy {
-                    file.status = if connecting {
+                if !now_connected && !file.busy {
+                    file.status = if !source_connected {
+                        if source_connecting {
+                            "Connecting source terminal...".to_string()
+                        } else if !source_status.trim().is_empty() {
+                            source_status.clone()
+                        } else {
+                            "SFTP session is not connected".to_string()
+                        }
+                    } else if sftp_connecting {
                         "Connecting SFTP session...".to_string()
-                    } else if !last_status.trim().is_empty() {
-                        last_status.clone()
+                    } else if !pane_status.trim().is_empty() {
+                        pane_status.clone()
+                    } else if source_connecting {
+                        "Connecting source terminal...".to_string()
                     } else {
                         "SFTP session is not connected".to_string()
                     };
                 }
             }
+
+            if source_connected {
+                if !sftp_connected && !sftp_connecting && !has_worker {
+                    attach_pending.push(pane_id);
+                }
+            } else if sftp_connected || sftp_connecting || has_worker {
+                detach_pending.push(pane_id);
+            }
         }
 
+        for tile_id in detach_pending {
+            if let Some(tab) = self.pane_mut(tile_id) {
+                tab.disconnect();
+            }
+        }
+        for tile_id in attach_pending {
+            if self.file_pane(tile_id).is_some() {
+                let _ = self.attach_file_manager_to_source(tile_id);
+            }
+        }
         if !clear_pending_for.is_empty() {
             self.pending_sftp_requests
                 .retain(|_, file_tile| !clear_pending_for.contains(file_tile));
@@ -1833,6 +2073,84 @@ impl AppState {
     fn set_focus_next_frame(&mut self, tile_id: TileId) {
         if let Some(pane) = self.pane_mut(tile_id) {
             pane.focus_terminal_next_frame = true;
+        }
+    }
+
+    fn clear_transient_prompts_for_tile(&mut self, tile_id: TileId) {
+        if self
+            .auth_dialog
+            .as_ref()
+            .map(|dialog| dialog.tile_id == tile_id)
+            .unwrap_or(false)
+        {
+            self.auth_dialog = None;
+        }
+        if self
+            .host_key_dialog
+            .as_ref()
+            .map(|dialog| dialog.tile_id == tile_id)
+            .unwrap_or(false)
+        {
+            self.host_key_dialog = None;
+        }
+        if let Some(tab) = self.pane_mut(tile_id) {
+            tab.pending_auth = None;
+            tab.pending_host_key = None;
+        }
+    }
+
+    fn cycle_active_terminal_focus(&mut self, reverse: bool) -> bool {
+        let order = self.visible_terminal_focus_order();
+        if order.is_empty() {
+            return false;
+        }
+
+        let next_tile = self
+            .active_tile
+            .and_then(|active| order.iter().position(|candidate| *candidate == active))
+            .map(|index| {
+                if reverse {
+                    order[(index + order.len() - 1) % order.len()]
+                } else {
+                    order[(index + 1) % order.len()]
+                }
+            })
+            .unwrap_or_else(|| {
+                if reverse {
+                    *order.last().unwrap_or(&order[0])
+                } else {
+                    order[0]
+                }
+            });
+
+        if self.active_tile != Some(next_tile) {
+            self.layout_dirty = true;
+        }
+        self.active_tile = Some(next_tile);
+        self.settings_dialog.target_tile = Some(next_tile);
+        self.set_focus_next_frame(next_tile);
+        true
+    }
+
+    fn handle_terminal_focus_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.auth_dialog.is_some()
+            || self.host_key_dialog.is_some()
+            || self.rename_popup.is_some()
+            || self.transfer_delete_dialog.is_some()
+        {
+            return;
+        }
+
+        let reverse = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab)
+        });
+        if reverse {
+            let _ = self.cycle_active_terminal_focus(true);
+            return;
+        }
+
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
+            let _ = self.cycle_active_terminal_focus(false);
         }
     }
 
@@ -2131,9 +2449,7 @@ impl AppState {
                 self.config.terminal_scrollback_lines,
             ));
 
-        let Some(tabs_container_id) = self.tree.tiles.parent_of(pane_id) else {
-            return None;
-        };
+        let tabs_container_id = self.tree.tiles.parent_of(pane_id)?;
         let parent_of_tabs = self.tree.tiles.parent_of(tabs_container_id);
 
         let new_pane_id = self.create_pane(settings, color, profile_name, scrollback_len);

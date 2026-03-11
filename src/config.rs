@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,12 @@ fn default_terminal_font_size() -> f32 {
 
 fn default_terminal_scrollback_lines() -> usize {
     5000
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigLoadOutcome {
+    pub config: AppConfig,
+    pub notice: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -248,7 +254,118 @@ pub fn config_path() -> PathBuf {
     PathBuf::from("config.json")
 }
 
-pub fn load() -> AppConfig {
+fn corrupt_backup_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("config");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("json");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    for attempt in 0..1000u32 {
+        let suffix = if attempt == 0 {
+            format!("{stem}.corrupt-{stamp}")
+        } else {
+            format!("{stem}.corrupt-{stamp}-{attempt}")
+        };
+        let file_name = if ext.is_empty() {
+            suffix
+        } else {
+            format!("{suffix}.{ext}")
+        };
+        let candidate = path.with_file_name(file_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    path.with_file_name(format!("{stem}.corrupt-backup"))
+}
+
+fn preserve_unreadable_config(path: &Path, bytes: &[u8], reason: &str) -> Option<PathBuf> {
+    let backup = corrupt_backup_path(path);
+    if let Some(parent) = backup.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    match fs::rename(path, &backup) {
+        Ok(()) => Some(backup),
+        Err(rename_err) => {
+            logger::log_line(
+                "logs\\config.log",
+                &format!(
+                    "Config backup rename failed for {} -> {}: {rename_err}",
+                    path.display(),
+                    backup.display()
+                ),
+            );
+            match fs::write(&backup, bytes) {
+                Ok(()) => Some(backup),
+                Err(write_err) => {
+                    logger::log_line(
+                        "logs\\config.log",
+                        &format!(
+                            "Config backup write failed for {} after load error ({reason}): {write_err}",
+                            backup.display()
+                        ),
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn unreadable_config_outcome(path: &Path, bytes: &[u8], reason: &str) -> ConfigLoadOutcome {
+    logger::log_line(
+        "logs\\config.log",
+        &format!("Config load failed for {}: {reason}", path.display()),
+    );
+
+    let backup = preserve_unreadable_config(path, bytes, reason);
+    let notice = match backup {
+        Some(backup) => format!(
+            "Rusty could not read the saved config at {}. It was preserved as {} and defaults were loaded.",
+            path.display(),
+            backup.display()
+        ),
+        None => format!(
+            "Rusty could not read the saved config at {}. Defaults were loaded; see logs\\\\config.log.",
+            path.display()
+        ),
+    };
+
+    ConfigLoadOutcome {
+        config: AppConfig::default(),
+        notice: Some(notice),
+    }
+}
+
+fn sanitized_for_plaintext_fallback(cfg: &AppConfig) -> AppConfig {
+    let mut sanitized = cfg.clone();
+
+    for profile in &mut sanitized.profiles {
+        profile.remember_password = false;
+        profile.remember_key_passphrase = false;
+        profile.settings.password.clear();
+        profile.settings.key_passphrase.clear();
+    }
+
+    for transfer in &mut sanitized.transfer_history {
+        transfer.settings.password.clear();
+        transfer.settings.key_passphrase.clear();
+    }
+
+    // Session layout snapshots may embed serialized connection settings with secrets.
+    sanitized.saved_session_layout_json = None;
+    sanitized
+}
+
+pub fn load() -> ConfigLoadOutcome {
     let path = config_path();
     let (bytes, loaded_from_path) = if let Ok(bytes) = fs::read(&path) {
         (bytes, path.clone())
@@ -259,27 +376,65 @@ pub fn load() -> AppConfig {
         match legacy {
             Some(legacy_path) => match fs::read(&legacy_path) {
                 Ok(bytes) => (bytes, legacy_path),
-                Err(_) => return AppConfig::default(),
+                Err(_) => {
+                    return ConfigLoadOutcome {
+                        config: AppConfig::default(),
+                        notice: None,
+                    };
+                }
             },
-            None => return AppConfig::default(),
+            None => {
+                return ConfigLoadOutcome {
+                    config: AppConfig::default(),
+                    notice: None,
+                };
+            }
         }
     };
 
-    let parsed = if bytes.starts_with(CFG_MAGIC_PREFIX.as_bytes()) {
+    let cfg = if bytes.starts_with(CFG_MAGIC_PREFIX.as_bytes()) {
         let b64 = &bytes[CFG_MAGIC_PREFIX.len()..];
-        let Ok(cipher) = base64::engine::general_purpose::STANDARD.decode(b64) else {
-            return AppConfig::default();
+        let cipher = match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(cipher) => cipher,
+            Err(err) => {
+                return unreadable_config_outcome(
+                    &loaded_from_path,
+                    &bytes,
+                    &format!("base64 decode failed: {err}"),
+                );
+            }
         };
-        let Ok(plain) = crypto::decrypt_for_current_user(&cipher) else {
-            return AppConfig::default();
+        let plain = match crypto::decrypt_for_current_user(&cipher) {
+            Ok(plain) => plain,
+            Err(err) => {
+                return unreadable_config_outcome(
+                    &loaded_from_path,
+                    &bytes,
+                    &format!("decrypt failed: {err}"),
+                );
+            }
         };
-        serde_json::from_slice::<AppConfig>(&plain).ok()
+        match serde_json::from_slice::<AppConfig>(&plain) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                return unreadable_config_outcome(
+                    &loaded_from_path,
+                    &bytes,
+                    &format!("JSON parse failed after decrypt: {err}"),
+                );
+            }
+        }
     } else {
-        serde_json::from_slice::<AppConfig>(&bytes).ok()
-    };
-
-    let Some(cfg) = parsed else {
-        return AppConfig::default();
+        match serde_json::from_slice::<AppConfig>(&bytes) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                return unreadable_config_outcome(
+                    &loaded_from_path,
+                    &bytes,
+                    &format!("JSON parse failed: {err}"),
+                );
+            }
+        }
     };
 
     // Best-effort migration: rewrite plaintext configs encrypted, and migrate from the legacy
@@ -288,7 +443,10 @@ pub fn load() -> AppConfig {
         save(&cfg);
     }
 
-    cfg
+    ConfigLoadOutcome {
+        config: cfg,
+        notice: None,
+    }
 }
 
 pub fn save(cfg: &AppConfig) {
@@ -323,12 +481,22 @@ pub fn save(cfg: &AppConfig) {
             out
         }
         Err(err) => {
-            // If encryption fails for some reason, avoid breaking the app; log and fall back.
+            // Never fall back to writing credentials in plaintext.
+            let sanitized = sanitized_for_plaintext_fallback(cfg);
+            let Ok(sanitized_json) = serde_json::to_vec_pretty(&sanitized) else {
+                logger::log_line(
+                    "logs\\config.log",
+                    "Config save failed to serialize sanitized JSON payload",
+                );
+                return;
+            };
             logger::log_line(
                 "logs\\config.log",
-                &format!("Config encryption failed: {err}"),
+                &format!(
+                    "Config encryption failed: {err}. Writing sanitized plaintext config without stored secrets."
+                ),
             );
-            json
+            sanitized_json
         }
     };
 
@@ -430,5 +598,59 @@ pub fn read_profile_from_settings(
         settings: s,
         remember_password,
         remember_key_passphrase,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plaintext_fallback_strips_secrets() {
+        let mut cfg = AppConfig {
+            saved_session_layout_json: Some("{\"embedded\":\"secret\"}".to_string()),
+            ..AppConfig::default()
+        };
+        cfg.profiles.push(ConnectionProfile {
+            name: "prod".to_string(),
+            settings: ConnectionSettings {
+                host: "example.com".to_string(),
+                port: 22,
+                username: "alice".to_string(),
+                password: "pw".to_string(),
+                private_key_path: "id_ed25519".to_string(),
+                key_passphrase: "keypw".to_string(),
+            },
+            remember_password: true,
+            remember_key_passphrase: true,
+        });
+        cfg.transfer_history.push(TransferHistoryEntry {
+            request_id: 1,
+            direction: TransferDirectionConfig::Download,
+            settings: ConnectionSettings {
+                host: "example.com".to_string(),
+                port: 22,
+                username: "alice".to_string(),
+                password: "pw".to_string(),
+                private_key_path: "id_ed25519".to_string(),
+                key_passphrase: "keypw".to_string(),
+            },
+            remote_path: "/tmp/file".to_string(),
+            local_path: "file".to_string(),
+            transferred_bytes: 0,
+            total_bytes: None,
+            speed_bps: 0.0,
+            state: TransferStateConfig::Queued,
+            message: String::new(),
+        });
+
+        let sanitized = sanitized_for_plaintext_fallback(&cfg);
+        assert_eq!(sanitized.profiles[0].settings.password, "");
+        assert_eq!(sanitized.profiles[0].settings.key_passphrase, "");
+        assert!(!sanitized.profiles[0].remember_password);
+        assert!(!sanitized.profiles[0].remember_key_passphrase);
+        assert_eq!(sanitized.transfer_history[0].settings.password, "");
+        assert_eq!(sanitized.transfer_history[0].settings.key_passphrase, "");
+        assert!(sanitized.saved_session_layout_json.is_none());
     }
 }

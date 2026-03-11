@@ -75,9 +75,20 @@ fn handle_window_resize(ctx: &egui::Context) {
     };
     ctx.output_mut(|o| o.cursor_icon = icon);
 
-    let begin_now = ctx.input(|i| i.pointer.primary_pressed())
-        || (ctx.input(|i| i.pointer.primary_down()) && press_dir.is_some());
+    let begin_now = ctx.input(|i| i.pointer.primary_pressed());
     if begin_now {
+        begin_window_resize(ctx, dir);
+    }
+}
+
+fn begin_window_drag(ctx: &egui::Context) {
+    if !crate::tray::begin_native_drag() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+}
+
+fn begin_window_resize(ctx: &egui::Context, dir: egui::ResizeDirection) {
+    if !crate::tray::begin_native_resize(dir) {
         ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
     }
 }

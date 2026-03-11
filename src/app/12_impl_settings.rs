@@ -231,6 +231,9 @@ impl AppState {
             egui::RichText::new("Remembers splits/tabs and window position/size between launches.")
                 .color(theme.muted),
         );
+        ui.label(
+            egui::RichText::new("(NOT RECOMMENDED FOR MFA SETUPS)").color(theme.muted),
+        );
     }
 
     fn draw_settings_page_appearance(&mut self, ui: &mut egui::Ui) {
@@ -268,11 +271,10 @@ impl AppState {
         );
         // Persist on release to avoid writing to disk on every slider tick.
         // Note: on the release-frame `resp.changed()` may be false, so key off `drag_released`.
-        if resp.drag_released() {
-            self.config_saver.request_save(self.config.clone());
-        } else if resp.changed()
-            && !resp.dragged()
-            && (self.config.terminal_font_size - before).abs() > f32::EPSILON
+        if resp.drag_released()
+            || (resp.changed()
+                && !resp.dragged()
+                && (self.config.terminal_font_size - before).abs() > f32::EPSILON)
         {
             self.config_saver.request_save(self.config.clone());
         }
@@ -1061,6 +1063,7 @@ impl AppState {
                         .settings_dialog
                         .selected_profile
                         .and_then(|i| self.config.profiles.get(i).map(|p| p.name.clone()));
+                    self.clear_transient_prompts_for_tile(tile_id);
                     if let Some(tab) = self.pane_mut(tile_id) {
                         tab.profile_name = profile_name;
                         tab.settings = draft;
@@ -1173,7 +1176,7 @@ impl AppState {
                     let pressed_on_title =
                         drag_resp.hovered() && ctx.input(|i| i.pointer.primary_pressed());
                     if drag_resp.drag_started() || (pressed_on_title && !title_controls_hot) {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        begin_window_drag(ctx);
                     }
                     if drag_resp.double_clicked() && !title_controls_hot {
                         let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -1400,7 +1403,10 @@ impl AppState {
         };
 
         // If the tab was closed while waiting on user input, drop this prompt.
-        if !matches!(self.tree.tiles.get(dialog.tile_id), Some(Tile::Pane(_))) {
+        let Some(tab) = self.pane(dialog.tile_id) else {
+            return;
+        };
+        if !tab.connecting && !tab.connected {
             return;
         }
 
@@ -1449,8 +1455,13 @@ impl AppState {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
 
                 ui.horizontal(|ui| {
+                    let title = if dialog.prompt.changed_line.is_some() {
+                        "Changed Host Key"
+                    } else {
+                        "Unknown Host Key"
+                    };
                     ui.label(
-                        egui::RichText::new("Unknown Host Key")
+                        egui::RichText::new(title)
                             .strong()
                             .size(18.0)
                             .color(self.theme.accent),
@@ -1474,6 +1485,15 @@ impl AppState {
                     egui::RichText::new(format!("Algorithm: {}", dialog.prompt.algorithm))
                         .color(self.theme.muted),
                 );
+                if let Some(line) = dialog.prompt.changed_line {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Saved host key mismatch detected on known_hosts line {}.",
+                            line
+                        ))
+                        .color(Color32::from_rgb(220, 170, 90)),
+                    );
+                }
                 ui.add_space(4.0);
 
                 ui.label(egui::RichText::new("SHA256 fingerprint").strong());
@@ -1487,18 +1507,34 @@ impl AppState {
                 ui.add_space(4.0);
 
                 ui.label(
-                    egui::RichText::new(format!(
-                        "If trusted, this key will be pinned to:\n{}",
-                        dialog.prompt.known_hosts_path
-                    ))
+                    egui::RichText::new(if let Some(line) = dialog.prompt.changed_line {
+                        format!(
+                            "If you deliberately replace the saved key, Rusty will remove line {} in:\n{}\nand then save this new host key.",
+                            line, dialog.prompt.known_hosts_path
+                        )
+                    } else {
+                        format!(
+                            "If trusted, this key will be pinned to:\n{}",
+                            dialog.prompt.known_hosts_path
+                        )
+                    })
                     .color(self.theme.muted),
                 );
                 ui.add_space(10.0);
 
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    let trust = ui.add(egui::Button::new("Trust & Save"));
+                    let action_label = if dialog.prompt.changed_line.is_some() {
+                        "Replace Saved Key"
+                    } else {
+                        "Trust & Save"
+                    };
+                    let trust = ui.add(egui::Button::new(action_label));
                     if trust.clicked() {
-                        decision = Some(ssh::HostKeyDecision::TrustAndSave);
+                        decision = Some(if dialog.prompt.changed_line.is_some() {
+                            ssh::HostKeyDecision::ReplaceAndSave
+                        } else {
+                            ssh::HostKeyDecision::TrustAndSave
+                        });
                     }
                 });
             });
@@ -1530,7 +1566,10 @@ impl AppState {
         auth.responses.resize(auth.prompts.len(), String::new());
 
         // If the tab went away (closed) or no longer exists, drop the prompt.
-        if !matches!(self.tree.tiles.get(auth.tile_id), Some(Tile::Pane(_))) {
+        let Some(tab) = self.pane(auth.tile_id) else {
+            return;
+        };
+        if !tab.connecting && !tab.connected {
             return;
         }
 

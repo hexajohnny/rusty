@@ -186,6 +186,7 @@ impl eframe::App for AppState {
         }
 
         let mut clipboard = self.clipboard.take();
+        self.handle_terminal_focus_shortcuts(ctx);
 
         let theme = self.theme;
         self.term_theme = TermTheme::from_config(&self.config.terminal_colors);
@@ -327,7 +328,7 @@ impl eframe::App for AppState {
                 let pressed_on_title =
                     drag_resp.hovered() && ctx.input(|i| i.pointer.primary_pressed());
                 if drag_resp.drag_started() || (pressed_on_title && !title_controls_hot) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    begin_window_drag(ctx);
                 }
                 if drag_resp.double_clicked() && !title_controls_hot {
                     let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -335,21 +336,54 @@ impl eframe::App for AppState {
                 }
             });
 
-        let mut behavior = SshTilesBehavior::new(
+        if self.startup_notice.is_some() {
+            let mut dismiss_notice = false;
+            let notice_text = self.startup_notice.clone().unwrap_or_default();
+            egui::TopBottomPanel::top("rusty_startup_notice")
+                .resizable(false)
+                .frame(
+                    egui::Frame::none()
+                        .fill(adjust_color(theme.top_bg, 0.10))
+                        .stroke(Stroke::new(1.0, theme.top_border))
+                        .inner_margin(egui::Margin::symmetric(TITLE_PAD_X, 6.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.visuals_mut().override_text_color = Some(theme.fg);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new("Startup Notice")
+                                .strong()
+                                .color(theme.accent),
+                        );
+                        ui.label(egui::RichText::new(notice_text).color(theme.fg));
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Dismiss").clicked() {
+                                dismiss_notice = true;
+                            }
+                        });
+                    });
+                });
+            if dismiss_notice {
+                self.startup_notice = None;
+            }
+        }
+
+        let mut behavior = SshTilesBehavior::new(SshTilesBehaviorInit {
             theme,
             term_theme,
             cursor_visible,
             term_font_size,
-            !self.hidden_to_tray,
-            self.config.focus_shade,
-            self.config
+            allow_resize: !self.hidden_to_tray,
+            focus_shade: self.config.focus_shade,
+            profiles: self
+                .config
                 .profiles
                 .iter()
                 .map(|p| (p.name.clone(), config::write_profile_settings(p)))
                 .collect(),
-            &mut clipboard,
-            self.active_tile,
-        );
+            clipboard: &mut clipboard,
+            active_tile: self.active_tile,
+        });
 
         egui::CentralPanel::default()
             .frame(
@@ -405,6 +439,7 @@ impl eframe::App for AppState {
                     }
                 }
                 TilesAction::Connect(tile_id) => {
+                    self.clear_transient_prompts_for_tile(tile_id);
                     let (missing_settings, connected_or_connecting) = self
                         .terminal_pane(tile_id)
                         .map(|t| {
@@ -427,6 +462,7 @@ impl eframe::App for AppState {
                     self.settings_dialog.target_tile = Some(tile_id);
                 }
                 TilesAction::ToggleConnect(tile_id) => {
+                    self.clear_transient_prompts_for_tile(tile_id);
                     let needs_settings = self
                         .terminal_pane(tile_id)
                         .map(|t| {

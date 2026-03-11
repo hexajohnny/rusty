@@ -344,14 +344,12 @@ impl AppState {
                                     });
                                     ui.close_menu();
                                 }
-                            } else {
-                                if ui.button("Download").clicked() {
-                                    actions.push(TilesAction::FileDownload {
-                                        pane_id: tile_id,
-                                        name: entry.file_name.clone(),
-                                    });
-                                    ui.close_menu();
-                                }
+                            } else if ui.button("Download").clicked() {
+                                actions.push(TilesAction::FileDownload {
+                                    pane_id: tile_id,
+                                    name: entry.file_name.clone(),
+                                });
+                                ui.close_menu();
                             }
 
                             ui.separator();
