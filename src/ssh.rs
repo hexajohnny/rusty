@@ -15,16 +15,17 @@ use russh::{ChannelMsg, Disconnect, MethodKind, MethodSet};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, FileType as SftpFileType, OpenFlags};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::logger;
 use crate::model::ConnectionSettings;
 
-const READ_POLL_INTERVAL: Duration = Duration::from_millis(30);
+const SESSION_HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 pub const TERM_SCROLLBACK_LEN: usize = 5000;
-const TERM_SCREEN_EMIT_INTERVAL_BASE: Duration = Duration::from_millis(16);
-const TERM_SCREEN_EMIT_INTERVAL_MEDIUM: Duration = Duration::from_millis(24);
-const TERM_SCREEN_EMIT_INTERVAL_HIGH: Duration = Duration::from_millis(33);
-const TERM_SCREEN_EMIT_INTERVAL_EXTREME: Duration = Duration::from_millis(40);
+const TERM_SCREEN_EMIT_INTERVAL_BASE: Duration = Duration::from_millis(24);
+const TERM_SCREEN_EMIT_INTERVAL_MEDIUM: Duration = Duration::from_millis(33);
+const TERM_SCREEN_EMIT_INTERVAL_HIGH: Duration = Duration::from_millis(50);
+const TERM_SCREEN_EMIT_INTERVAL_EXTREME: Duration = Duration::from_millis(66);
 const TERM_SCREEN_RATE_WINDOW: Duration = Duration::from_millis(250);
 const FAST_REMOTE_COMPARE_BATCH_LIMIT: usize = 64;
 
@@ -540,7 +541,7 @@ impl CsiQueryScanner {
 
 async fn respond_to_query<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
-    parser: &Parser,
+    parser: &mut Parser,
     query: TerminalQuery,
 ) -> Result<()> {
     let response = match query {
@@ -651,20 +652,32 @@ fn supports_method(methods: &MethodSet, target: MethodKind) -> bool {
     methods.contains(&target)
 }
 
-fn compute_scrollback_max(parser: &mut Parser) -> usize {
-    let cur = parser.screen().scrollback();
-    parser.set_scrollback(usize::MAX);
-    let max = parser.screen().scrollback();
-    parser.set_scrollback(cur);
-    max
+fn send_message<T>(tx: &Sender<T>, message: T) {
+    let _ = tx.send(message);
+    crate::tray::request_app_repaint();
 }
 
 fn send_screen(ui_tx: &Sender<UiMessage>, parser: &mut Parser) {
-    let _ = ui_tx.send(UiMessage::Screen(Box::new(parser.screen().clone())));
+    send_message(ui_tx, UiMessage::Screen(Box::new(parser.screen().clone())));
 }
 
 fn send_scrollback_max(ui_tx: &Sender<UiMessage>, parser: &mut Parser) {
-    let _ = ui_tx.send(UiMessage::ScrollbackMax(compute_scrollback_max(parser)));
+    send_message(
+        ui_tx,
+        UiMessage::ScrollbackMax(parser.screen().scrollback_max()),
+    );
+}
+
+fn bridge_receiver_to_async<T: Send + 'static>(rx: Receiver<T>) -> UnboundedReceiver<T> {
+    let (async_tx, async_rx) = unbounded_channel();
+    thread::spawn(move || {
+        while let Ok(message) = rx.recv() {
+            if async_tx.send(message).is_err() {
+                break;
+            }
+        }
+    });
+    async_rx
 }
 
 fn adaptive_screen_emit_interval(window_bytes: u64, window_elapsed: Duration) -> Duration {
@@ -1236,13 +1249,16 @@ impl<'a> TransferProgressReporter<'a> {
     }
 
     fn send_started(&self, remote_path: String, local_path: String) {
-        let _ = self.event_tx.send(DownloadManagerEvent::Started {
-            request_id: self.request_id,
-            remote_path,
-            local_path,
-            downloaded_bytes: self.transferred_bytes,
-            total_bytes: self.total_bytes,
-        });
+        send_download_event(
+            self.event_tx,
+            DownloadManagerEvent::Started {
+                request_id: self.request_id,
+                remote_path,
+                local_path,
+                downloaded_bytes: self.transferred_bytes,
+                total_bytes: self.total_bytes,
+            },
+        );
     }
 
     fn current_speed_bps(&self) -> f64 {
@@ -1255,12 +1271,15 @@ impl<'a> TransferProgressReporter<'a> {
     }
 
     fn emit_progress(&self, speed_bps: f64) {
-        let _ = self.event_tx.send(DownloadManagerEvent::Progress {
-            request_id: self.request_id,
-            downloaded_bytes: self.transferred_bytes,
-            total_bytes: self.total_bytes,
-            speed_bps,
-        });
+        send_download_event(
+            self.event_tx,
+            DownloadManagerEvent::Progress {
+                request_id: self.request_id,
+                downloaded_bytes: self.transferred_bytes,
+                total_bytes: self.total_bytes,
+                speed_bps,
+            },
+        );
     }
 
     fn add_progress(&mut self, delta: u64) {
@@ -1727,17 +1746,27 @@ fn transfer_issue_from_error(err: &anyhow::Error) -> TransferIssue {
 }
 
 fn send_ui_status(ui_tx: &Sender<UiMessage>, kind: IssueKind, message: impl Into<String>) {
-    let _ = ui_tx.send(UiMessage::Status(StatusUpdate {
-        kind,
-        message: message.into(),
-    }));
+    send_message(
+        ui_tx,
+        UiMessage::Status(StatusUpdate {
+            kind,
+            message: message.into(),
+        }),
+    );
 }
 
 fn send_sftp_status(ui_tx: &Sender<SftpUiMessage>, kind: IssueKind, message: impl Into<String>) {
-    let _ = ui_tx.send(SftpUiMessage::Status(StatusUpdate {
-        kind,
-        message: message.into(),
-    }));
+    send_message(
+        ui_tx,
+        SftpUiMessage::Status(StatusUpdate {
+            kind,
+            message: message.into(),
+        }),
+    );
+}
+
+fn send_download_event(event_tx: &Sender<DownloadManagerEvent>, event: DownloadManagerEvent) {
+    send_message(event_tx, event);
 }
 
 fn local_transfer_temp_path(local_path: &str) -> PathBuf {
@@ -1875,10 +1904,13 @@ async fn download_remote_file_to_path(
 
     loop {
         if transfer_cancel_requested(cancel_rx) {
-            let _ = progress.event_tx.send(DownloadManagerEvent::Canceled {
-                request_id: progress.request_id,
-                local_path: cancel_label.to_string(),
-            });
+            send_download_event(
+                progress.event_tx,
+                DownloadManagerEvent::Canceled {
+                    request_id: progress.request_id,
+                    local_path: cancel_label.to_string(),
+                },
+            );
             return Ok(false);
         }
 
@@ -1916,18 +1948,24 @@ async fn run_sftp_download_directory_with_session(
     cancel_rx: &Receiver<()>,
 ) -> Result<()> {
     if transfer_cancel_requested(cancel_rx) {
-        let _ = event_tx.send(DownloadManagerEvent::Canceled {
-            request_id,
-            local_path,
-        });
+        send_download_event(
+            event_tx,
+            DownloadManagerEvent::Canceled {
+                request_id,
+                local_path,
+            },
+        );
         return Ok(());
     }
 
-    let _ = event_tx.send(DownloadManagerEvent::Preparing {
-        request_id,
-        total_bytes: None,
-        message: "Preparing folder download...".to_string(),
-    });
+    send_download_event(
+        event_tx,
+        DownloadManagerEvent::Preparing {
+            request_id,
+            total_bytes: None,
+            message: "Preparing folder download...".to_string(),
+        },
+    );
 
     let local_root = PathBuf::from(local_path.clone());
     let (directories, files, total_bytes) =
@@ -1938,15 +1976,18 @@ async fn run_sftp_download_directory_with_session(
             .with_context(|| format!("Failed to create local directory: {}", dir.display()))?;
     }
 
-    let _ = event_tx.send(DownloadManagerEvent::Preparing {
-        request_id,
-        total_bytes: Some(total_bytes),
-        message: if files.is_empty() {
-            "Folder download is ready...".to_string()
-        } else {
-            format!("Prepared {} file(s) for download...", files.len())
+    send_download_event(
+        event_tx,
+        DownloadManagerEvent::Preparing {
+            request_id,
+            total_bytes: Some(total_bytes),
+            message: if files.is_empty() {
+                "Folder download is ready...".to_string()
+            } else {
+                format!("Prepared {} file(s) for download...", files.len())
+            },
         },
-    });
+    );
 
     let mut progress = TransferProgressReporter::new(request_id, Some(total_bytes), event_tx);
     progress.send_started(remote_path.clone(), local_path.clone());
@@ -1976,11 +2017,14 @@ fn send_transfer_finished(
     local_path: String,
     message: Option<String>,
 ) {
-    let _ = event_tx.send(DownloadManagerEvent::Finished {
-        request_id,
-        local_path,
-        message,
-    });
+    send_download_event(
+        event_tx,
+        DownloadManagerEvent::Finished {
+            request_id,
+            local_path,
+            message,
+        },
+    );
 }
 
 fn local_upload_scan_path(local_root: &Path, current_dir: &Path) -> String {
@@ -2018,11 +2062,14 @@ fn send_upload_preparing(
     total_bytes: Option<u64>,
     message: impl Into<String>,
 ) {
-    let _ = event_tx.send(DownloadManagerEvent::Preparing {
-        request_id,
-        total_bytes,
-        message: message.into(),
-    });
+    send_download_event(
+        event_tx,
+        DownloadManagerEvent::Preparing {
+            request_id,
+            total_bytes,
+            message: message.into(),
+        },
+    );
 }
 
 fn send_local_upload_tree_scan_update(
@@ -2492,10 +2539,13 @@ async fn build_local_upload_tree(
 
     while let Some((local_dir, relative_dir)) = queue.pop_front() {
         if transfer_cancel_requested(cancel_rx) {
-            let _ = event_tx.send(DownloadManagerEvent::Canceled {
-                request_id,
-                local_path: local_root.display().to_string(),
-            });
+            send_download_event(
+                event_tx,
+                DownloadManagerEvent::Canceled {
+                    request_id,
+                    local_path: local_root.display().to_string(),
+                },
+            );
             return Ok(None);
         }
 
@@ -2503,10 +2553,13 @@ async fn build_local_upload_tree(
             .with_context(|| format!("Failed to read local directory: {}", local_dir.display()))?
         {
             if transfer_cancel_requested(cancel_rx) {
-                let _ = event_tx.send(DownloadManagerEvent::Canceled {
-                    request_id,
-                    local_path: local_root.display().to_string(),
-                });
+                send_download_event(
+                    event_tx,
+                    DownloadManagerEvent::Canceled {
+                        request_id,
+                        local_path: local_root.display().to_string(),
+                    },
+                );
                 return Ok(None);
             }
 
@@ -2640,10 +2693,13 @@ async fn build_remote_upload_tree(
 
     while let Some((remote_dir, relative_dir)) = queue.pop_front() {
         if transfer_cancel_requested(control.cancel_rx) {
-            let _ = control.event_tx.send(DownloadManagerEvent::Canceled {
-                request_id: control.request_id,
-                local_path: cancel_label.to_string(),
-            });
+            send_download_event(
+                control.event_tx,
+                DownloadManagerEvent::Canceled {
+                    request_id: control.request_id,
+                    local_path: cancel_label.to_string(),
+                },
+            );
             return Ok(None);
         }
 
@@ -2653,10 +2709,13 @@ async fn build_remote_upload_tree(
             .with_context(|| format!("Failed to read remote directory: {remote_dir}"))?;
         for entry in read_dir {
             if transfer_cancel_requested(control.cancel_rx) {
-                let _ = control.event_tx.send(DownloadManagerEvent::Canceled {
-                    request_id: control.request_id,
-                    local_path: cancel_label.to_string(),
-                });
+                send_download_event(
+                    control.event_tx,
+                    DownloadManagerEvent::Canceled {
+                        request_id: control.request_id,
+                        local_path: cancel_label.to_string(),
+                    },
+                );
                 return Ok(None);
             }
 
@@ -2843,9 +2902,10 @@ async fn wait_for_upload_conflict_response(
     prompt: UploadConflictPrompt,
     control: &UploadTransferControl<'_>,
 ) -> Result<UploadConflictResponse> {
-    let _ = control
-        .event_tx
-        .send(DownloadManagerEvent::UploadConflictPrompt { prompt });
+    send_download_event(
+        control.event_tx,
+        DownloadManagerEvent::UploadConflictPrompt { prompt },
+    );
 
     loop {
         if transfer_cancel_requested(control.cancel_rx) {
@@ -3138,10 +3198,13 @@ async fn upload_local_file_to_remote(
 
     loop {
         if transfer_cancel_requested(cancel_rx) {
-            let _ = progress.event_tx.send(DownloadManagerEvent::Canceled {
-                request_id: progress.request_id,
-                local_path: cancel_label.to_string(),
-            });
+            send_download_event(
+                progress.event_tx,
+                DownloadManagerEvent::Canceled {
+                    request_id: progress.request_id,
+                    local_path: cancel_label.to_string(),
+                },
+            );
             return Ok(false);
         }
 
@@ -3177,10 +3240,13 @@ async fn run_sftp_upload_directory_with_session(
     control: &UploadTransferControl<'_>,
 ) -> Result<()> {
     if transfer_cancel_requested(control.cancel_rx) {
-        let _ = control.event_tx.send(DownloadManagerEvent::Canceled {
-            request_id: control.request_id,
-            local_path,
-        });
+        send_download_event(
+            control.event_tx,
+            DownloadManagerEvent::Canceled {
+                request_id: control.request_id,
+                local_path,
+            },
+        );
         return Ok(());
     }
 
@@ -3202,10 +3268,13 @@ async fn run_sftp_upload_directory_with_session(
     let Some((files_after_prompt, skipped_files)) =
         resolve_upload_plan_conflicts(files, control).await?
     else {
-        let _ = control.event_tx.send(DownloadManagerEvent::Canceled {
-            request_id: control.request_id,
-            local_path,
-        });
+        send_download_event(
+            control.event_tx,
+            DownloadManagerEvent::Canceled {
+                request_id: control.request_id,
+                local_path,
+            },
+        );
         return Ok(());
     };
 
@@ -3213,10 +3282,13 @@ async fn run_sftp_upload_directory_with_session(
         finalize_upload_plan_after_prompt(sftp, files_after_prompt, control, root_total_bytes)
             .await?
     else {
-        let _ = control.event_tx.send(DownloadManagerEvent::Canceled {
-            request_id: control.request_id,
-            local_path,
-        });
+        send_download_event(
+            control.event_tx,
+            DownloadManagerEvent::Canceled {
+                request_id: control.request_id,
+                local_path,
+            },
+        );
         return Ok(());
     };
     let files_to_upload = finalized_plan.files_to_upload;
@@ -3235,10 +3307,13 @@ async fn run_sftp_upload_directory_with_session(
         );
         for (idx, dir) in directories_to_create.iter().enumerate() {
             if transfer_cancel_requested(control.cancel_rx) {
-                let _ = control.event_tx.send(DownloadManagerEvent::Canceled {
-                    request_id: control.request_id,
-                    local_path,
-                });
+                send_download_event(
+                    control.event_tx,
+                    DownloadManagerEvent::Canceled {
+                        request_id: control.request_id,
+                        local_path,
+                    },
+                );
                 return Ok(());
             }
             ensure_remote_dir_exists(sftp, dir).await?;
@@ -3392,13 +3467,16 @@ async fn run_sftp_download_with_session(
                             local_path_obj.display()
                         )
                     })?;
-                    let _ = event_tx.send(DownloadManagerEvent::Started {
-                        request_id,
-                        remote_path,
-                        local_path: local_path.clone(),
-                        downloaded_bytes: existing_size,
-                        total_bytes,
-                    });
+                    send_download_event(
+                        event_tx,
+                        DownloadManagerEvent::Started {
+                            request_id,
+                            remote_path,
+                            local_path: local_path.clone(),
+                            downloaded_bytes: existing_size,
+                            total_bytes,
+                        },
+                    );
                     send_transfer_finished(event_tx, request_id, local_path, None);
                     return Ok(());
                 }
@@ -3446,13 +3524,16 @@ async fn run_sftp_download_with_session(
         })?
     };
 
-    let _ = event_tx.send(DownloadManagerEvent::Started {
-        request_id,
-        remote_path: remote_path.clone(),
-        local_path: local_path.clone(),
-        downloaded_bytes,
-        total_bytes,
-    });
+    send_download_event(
+        event_tx,
+        DownloadManagerEvent::Started {
+            request_id,
+            remote_path: remote_path.clone(),
+            local_path: local_path.clone(),
+            downloaded_bytes,
+            total_bytes,
+        },
+    );
 
     let started_at = Instant::now();
     let mut downloaded_this_attempt: u64 = 0;
@@ -3460,10 +3541,13 @@ async fn run_sftp_download_with_session(
 
     loop {
         if transfer_cancel_requested(cancel_rx) {
-            let _ = event_tx.send(DownloadManagerEvent::Canceled {
-                request_id,
-                local_path: local_path.clone(),
-            });
+            send_download_event(
+                event_tx,
+                DownloadManagerEvent::Canceled {
+                    request_id,
+                    local_path: local_path.clone(),
+                },
+            );
             return Ok(());
         }
 
@@ -3484,12 +3568,15 @@ async fn run_sftp_download_with_session(
         } else {
             0.0
         };
-        let _ = event_tx.send(DownloadManagerEvent::Progress {
-            request_id,
-            downloaded_bytes,
-            total_bytes,
-            speed_bps,
-        });
+        send_download_event(
+            event_tx,
+            DownloadManagerEvent::Progress {
+                request_id,
+                downloaded_bytes,
+                total_bytes,
+                speed_bps,
+            },
+        );
     }
 
     std::io::Write::flush(&mut out).context("Failed to flush local file")?;
@@ -3570,10 +3657,13 @@ async fn run_sftp_upload_with_session(
                                     return Ok(());
                                 }
                                 None => {
-                                    let _ = control.event_tx.send(DownloadManagerEvent::Canceled {
-                                        request_id,
-                                        local_path,
-                                    });
+                                    send_download_event(
+                                        control.event_tx,
+                                        DownloadManagerEvent::Canceled {
+                                            request_id,
+                                            local_path,
+                                        },
+                                    );
                                     return Ok(());
                                 }
                             }
@@ -3589,10 +3679,13 @@ async fn run_sftp_upload_with_session(
                         return Ok(());
                     }
                     UploadConflictChoice::CancelTransfer => {
-                        let _ = control.event_tx.send(DownloadManagerEvent::Canceled {
-                            request_id,
-                            local_path,
-                        });
+                        send_download_event(
+                            control.event_tx,
+                            DownloadManagerEvent::Canceled {
+                                request_id,
+                                local_path,
+                            },
+                        );
                         return Ok(());
                     }
                 }
@@ -3615,13 +3708,16 @@ async fn run_sftp_upload_with_session(
             match total_bytes {
                 Some(total) if existing_size == total => {
                     replace_remote_file(&sftp, &temp_remote_path, &remote_path).await?;
-                    let _ = control.event_tx.send(DownloadManagerEvent::Started {
-                        request_id,
-                        remote_path: remote_path.clone(),
-                        local_path: local_path.clone(),
-                        downloaded_bytes: existing_size,
-                        total_bytes,
-                    });
+                    send_download_event(
+                        control.event_tx,
+                        DownloadManagerEvent::Started {
+                            request_id,
+                            remote_path: remote_path.clone(),
+                            local_path: local_path.clone(),
+                            downloaded_bytes: existing_size,
+                            total_bytes,
+                        },
+                    );
                     send_transfer_finished(control.event_tx, request_id, local_path, None);
                     return Ok(());
                 }
@@ -3691,23 +3787,29 @@ async fn run_sftp_upload_with_session(
             .with_context(|| format!("Failed to create remote temp file: {temp_remote_path}"))?
     };
 
-    let _ = control.event_tx.send(DownloadManagerEvent::Started {
-        request_id,
-        remote_path: remote_path.clone(),
-        local_path: local_path.clone(),
-        downloaded_bytes: uploaded_bytes,
-        total_bytes,
-    });
+    send_download_event(
+        control.event_tx,
+        DownloadManagerEvent::Started {
+            request_id,
+            remote_path: remote_path.clone(),
+            local_path: local_path.clone(),
+            downloaded_bytes: uploaded_bytes,
+            total_bytes,
+        },
+    );
 
     let started_at = Instant::now();
     let mut buf = vec![0u8; TRANSFER_IO_BUFFER_SIZE];
 
     loop {
         if transfer_cancel_requested(control.cancel_rx) {
-            let _ = control.event_tx.send(DownloadManagerEvent::Canceled {
-                request_id,
-                local_path: local_path.clone(),
-            });
+            send_download_event(
+                control.event_tx,
+                DownloadManagerEvent::Canceled {
+                    request_id,
+                    local_path: local_path.clone(),
+                },
+            );
             return Ok(());
         }
 
@@ -3729,12 +3831,15 @@ async fn run_sftp_upload_with_session(
         } else {
             0.0
         };
-        let _ = control.event_tx.send(DownloadManagerEvent::Progress {
-            request_id,
-            downloaded_bytes: uploaded_bytes,
-            total_bytes,
-            speed_bps,
-        });
+        send_download_event(
+            control.event_tx,
+            DownloadManagerEvent::Progress {
+                request_id,
+                downloaded_bytes: uploaded_bytes,
+                total_bytes,
+                speed_bps,
+            },
+        );
     }
 
     remote
@@ -3755,65 +3860,54 @@ async fn run_sftp_client_async(
     session: Rc<SshHandle>,
     sftp: SftpSession,
     ui_tx: Sender<SftpUiMessage>,
-    worker_rx: Receiver<SftpWorkerMessage>,
+    mut worker_rx: UnboundedReceiver<SftpWorkerMessage>,
     log_path: String,
 ) -> Result<()> {
     logger::log_line(&log_path, &format!("SFTP client {client_id} connected."));
-    let _ = ui_tx.send(SftpUiMessage::Status(StatusUpdate::info("Connected")));
-    let _ = ui_tx.send(SftpUiMessage::Connected(true));
+    send_message(
+        &ui_tx,
+        SftpUiMessage::Status(StatusUpdate::info("Connected")),
+    );
+    send_message(&ui_tx, SftpUiMessage::Connected(true));
 
-    loop {
-        let mut disconnected = false;
-
-        loop {
-            match worker_rx.try_recv() {
-                Ok(SftpWorkerMessage::Command(cmd)) => {
-                    let request_id = sftp_command_request_id(&cmd);
-                    match execute_sftp_command(&sftp, Some(session.as_ref()), cmd, &log_path).await
-                    {
-                        Ok(event) => {
-                            let _ = ui_tx.send(SftpUiMessage::Event(event));
-                        }
-                        Err(err) => {
-                            logger::log_line(
-                                &log_path,
-                                &format!("SFTP client {client_id} command failed: {err}"),
-                            );
-                            let _ = ui_tx.send(SftpUiMessage::Event(SftpEvent::OperationErr {
+    while let Some(message) = worker_rx.recv().await {
+        match message {
+            SftpWorkerMessage::Command(cmd) => {
+                let request_id = sftp_command_request_id(&cmd);
+                match execute_sftp_command(&sftp, Some(session.as_ref()), cmd, &log_path).await {
+                    Ok(event) => {
+                        send_message(&ui_tx, SftpUiMessage::Event(event));
+                    }
+                    Err(err) => {
+                        logger::log_line(
+                            &log_path,
+                            &format!("SFTP client {client_id} command failed: {err}"),
+                        );
+                        send_message(
+                            &ui_tx,
+                            SftpUiMessage::Event(SftpEvent::OperationErr {
                                 request_id,
                                 issue: transfer_issue_from_error(&err),
-                            }));
-                        }
+                            }),
+                        );
                     }
                 }
-                Ok(SftpWorkerMessage::Disconnect) => {
-                    disconnected = true;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
             }
+            SftpWorkerMessage::Disconnect => break,
         }
-
-        if disconnected {
-            logger::log_line(&log_path, &format!("SFTP client {client_id} disconnected."));
-            send_sftp_status(&ui_tx, IssueKind::Transport, "Disconnected");
-            let _ = ui_tx.send(SftpUiMessage::Connected(false));
-            return Ok(());
-        }
-
-        tokio::time::sleep(READ_POLL_INTERVAL).await;
     }
+
+    logger::log_line(&log_path, &format!("SFTP client {client_id} disconnected."));
+    send_sftp_status(&ui_tx, IssueKind::Transport, "Disconnected");
+    send_message(&ui_tx, SftpUiMessage::Connected(false));
+    Ok(())
 }
 
 async fn run_terminal_client_async(
     client_id: u64,
     session: Rc<SshHandle>,
     ui_tx: Sender<UiMessage>,
-    worker_rx: Receiver<TerminalClientCommand>,
+    mut worker_rx: UnboundedReceiver<TerminalClientCommand>,
     scrollback_len: usize,
     log_path: String,
 ) -> Result<()> {
@@ -3847,7 +3941,7 @@ async fn run_terminal_client_async(
         .context("Failed to start shell")?;
 
     send_ui_status(&ui_tx, IssueKind::Info, "Connected successfully.");
-    let _ = ui_tx.send(UiMessage::Connected(true));
+    send_message(&ui_tx, UiMessage::Connected(true));
     logger::log_line(
         &log_path,
         &format!("Terminal client {client_id} connected."),
@@ -3859,6 +3953,7 @@ async fn run_terminal_client_async(
     let mut scanner = CsiQueryScanner::default();
     let mut screen_dirty = true;
     let mut scrollback_dirty = true;
+    let mut last_scrollback_max: Option<usize> = None;
     let mut screen_emit_interval = TERM_SCREEN_EMIT_INTERVAL_BASE;
     let mut last_screen_emit = Instant::now()
         .checked_sub(screen_emit_interval)
@@ -3869,44 +3964,126 @@ async fn run_terminal_client_async(
     let mut writer = channel.make_writer();
 
     loop {
-        let mut disconnected = false;
+        let rate_window_elapsed = screen_rate_window_started.elapsed();
+        if rate_window_elapsed >= TERM_SCREEN_RATE_WINDOW {
+            screen_emit_interval =
+                adaptive_screen_emit_interval(screen_rate_window_bytes, rate_window_elapsed);
+            screen_rate_window_started = Instant::now();
+            screen_rate_window_bytes = 0;
+        }
 
-        loop {
-            match worker_rx.try_recv() {
-                Ok(TerminalClientCommand::Input(data)) => {
-                    writer
-                        .write_all(&data)
-                        .await
-                        .context("Channel write failed")?;
-                    writer.flush().await.context("Channel flush failed")?;
+        if scrollback_dirty {
+            let scrollback_max = parser.screen().scrollback_max();
+            if last_scrollback_max != Some(scrollback_max) {
+                send_scrollback_max(&ui_tx, &mut parser);
+                last_scrollback_max = Some(scrollback_max);
+            }
+            scrollback_dirty = false;
+        }
+
+        if screen_dirty && last_screen_emit.elapsed() >= screen_emit_interval {
+            send_screen(&ui_tx, &mut parser);
+            screen_dirty = false;
+            last_screen_emit = Instant::now();
+            continue;
+        }
+
+        let mut disconnected = false;
+        tokio::select! {
+            command = worker_rx.recv() => {
+                match command {
+                    Some(TerminalClientCommand::Input(data)) => {
+                        writer
+                            .write_all(&data)
+                            .await
+                            .context("Channel write failed")?;
+                        writer.flush().await.context("Channel flush failed")?;
+                    }
+                    Some(TerminalClientCommand::Resize {
+                        rows,
+                        cols,
+                        width_px,
+                        height_px,
+                    }) => {
+                        channel
+                            .window_change(cols.into(), rows.into(), width_px, height_px)
+                            .await
+                            .map_err(|err| anyhow!("Failed to resize PTY: {err}"))?;
+                        parser.set_size(rows, cols);
+                        screen_dirty = true;
+                        scrollback_dirty = true;
+                    }
+                    Some(TerminalClientCommand::SetScrollback(rows)) => {
+                        parser.set_scrollback(rows);
+                        screen_dirty = true;
+                        scrollback_dirty = true;
+                    }
+                    Some(TerminalClientCommand::Disconnect) | None => {
+                        disconnected = true;
+                    }
                 }
-                Ok(TerminalClientCommand::Resize {
-                    rows,
-                    cols,
-                    width_px,
-                    height_px,
-                }) => {
-                    channel
-                        .window_change(cols.into(), rows.into(), width_px, height_px)
-                        .await
-                        .map_err(|err| anyhow!("Failed to resize PTY: {err}"))?;
-                    parser.set_size(rows, cols);
-                    screen_dirty = true;
-                    scrollback_dirty = true;
+            }
+            message = channel.wait() => {
+                match message {
+                    Some(ChannelMsg::Data { data }) => {
+                        process_with_query_responses(
+                            &mut parser,
+                            &mut scanner,
+                            &mut writer,
+                            data.as_ref(),
+                        )
+                        .await?;
+                        screen_rate_window_bytes =
+                            screen_rate_window_bytes.saturating_add(data.len() as u64);
+                        screen_dirty = true;
+                        scrollback_dirty = true;
+                    }
+                    Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        process_with_query_responses(
+                            &mut parser,
+                            &mut scanner,
+                            &mut writer,
+                            data.as_ref(),
+                        )
+                        .await?;
+                        screen_rate_window_bytes =
+                            screen_rate_window_bytes.saturating_add(data.len() as u64);
+                        screen_dirty = true;
+                        scrollback_dirty = true;
+                    }
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
+                        logger::log_line(
+                            &log_path,
+                            &format!("Terminal client {client_id} channel EOF."),
+                        );
+                        send_ui_status(
+                            &ui_tx,
+                            IssueKind::Transport,
+                            "Transport disconnected. The SSH channel closed.",
+                        );
+                        send_message(&ui_tx, UiMessage::Connected(false));
+                        return Ok(());
+                    }
+                    Some(_) => {}
+                    None => {
+                        logger::log_line(
+                            &log_path,
+                            &format!("Terminal client {client_id} channel closed."),
+                        );
+                        send_ui_status(
+                            &ui_tx,
+                            IssueKind::Transport,
+                            "Transport disconnected. The SSH channel closed.",
+                        );
+                        send_message(&ui_tx, UiMessage::Connected(false));
+                        return Ok(());
+                    }
                 }
-                Ok(TerminalClientCommand::SetScrollback(rows)) => {
-                    parser.set_scrollback(rows);
-                    screen_dirty = true;
-                }
-                Ok(TerminalClientCommand::Disconnect) => {
-                    disconnected = true;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
+            }
+            _ = tokio::time::sleep(screen_emit_interval.saturating_sub(last_screen_emit.elapsed())), if screen_dirty => {
+                send_screen(&ui_tx, &mut parser);
+                screen_dirty = false;
+                last_screen_emit = Instant::now();
             }
         }
 
@@ -3918,74 +4095,8 @@ async fn run_terminal_client_async(
             let _ = channel.eof().await;
             let _ = channel.close().await;
             send_ui_status(&ui_tx, IssueKind::Info, "Disconnected.");
-            let _ = ui_tx.send(UiMessage::Connected(false));
+            send_message(&ui_tx, UiMessage::Connected(false));
             return Ok(());
-        }
-
-        match tokio::time::timeout(READ_POLL_INTERVAL, channel.wait()).await {
-            Ok(Some(ChannelMsg::Data { data })) => {
-                process_with_query_responses(&mut parser, &mut scanner, &mut writer, data.as_ref())
-                    .await?;
-                screen_rate_window_bytes =
-                    screen_rate_window_bytes.saturating_add(data.len() as u64);
-                screen_dirty = true;
-                scrollback_dirty = true;
-            }
-            Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
-                process_with_query_responses(&mut parser, &mut scanner, &mut writer, data.as_ref())
-                    .await?;
-                screen_rate_window_bytes =
-                    screen_rate_window_bytes.saturating_add(data.len() as u64);
-                screen_dirty = true;
-                scrollback_dirty = true;
-            }
-            Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) => {
-                logger::log_line(
-                    &log_path,
-                    &format!("Terminal client {client_id} channel EOF."),
-                );
-                send_ui_status(
-                    &ui_tx,
-                    IssueKind::Transport,
-                    "Transport disconnected. The SSH channel closed.",
-                );
-                let _ = ui_tx.send(UiMessage::Connected(false));
-                return Ok(());
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                logger::log_line(
-                    &log_path,
-                    &format!("Terminal client {client_id} channel closed."),
-                );
-                send_ui_status(
-                    &ui_tx,
-                    IssueKind::Transport,
-                    "Transport disconnected. The SSH channel closed.",
-                );
-                let _ = ui_tx.send(UiMessage::Connected(false));
-                return Ok(());
-            }
-            Err(_) => {}
-        }
-
-        let rate_window_elapsed = screen_rate_window_started.elapsed();
-        if rate_window_elapsed >= TERM_SCREEN_RATE_WINDOW {
-            screen_emit_interval =
-                adaptive_screen_emit_interval(screen_rate_window_bytes, rate_window_elapsed);
-            screen_rate_window_started = Instant::now();
-            screen_rate_window_bytes = 0;
-        }
-
-        if scrollback_dirty {
-            send_scrollback_max(&ui_tx, &mut parser);
-            scrollback_dirty = false;
-        }
-
-        if screen_dirty && last_screen_emit.elapsed() >= screen_emit_interval {
-            send_screen(&ui_tx, &mut parser);
-            screen_dirty = false;
-            last_screen_emit = Instant::now();
         }
     }
 }
@@ -4024,7 +4135,7 @@ fn spawn_terminal_client(
         abort_terminal_client(client);
     }
 
-    let (command_tx, command_rx) = std::sync::mpsc::channel::<TerminalClientCommand>();
+    let (command_tx, command_rx) = unbounded_channel::<TerminalClientCommand>();
     let tracked_ui_tx = ui_tx.clone();
     let log_path = log_path.to_string();
     let task = tokio::task::spawn_local(async move {
@@ -4044,7 +4155,7 @@ fn spawn_terminal_client(
             );
             let issue = transfer_issue_from_error(&err);
             send_ui_status(&ui_tx, issue.kind, issue.message);
-            let _ = ui_tx.send(UiMessage::Connected(false));
+            send_message(&ui_tx, UiMessage::Connected(false));
         }
     });
     active_clients.push(ActiveTerminalClient {
@@ -4080,10 +4191,13 @@ fn request_auth_responses(
         ),
     );
     send_ui_status(ui_tx, IssueKind::Authentication, "Authentication required");
-    let _ = ui_tx.send(UiMessage::AuthPrompt(AuthPrompt {
-        instructions: instructions.to_string(),
-        prompts: prompts.clone(),
-    }));
+    send_message(
+        ui_tx,
+        UiMessage::AuthPrompt(AuthPrompt {
+            instructions: instructions.to_string(),
+            prompts: prompts.clone(),
+        }),
+    );
 
     let timeout = Duration::from_secs(600);
     loop {
@@ -4467,7 +4581,7 @@ type SshHandle = client::Handle<KnownHostsClient>;
 struct ActiveTerminalClient {
     client_id: u64,
     ui_tx: Sender<UiMessage>,
-    command_tx: Sender<TerminalClientCommand>,
+    command_tx: UnboundedSender<TerminalClientCommand>,
     abort_handle: tokio::task::AbortHandle,
 }
 
@@ -4483,11 +4597,14 @@ fn stop_terminal_client(client: ActiveTerminalClient, message: &str) {
         return;
     }
     client.abort_handle.abort();
-    let _ = client.ui_tx.send(UiMessage::Status(StatusUpdate {
-        kind: IssueKind::Transport,
-        message: message.to_string(),
-    }));
-    let _ = client.ui_tx.send(UiMessage::Connected(false));
+    send_message(
+        &client.ui_tx,
+        UiMessage::Status(StatusUpdate {
+            kind: IssueKind::Transport,
+            message: message.to_string(),
+        }),
+    );
+    send_message(&client.ui_tx, UiMessage::Connected(false));
 }
 
 fn stop_active_terminal_clients(active_clients: &mut Vec<ActiveTerminalClient>, message: &str) {
@@ -4507,11 +4624,14 @@ fn stop_sftp_client(client: ActiveSftpClient, message: &str) {
         return;
     }
     client.abort_handle.abort();
-    let _ = client.ui_tx.send(SftpUiMessage::Status(StatusUpdate {
-        kind: IssueKind::Transport,
-        message: message.to_string(),
-    }));
-    let _ = client.ui_tx.send(SftpUiMessage::Connected(false));
+    send_message(
+        &client.ui_tx,
+        SftpUiMessage::Status(StatusUpdate {
+            kind: IssueKind::Transport,
+            message: message.to_string(),
+        }),
+    );
+    send_message(&client.ui_tx, SftpUiMessage::Connected(false));
 }
 
 fn stop_active_sftp_clients(active_clients: &mut Vec<ActiveSftpClient>, message: &str) {
@@ -4532,13 +4652,16 @@ fn stop_active_transfers(active_transfers: &mut Vec<ActiveTransfer>, message: &s
             continue;
         }
         transfer.abort_handle.abort();
-        let _ = transfer.event_tx.send(DownloadManagerEvent::Paused {
-            request_id: transfer.request_id,
-            issue: TransferIssue {
-                kind: IssueKind::Transport,
-                message: message.to_string(),
+        send_message(
+            &transfer.event_tx,
+            DownloadManagerEvent::Paused {
+                request_id: transfer.request_id,
+                issue: TransferIssue {
+                    kind: IssueKind::Transport,
+                    message: message.to_string(),
+                },
             },
-        });
+        );
     }
 }
 
@@ -4641,7 +4764,7 @@ impl KnownHostsClient {
                     )
                 };
                 logger::log_line(log_path.as_str(), &prompt_message);
-                let _ = ui_tx.send(UiMessage::HostKeyPrompt(prompt));
+                send_message(ui_tx, UiMessage::HostKeyPrompt(prompt));
 
                 match decision_rx.recv_timeout(Duration::from_secs(600)) {
                     Ok(HostKeyDecision::TrustAndSave) => {
@@ -4755,10 +4878,13 @@ async fn run_detached_sftp_download(
     } = request;
 
     if transfer_cancel_requested(&cancel_rx) {
-        let _ = event_tx.send(DownloadManagerEvent::Canceled {
-            request_id,
-            local_path,
-        });
+        send_download_event(
+            &event_tx,
+            DownloadManagerEvent::Canceled {
+                request_id,
+                local_path,
+            },
+        );
         return Ok(());
     }
 
@@ -4792,10 +4918,13 @@ async fn run_detached_sftp_upload(
     } = request;
 
     if transfer_cancel_requested(&cancel_rx) {
-        let _ = event_tx.send(DownloadManagerEvent::Canceled {
-            request_id,
-            local_path,
-        });
+        send_download_event(
+            &event_tx,
+            DownloadManagerEvent::Canceled {
+                request_id,
+                local_path,
+            },
+        );
         return Ok(());
     }
 
@@ -4835,10 +4964,13 @@ pub fn start_sftp_download_detached(
         };
 
         if let Err(err) = result {
-            let _ = failure_tx.send(DownloadManagerEvent::Failed {
-                request_id,
-                issue: transfer_issue_from_error(&err),
-            });
+            send_download_event(
+                &failure_tx,
+                DownloadManagerEvent::Failed {
+                    request_id,
+                    issue: transfer_issue_from_error(&err),
+                },
+            );
         }
     })
 }
@@ -4859,10 +4991,13 @@ pub fn start_sftp_upload_detached(
         };
 
         if let Err(err) = result {
-            let _ = failure_tx.send(DownloadManagerEvent::Failed {
-                request_id,
-                issue: transfer_issue_from_error(&err),
-            });
+            send_download_event(
+                &failure_tx,
+                DownloadManagerEvent::Failed {
+                    request_id,
+                    issue: transfer_issue_from_error(&err),
+                },
+            );
         }
     })
 }
@@ -4915,8 +5050,11 @@ pub fn start_shell(
 
         if let Err(err) = result {
             logger::log_line(&log_path, &format!("Worker error: {err}"));
-            let _ = ui_tx.send(UiMessage::Status(connection_status_from_error(&err)));
-            let _ = ui_tx.send(UiMessage::Connected(false));
+            send_message(
+                &ui_tx,
+                UiMessage::Status(connection_status_from_error(&err)),
+            );
+            send_message(&ui_tx, UiMessage::Connected(false));
         }
     })
 }
@@ -5298,9 +5436,11 @@ async fn run_shell_async(
     }
 
     let session = Rc::new(session);
+    let mut worker_rx = bridge_receiver_to_async(worker_rx);
     let mut active_terminal_clients: Vec<ActiveTerminalClient> = Vec::new();
     let mut active_sftp_clients: Vec<ActiveSftpClient> = Vec::new();
     let mut active_transfers: Vec<ActiveTransfer> = Vec::new();
+    let mut worker_sender_disconnected = false;
     spawn_terminal_client(
         &mut active_terminal_clients,
         initial_client_id,
@@ -5311,26 +5451,53 @@ async fn run_shell_async(
     );
 
     loop {
-        let mut disconnected = false;
-        let mut worker_sender_disconnected = false;
         active_terminal_clients.retain(|client| !client.abort_handle.is_finished());
         active_sftp_clients.retain(|client| !client.abort_handle.is_finished());
         active_transfers.retain(|transfer| !transfer.abort_handle.is_finished());
 
-        loop {
-            match worker_rx.try_recv() {
-                Ok(WorkerMessage::Input { client_id, data }) => send_terminal_client_command(
+        let mut pending_messages = VecDeque::new();
+        if worker_sender_disconnected {
+            tokio::time::sleep(SESSION_HOUSEKEEPING_INTERVAL).await;
+        } else {
+            tokio::select! {
+                maybe_message = worker_rx.recv() => {
+                    match maybe_message {
+                        Some(message) => pending_messages.push_back(message),
+                        None => worker_sender_disconnected = true,
+                    }
+                }
+                _ = tokio::time::sleep(SESSION_HOUSEKEEPING_INTERVAL) => {}
+            }
+        }
+
+        if !worker_sender_disconnected {
+            loop {
+                match worker_rx.try_recv() {
+                    Ok(message) => pending_messages.push_back(message),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        worker_sender_disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut disconnected = false;
+        while let Some(message) = pending_messages.pop_front() {
+            match message {
+                WorkerMessage::Input { client_id, data } => send_terminal_client_command(
                     &mut active_terminal_clients,
                     client_id,
                     TerminalClientCommand::Input(data),
                 ),
-                Ok(WorkerMessage::Resize {
+                WorkerMessage::Resize {
                     client_id,
                     rows,
                     cols,
                     width_px,
                     height_px,
-                }) => send_terminal_client_command(
+                } => send_terminal_client_command(
                     &mut active_terminal_clients,
                     client_id,
                     TerminalClientCommand::Resize {
@@ -5340,18 +5507,16 @@ async fn run_shell_async(
                         height_px,
                     },
                 ),
-                Ok(WorkerMessage::SetScrollback { client_id, rows }) => {
-                    send_terminal_client_command(
-                        &mut active_terminal_clients,
-                        client_id,
-                        TerminalClientCommand::SetScrollback(rows),
-                    )
-                }
-                Ok(WorkerMessage::AttachTerminalClient {
+                WorkerMessage::SetScrollback { client_id, rows } => send_terminal_client_command(
+                    &mut active_terminal_clients,
+                    client_id,
+                    TerminalClientCommand::SetScrollback(rows),
+                ),
+                WorkerMessage::AttachTerminalClient {
                     client_id,
                     ui_tx,
                     scrollback_len,
-                }) => spawn_terminal_client(
+                } => spawn_terminal_client(
                     &mut active_terminal_clients,
                     client_id,
                     Rc::clone(&session),
@@ -5359,7 +5524,7 @@ async fn run_shell_async(
                     scrollback_len,
                     log_path,
                 ),
-                Ok(WorkerMessage::DetachTerminalClient { client_id }) => {
+                WorkerMessage::DetachTerminalClient { client_id } => {
                     if let Some(index) = terminal_client_by_id(&active_terminal_clients, client_id)
                     {
                         let client = active_terminal_clients.swap_remove(index);
@@ -5367,11 +5532,11 @@ async fn run_shell_async(
                         abort_terminal_client(client);
                     }
                 }
-                Ok(WorkerMessage::AttachSftpClient {
+                WorkerMessage::AttachSftpClient {
                     client_id,
                     ui_tx,
                     worker_rx,
-                }) => {
+                } => {
                     if let Some(index) = active_sftp_clients
                         .iter()
                         .position(|client| client.client_id == client_id)
@@ -5387,6 +5552,7 @@ async fn run_shell_async(
                             let log_path = log_path.to_string();
                             let tracked_ui_tx = ui_tx.clone();
                             let sftp_session = Rc::clone(&session);
+                            let worker_rx = bridge_receiver_to_async(worker_rx);
                             let task = tokio::task::spawn_local(async move {
                                 if let Err(err) = run_sftp_client_async(
                                     client_id,
@@ -5404,7 +5570,7 @@ async fn run_shell_async(
                                     );
                                     let issue = transfer_issue_from_error(&err);
                                     send_sftp_status(&ui_tx, issue.kind, issue.message);
-                                    let _ = ui_tx.send(SftpUiMessage::Connected(false));
+                                    send_message(&ui_tx, SftpUiMessage::Connected(false));
                                 }
                             });
                             active_sftp_clients.push(ActiveSftpClient {
@@ -5424,11 +5590,11 @@ async fn run_shell_async(
                                 transfer_issue_from_error(&err).kind,
                                 format!("Failed to open SFTP session. {err}"),
                             );
-                            let _ = ui_tx.send(SftpUiMessage::Connected(false));
+                            send_message(&ui_tx, SftpUiMessage::Connected(false));
                         }
                     }
                 }
-                Ok(WorkerMessage::TransferCommand(cmd)) => match cmd {
+                WorkerMessage::TransferCommand(cmd) => match cmd {
                     TransferCommand::Download {
                         request_id,
                         remote_path,
@@ -5438,10 +5604,13 @@ async fn run_shell_async(
                         cancel_rx,
                     } => {
                         if transfer_cancel_requested(&cancel_rx) {
-                            let _ = event_tx.send(DownloadManagerEvent::Canceled {
-                                request_id,
-                                local_path,
-                            });
+                            send_message(
+                                &event_tx,
+                                DownloadManagerEvent::Canceled {
+                                    request_id,
+                                    local_path,
+                                },
+                            );
                             continue;
                         }
 
@@ -5467,10 +5636,13 @@ async fn run_shell_async(
                                                 "Live download transfer {request_id} failed: {err}"
                                             ),
                                         );
-                                        let _ = event_tx.send(DownloadManagerEvent::Failed {
-                                            request_id,
-                                            issue: transfer_issue_from_error(&err),
-                                        });
+                                        send_message(
+                                            &event_tx,
+                                            DownloadManagerEvent::Failed {
+                                                request_id,
+                                                issue: transfer_issue_from_error(&err),
+                                            },
+                                        );
                                     }
                                 });
                                 active_transfers.push(ActiveTransfer {
@@ -5487,10 +5659,13 @@ async fn run_shell_async(
                                         "Failed to open live SFTP channel for download {request_id}: {err}"
                                     ),
                                 );
-                                let _ = event_tx.send(DownloadManagerEvent::Failed {
-                                    request_id,
-                                    issue: transfer_issue_from_error(&err),
-                                });
+                                send_message(
+                                    &event_tx,
+                                    DownloadManagerEvent::Failed {
+                                        request_id,
+                                        issue: transfer_issue_from_error(&err),
+                                    },
+                                );
                             }
                         }
                     }
@@ -5504,10 +5679,13 @@ async fn run_shell_async(
                         conflict_response_rx,
                     } => {
                         if transfer_cancel_requested(&cancel_rx) {
-                            let _ = event_tx.send(DownloadManagerEvent::Canceled {
-                                request_id,
-                                local_path,
-                            });
+                            send_message(
+                                &event_tx,
+                                DownloadManagerEvent::Canceled {
+                                    request_id,
+                                    local_path,
+                                },
+                            );
                             continue;
                         }
 
@@ -5540,10 +5718,13 @@ async fn run_shell_async(
                                                 "Live upload transfer {request_id} failed: {err}"
                                             ),
                                         );
-                                        let _ = event_tx.send(DownloadManagerEvent::Failed {
-                                            request_id,
-                                            issue: transfer_issue_from_error(&err),
-                                        });
+                                        send_message(
+                                            &event_tx,
+                                            DownloadManagerEvent::Failed {
+                                                request_id,
+                                                issue: transfer_issue_from_error(&err),
+                                            },
+                                        );
                                     }
                                 });
                                 active_transfers.push(ActiveTransfer {
@@ -5560,25 +5741,23 @@ async fn run_shell_async(
                                         "Failed to open live SFTP channel for upload {request_id}: {err}"
                                     ),
                                 );
-                                let _ = event_tx.send(DownloadManagerEvent::Failed {
-                                    request_id,
-                                    issue: transfer_issue_from_error(&err),
-                                });
+                                send_message(
+                                    &event_tx,
+                                    DownloadManagerEvent::Failed {
+                                        request_id,
+                                        issue: transfer_issue_from_error(&err),
+                                    },
+                                );
                             }
                         }
                     }
                 },
-                Ok(WorkerMessage::Disconnect) => {
+                WorkerMessage::Disconnect => {
                     disconnected = true;
                     break;
                 }
-                Ok(WorkerMessage::AuthResponse(_)) => {
+                WorkerMessage::AuthResponse(_) => {
                     // Auth responses are only expected during authentication.
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    worker_sender_disconnected = true;
-                    break;
                 }
             }
         }
@@ -5626,8 +5805,6 @@ async fn run_shell_async(
             );
             return Ok(());
         }
-
-        tokio::time::sleep(READ_POLL_INTERVAL).await;
     }
 }
 

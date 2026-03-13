@@ -1,5 +1,8 @@
 impl AppState {
     fn ms_until_cursor_blink_toggle(&self) -> u64 {
+        if self.low_power_renderer {
+            return u64::MAX;
+        }
         let blink_period = Duration::from_millis(530);
         let elapsed = self.last_cursor_blink.elapsed();
         if elapsed >= blink_period {
@@ -10,6 +13,10 @@ impl AppState {
     }
 
     fn update_cursor_blink(&mut self) {
+        if self.low_power_renderer {
+            self.cursor_visible = true;
+            return;
+        }
         if self.last_cursor_blink.elapsed() >= Duration::from_millis(530) {
             self.cursor_visible = !self.cursor_visible;
             self.last_cursor_blink = Instant::now();
@@ -279,8 +286,8 @@ impl AppState {
             .fixed_decimals(0),
         );
         // Persist on release to avoid writing to disk on every slider tick.
-        // Note: on the release-frame `resp.changed()` may be false, so key off `drag_released`.
-        if resp.drag_released()
+        // Note: on the release-frame `resp.changed()` may be false, so key off `drag_stopped`.
+        if resp.drag_stopped()
             || (resp.changed()
                 && !resp.dragged()
                 && (self.config.terminal_font_size - before).abs() > f32::EPSILON)
@@ -301,7 +308,7 @@ impl AppState {
         ui.add(
             egui::DragValue::new(&mut self.config.terminal_scrollback_lines)
                 .speed(100.0)
-                .clamp_range(0..=200_000),
+                .range(0..=200_000),
         );
         ui.label("Terminal scrollback lines (0 = default)");
         if self.config.terminal_scrollback_lines != before {
@@ -345,7 +352,7 @@ impl AppState {
         let mut selected_theme_to_apply: Option<Option<String>> = None;
         let list_height = ui.available_height().max(150.0);
         egui::ScrollArea::vertical()
-            .id_source("settings_ui_theme_list_scroll")
+            .id_salt("settings_ui_theme_list_scroll")
             .auto_shrink([false, false])
             .max_height(list_height)
             .show(ui, |ui| {
@@ -459,6 +466,7 @@ impl AppState {
         self.theme_source = source;
         self.apply_global_style(ctx);
         self.style_initialized = true;
+        self.style_pixels_per_point_bits = ctx.pixels_per_point().to_bits();
         self.config_saver.request_save(self.config.clone());
         true
     }
@@ -619,11 +627,11 @@ impl AppState {
             Stroke::new(1.0, app_theme.top_border)
         };
 
-        let inner = egui::Frame::none()
+        let inner = egui::Frame::NONE
             .fill(fill)
             .stroke(stroke)
-            .rounding(egui::Rounding::same(6.0))
-            .inner_margin(egui::Margin::same(8.0))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
                 ui.set_min_width((card_width - 16.0).max(96.0));
                 ui.horizontal(|ui| {
@@ -649,11 +657,11 @@ impl AppState {
                 });
 
                 ui.add_space(3.0);
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(preview_theme.bg)
                     .stroke(Stroke::new(1.0, preview_theme.top_border))
-                    .rounding(egui::Rounding::same(5.0))
-                    .inner_margin(egui::Margin::same(6.0))
+                    .corner_radius(egui::CornerRadius::same(5))
+                    .inner_margin(egui::Margin::same(6))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let (accent_dot, _) =
@@ -735,11 +743,11 @@ impl AppState {
             Stroke::new(1.0, app_theme.top_border)
         };
 
-        let inner = egui::Frame::none()
+        let inner = egui::Frame::NONE
             .fill(fill)
             .stroke(stroke)
-            .rounding(egui::Rounding::same(6.0))
-            .inner_margin(egui::Margin::same(8.0))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
                 ui.set_min_width((card_width - 16.0).max(96.0));
                 ui.horizontal(|ui| {
@@ -783,11 +791,11 @@ impl AppState {
                 let preview_fg = Self::rgb_to_color32(term_theme.foreground);
                 let preview_border =
                     adjust_color(preview_bg, if term_theme.light { -0.18 } else { 0.25 });
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(preview_bg)
                     .stroke(Stroke::new(1.0, preview_border))
-                    .rounding(egui::Rounding::same(5.0))
-                    .inner_margin(egui::Margin::same(6.0))
+                    .corner_radius(egui::CornerRadius::same(5))
+                    .inner_margin(egui::Margin::same(6))
                     .show(ui, |ui| {
                         ui.visuals_mut().override_text_color = Some(preview_fg);
                         let palette = &term_theme.palette16;
@@ -833,7 +841,7 @@ impl AppState {
         ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
         ui.label(egui::RichText::new("Profiles").strong());
         egui::ScrollArea::vertical()
-            .id_source("settings_profiles_list_scroll")
+            .id_salt("settings_profiles_list_scroll")
             .max_height(120.0)
             .show(ui, |ui| {
                 let mut load_idx: Option<usize> = None;
@@ -854,7 +862,7 @@ impl AppState {
                         .as_deref()
                         .map(|d| d.eq_ignore_ascii_case(&p.name))
                         .unwrap_or(false);
-                    let resp = ui.add(egui::SelectableLabel::new(
+                    let resp = ui.add(egui::Button::selectable(
                         selected,
                         egui::RichText::new(label).color(text_color),
                     ));
@@ -865,16 +873,16 @@ impl AppState {
                         if is_default {
                             if ui.button("Clear Default Profile").clicked() {
                                 clear_default = true;
-                                ui.close_menu();
+                                ui.close();
                             }
                         } else if ui.button("Set As Default Profile").clicked() {
                             set_default_idx = Some(i);
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                         if ui.button("Delete Profile").clicked() {
                             delete_idx = Some(i);
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                 }
@@ -976,7 +984,7 @@ impl AppState {
                 ui.add(
                     egui::DragValue::new(&mut self.settings_dialog.draft.port)
                         .speed(1.0)
-                        .clamp_range(1..=65535),
+                        .range(1..=65535),
                 );
                 ui.end_row();
 
@@ -1083,7 +1091,7 @@ impl AppState {
                         tab.start_connect();
                         tab.focus_terminal_next_frame = true;
                     }
-                    self.active_tile = Some(tile_id);
+                    self.set_active_tile(Some(tile_id));
                 }
                 self.settings_dialog.open = false;
             }
@@ -1110,15 +1118,16 @@ impl AppState {
 
         let btn_fill = adjust_color(theme.top_bg, 0.10);
         let controls_enabled = !embedded;
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(adjust_color(theme.top_bg, 0.08))
             .stroke(Stroke::new(1.0, theme.top_border))
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::symmetric(TITLE_PAD_X, 2.0))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(TITLE_PAD_X.round() as i8, 2))
             .show(ui, |ui| {
-                ui.set_min_height(TITLE_BAR_H);
-
-                let bar_rect = ui.max_rect();
+                let bar_rect = Rect::from_min_size(
+                    ui.cursor().min,
+                    Vec2::new(ui.available_width(), TITLE_BAR_H),
+                );
                 let drag_resp = ui.interact(
                     bar_rect,
                     Id::new("rusty_settings_title_drag"),
@@ -1126,7 +1135,11 @@ impl AppState {
                 );
                 let mut title_controls_hot = false;
 
-                ui.horizontal(|ui| {
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(bar_rect)
+                        .layout(egui::Layout::left_to_right(Align::Center)),
+                    |ui| {
                     ui.label(
                         egui::RichText::new("Rusty Settings")
                             .strong()
@@ -1182,7 +1195,9 @@ impl AppState {
                             }
                         }
                     });
-                });
+                    },
+                );
+                ui.advance_cursor_after_rect(bar_rect);
 
                 if controls_enabled {
                     let pressed_on_title =
@@ -1200,7 +1215,7 @@ impl AppState {
 
         // Settings layout that scales: left section list (listbox-style) + right content pane.
         let avail_h = ui.available_height();
-        let panel_rounding = egui::Rounding::same(10.0);
+        let panel_rounding = egui::CornerRadius::same(10);
         let panel_stroke = Stroke::new(1.0, theme.top_border);
 
         ui.horizontal(|ui| {
@@ -1211,9 +1226,13 @@ impl AppState {
             ui.painter()
                 .rect_filled(nav_rect, panel_rounding, adjust_color(theme.top_bg, 0.10));
             ui.painter()
-                .rect_stroke(nav_rect, panel_rounding, panel_stroke);
+                .rect_stroke(nav_rect, panel_rounding, panel_stroke, egui::StrokeKind::Inside);
             let nav_inner = nav_rect.shrink(12.0);
-            let mut nav_ui = ui.child_ui(nav_inner, egui::Layout::top_down(Align::Min));
+            let mut nav_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(nav_inner)
+                    .layout(egui::Layout::top_down(Align::Min)),
+            );
             nav_ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
             nav_ui.label(
                 egui::RichText::new("Sections")
@@ -1223,18 +1242,22 @@ impl AppState {
             nav_ui.add_space(6.0);
 
             egui::ScrollArea::vertical()
-                .id_source("settings_nav_scroll")
+                .id_salt("settings_nav_scroll")
                 .auto_shrink([false, false])
                 .show(&mut nav_ui, |ui| {
                     let item_h = 34.0;
-                    let rounding = egui::Rounding::same(10.0);
+                    let rounding = egui::CornerRadius::same(10);
                     let font_id = FontId::proportional(16.0);
 
                     let mut item = |ui: &mut egui::Ui, page: SettingsPage| {
                         let selected = self.settings_dialog.page == page;
                         let text = egui::WidgetText::from(page.label());
-                        let galley =
-                            text.into_galley(ui, Some(false), f32::INFINITY, font_id.clone());
+                        let galley = text.into_galley(
+                            ui,
+                            Some(egui::TextWrapMode::Extend),
+                            f32::INFINITY,
+                            font_id.clone(),
+                        );
 
                         let (rect, resp) = ui.allocate_exact_size(
                             Vec2::new(ui.available_width(), item_h),
@@ -1263,7 +1286,12 @@ impl AppState {
                                 ui.painter().rect_filled(rect, rounding, fill);
                             }
                             if stroke != Stroke::NONE {
-                                ui.painter().rect_stroke(rect, rounding, stroke);
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    rounding,
+                                    stroke,
+                                    egui::StrokeKind::Inside,
+                                );
                             }
 
                             if selected {
@@ -1272,11 +1300,11 @@ impl AppState {
                                     rect.min,
                                     Pos2::new(rect.min.x + bar_w, rect.max.y),
                                 );
-                                let bar_rounding = egui::Rounding {
+                                let bar_rounding = egui::CornerRadius {
                                     nw: rounding.nw,
                                     sw: rounding.sw,
-                                    ne: 0.0,
-                                    se: 0.0,
+                                    ne: 0,
+                                    se: 0,
                                 };
                                 ui.painter().rect_filled(bar, bar_rounding, theme.accent);
                             }
@@ -1313,12 +1341,21 @@ impl AppState {
                 adjust_color(theme.top_bg, 0.10),
             );
             ui.painter()
-                .rect_stroke(content_rect, panel_rounding, panel_stroke);
+                .rect_stroke(
+                    content_rect,
+                    panel_rounding,
+                    panel_stroke,
+                    egui::StrokeKind::Inside,
+                );
             let content_inner = content_rect.shrink(12.0);
-            let mut content_ui = ui.child_ui(content_inner, egui::Layout::top_down(Align::Min));
+            let mut content_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(content_inner)
+                    .layout(egui::Layout::top_down(Align::Min)),
+            );
 
             egui::ScrollArea::vertical()
-                .id_source("settings_content_scroll")
+                .id_salt("settings_content_scroll")
                 .auto_shrink([false, false])
                 .show(&mut content_ui, |ui| match self.settings_dialog.page {
                     SettingsPage::Autostart => self.draw_settings_page_autostart(ui),
@@ -1368,20 +1405,20 @@ impl AppState {
                 paint_window_chrome(ctx, theme);
                 handle_window_resize(ctx);
             }
-            let outer_frame = egui::Frame::none()
+            let outer_frame = egui::Frame::NONE
                 .fill(adjust_color(theme.top_bg, 0.06))
                 .stroke(Stroke::new(1.0, theme.top_border))
                 .inner_margin(egui::Margin {
-                    left: 14.0,
-                    right: 14.0,
-                    top: 4.0,
-                    bottom: 14.0,
+                    left: 14,
+                    right: 14,
+                    top: 4,
+                    bottom: 14,
                 });
-            let section_frame = egui::Frame::none()
+            let section_frame = egui::Frame::NONE
                 .fill(adjust_color(theme.top_bg, 0.10))
                 .stroke(Stroke::new(1.0, theme.top_border))
-                .rounding(egui::Rounding::same(10.0))
-                .inner_margin(egui::Margin::same(12.0));
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::same(12));
 
             match class {
                 egui::ViewportClass::Embedded => {
@@ -1422,9 +1459,9 @@ impl AppState {
             return;
         }
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = ctx.content_rect();
         let overlay_id =
-            egui::LayerId::new(egui::Order::PanelResizeLine, Id::new("host_key_modal_bg"));
+            egui::LayerId::new(egui::Order::Middle, Id::new("host_key_modal_bg"));
         let painter = ctx.layer_painter(overlay_id);
         painter.rect_filled(
             screen_rect,
@@ -1448,17 +1485,23 @@ impl AppState {
         y = y.clamp(min_y, max_y);
         let win_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(win_w, win_h));
 
-        let frame = egui::Frame::none()
+        let frame = egui::Frame::NONE
             .fill(adjust_color(self.theme.top_bg, 0.06))
             .stroke(Stroke::new(1.0, self.theme.top_border))
-            .rounding(egui::Rounding::same(12.0))
-            .shadow(egui::epaint::Shadow::big_dark())
-            .inner_margin(egui::Margin::same(12.0));
+            .corner_radius(egui::CornerRadius::same(12))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 8],
+                blur: 32,
+                spread: 0,
+                color: Color32::from_black_alpha(96),
+            })
+            .inner_margin(egui::Margin::same(12));
 
         egui::Window::new("Host Key Verification")
             .collapsible(false)
             .resizable(false)
             .title_bar(false)
+            .order(egui::Order::Foreground)
             .fixed_rect(win_rect)
             .frame(frame)
             .open(&mut open)
@@ -1510,7 +1553,7 @@ impl AppState {
 
                 ui.label(egui::RichText::new("SHA256 fingerprint").strong());
                 egui::ScrollArea::vertical()
-                    .id_source(("hostkey_fp_scroll", dialog.tile_id))
+                    .id_salt(("hostkey_fp_scroll", dialog.tile_id))
                     .max_height(56.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -1586,9 +1629,9 @@ impl AppState {
         }
 
         // Modal dim background.
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = ctx.content_rect();
         // Paint the dim overlay above panels but below windows.
-        let overlay_id = egui::LayerId::new(egui::Order::PanelResizeLine, Id::new("auth_modal_bg"));
+        let overlay_id = egui::LayerId::new(egui::Order::Middle, Id::new("auth_modal_bg"));
         let painter = ctx.layer_painter(overlay_id);
         painter.rect_filled(
             screen_rect,
@@ -1630,17 +1673,23 @@ impl AppState {
         x = x.clamp(min_x, max_x);
         y = y.clamp(min_y, max_y);
         let win_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(win_w, win_h));
-        let frame = egui::Frame::none()
+        let frame = egui::Frame::NONE
             .fill(adjust_color(self.theme.top_bg, 0.06))
             .stroke(Stroke::new(1.0, self.theme.top_border))
-            .rounding(egui::Rounding::same(12.0))
-            .shadow(egui::epaint::Shadow::big_dark())
-            .inner_margin(egui::Margin::same(12.0));
+            .corner_radius(egui::CornerRadius::same(12))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 8],
+                blur: 32,
+                spread: 0,
+                color: Color32::from_black_alpha(96),
+            })
+            .inner_margin(egui::Margin::same(12));
 
         egui::Window::new("Authentication")
             .collapsible(false)
             .resizable(false)
             .title_bar(false)
+            .order(egui::Order::Foreground)
             .fixed_rect(win_rect)
             .frame(frame)
             .open(&mut open)
@@ -1670,7 +1719,7 @@ impl AppState {
                 }
 
                 egui::ScrollArea::vertical()
-                    .id_source(("auth_prompts_scroll", auth.tile_id))
+                    .id_salt(("auth_prompts_scroll", auth.tile_id))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let field_w = ui.available_width().min(360.0);
@@ -1695,7 +1744,7 @@ impl AppState {
                                         ui.ctx().memory_mut(|mem| mem.request_focus(response_id));
                                         ui.ctx().request_repaint();
                                     }
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                             if auth.just_opened && i == 0 {

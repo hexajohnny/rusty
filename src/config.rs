@@ -34,7 +34,7 @@ pub enum UiThemeMode {
     Light,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SavedWindow {
     pub outer_pos: [f32; 2],
     pub inner_size: [f32; 2],

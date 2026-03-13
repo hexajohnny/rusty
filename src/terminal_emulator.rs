@@ -231,6 +231,10 @@ impl Screen {
         self.scrollback
     }
 
+    pub fn scrollback_max(&self) -> usize {
+        self.scrollback_max
+    }
+
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
     }
@@ -285,6 +289,7 @@ impl Screen {
 pub struct Parser {
     terminal: Terminal,
     screen: Screen,
+    screen_dirty: bool,
     scrollback: usize,
     mode_state: ModeState,
     seq_filter: SeqFilter,
@@ -313,6 +318,7 @@ impl Parser {
                 Box::new(NullWriter),
             ),
             screen: Screen::from_snapshot(ScreenSnapshot::empty(rows as u16, cols as u16)),
+            screen_dirty: false,
             scrollback: 0,
             mode_state: ModeState::default(),
             seq_filter: SeqFilter::default(),
@@ -325,11 +331,12 @@ impl Parser {
         let filtered = self.seq_filter.transform(bytes, &mut self.mode_state);
         if !filtered.is_empty() {
             self.terminal.advance_bytes(filtered);
+            self.screen_dirty = true;
         }
-        self.refresh_screen();
     }
 
-    pub fn screen(&self) -> &Screen {
+    pub fn screen(&mut self) -> &Screen {
+        self.refresh_screen_if_dirty();
         &self.screen
     }
 
@@ -344,12 +351,18 @@ impl Parser {
             pixel_height: size.pixel_height,
             dpi: size.dpi,
         });
-        self.refresh_screen();
+        self.screen_dirty = true;
     }
 
     pub fn set_scrollback(&mut self, rows: usize) {
         self.scrollback = rows;
-        self.refresh_screen();
+        self.screen_dirty = true;
+    }
+
+    fn refresh_screen_if_dirty(&mut self) {
+        if self.screen_dirty {
+            self.refresh_screen();
+        }
     }
 
     fn refresh_screen(&mut self) {
@@ -381,6 +394,7 @@ impl Parser {
             hide_cursor,
         };
         self.screen = Screen::from_snapshot(snapshot);
+        self.screen_dirty = false;
     }
 }
 
@@ -660,5 +674,12 @@ mod tests {
         assert!(mode_state.application_cursor);
         assert_eq!(mode_state.mouse_mode(), MouseProtocolMode::Drag);
         assert_eq!(mode_state.mouse_encoding, MouseProtocolEncoding::Sgr);
+    }
+
+    #[test]
+    fn parser_refreshes_screen_lazily_on_read() {
+        let mut parser = Parser::new(4, 8, 32);
+        parser.process(b"hello");
+        assert!(parser.screen().contents().contains("hello"));
     }
 }

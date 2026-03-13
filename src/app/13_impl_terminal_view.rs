@@ -49,14 +49,14 @@ impl AppState {
         });
 
         let painter = ui.painter().with_clip_rect(rect);
-        let rounding = egui::Rounding::ZERO;
+        let rounding = egui::CornerRadius::ZERO;
         painter.rect_filled(rect, rounding, options.term_theme.bg);
 
         // Compute visible rows/cols and keep the remote PTY in sync.
         let ppp = ctx.pixels_per_point().max(1.0);
         let snapped_term_font_size = ((options.term_font_size * ppp).round() / ppp).max(8.0);
         let font_id = FontId::monospace(snapped_term_font_size);
-        let (cell_w, cell_h) = Self::cell_metrics(ctx, &font_id);
+        let (cell_w, cell_h) = Self::cell_metrics(tab, ctx, &font_id);
 
         let inner_size = rect.size() - Vec2::new(TERM_PAD_X * 2.0, TERM_PAD_Y * 2.0);
         let cols = ((inner_size.x / cell_w).floor().max(1.0)) as u16;
@@ -102,8 +102,7 @@ impl AppState {
         let origin = Pos2::new((origin.x * ppp).round() / ppp, (origin.y * ppp).round() / ppp);
 
         if tab.connected {
-            let job = Self::screen_to_layout_job(&tab.screen, font_id, &options.term_theme);
-            let galley = ui.fonts(|fonts| fonts.layout_job(job));
+            let galley = Self::terminal_galley(ui, tab, &font_id, &options.term_theme);
             painter.galley(origin, galley.clone(), Color32::WHITE);
             let draw_sel = if let Some(sel) = tab.abs_selection {
                 Self::visible_selection_from_abs(tab, sel)
@@ -217,8 +216,8 @@ impl AppState {
             let glow = Stroke::new(3.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a_glow));
             let r0 = rect.shrink(1.0);
             let r1 = rect.shrink(3.0);
-            painter.rect_stroke(r1, rounding, glow);
-            painter.rect_stroke(r0, rounding, stroke);
+            painter.rect_stroke(r1, rounding, glow, egui::StrokeKind::Inside);
+            painter.rect_stroke(r0, rounding, stroke, egui::StrokeKind::Inside);
         }
     }
 }

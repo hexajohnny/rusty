@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
@@ -102,7 +103,7 @@ impl Default for UiTheme {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct TermTheme {
     bg: Color32,
     fg: Color32,
@@ -793,6 +794,22 @@ impl FileBrowserState {
     }
 }
 
+#[derive(Clone)]
+struct CellMetricsCache {
+    font_size_bits: u32,
+    pixels_per_point_bits: u32,
+    cell_w: f32,
+    cell_h: f32,
+}
+
+#[derive(Clone)]
+struct TerminalRenderCache {
+    font_size_bits: u32,
+    pixels_per_point_bits: u32,
+    term_theme: TermTheme,
+    galley: Arc<egui::Galley>,
+}
+
 impl Clone for FileBrowserState {
     fn clone(&self) -> Self {
         Self {
@@ -840,6 +857,8 @@ struct SshTab {
     last_status: String,
 
     screen: crate::terminal_emulator::Screen,
+    cell_metrics_cache: Option<CellMetricsCache>,
+    render_cache: Option<TerminalRenderCache>,
     scroll_wheel_accum: f32,
     scrollback_max: usize,
     scrollbar_dragging: bool,
@@ -883,7 +902,10 @@ impl SshTab {
         } else {
             len
         };
-        let screen = crate::terminal_emulator::Parser::new(24, 80, len).screen().clone();
+        let screen = {
+            let mut parser = crate::terminal_emulator::Parser::new(24, 80, len);
+            parser.screen().clone()
+        };
         let title = Self::title_for(id, &settings);
         Self {
             id,
@@ -900,6 +922,8 @@ impl SshTab {
             last_status_kind: ssh::IssueKind::Info,
             last_status: String::new(),
             screen,
+            cell_metrics_cache: None,
+            render_cache: None,
             scroll_wheel_accum: 0.0,
             scrollback_max: 0,
             scrollbar_dragging: false,
@@ -1058,6 +1082,7 @@ impl SshTab {
         self.last_status = "Disconnected".to_string();
         self.last_sent_size = None;
         self.pending_resize = None;
+        self.render_cache = None;
         self.scroll_wheel_accum = 0.0;
         self.scrollback_max = 0;
         self.scrollbar_dragging = false;
@@ -1071,6 +1096,10 @@ impl SshTab {
         self.pending_scrollback = None;
         self.last_selection_autoscroll = Instant::now();
         self.pending_sftp_events.clear();
+    }
+
+    fn invalidate_terminal_render_cache(&mut self) {
+        self.render_cache = None;
     }
 
     fn poll_messages(&mut self) -> bool {
@@ -1145,9 +1174,11 @@ impl SshTab {
 
                 if let Some(screen) = latest_screen {
                     self.screen = *screen;
+                    self.invalidate_terminal_render_cache();
                     if let Some(target) = self.pending_scrollback {
                         let clamped = target.min(self.scrollback_max);
                         self.screen.set_scrollback(clamped);
+                        self.invalidate_terminal_render_cache();
                         if self.screen.scrollback() == clamped {
                             self.pending_scrollback = None;
                         }
@@ -1164,6 +1195,7 @@ impl SshTab {
                             self.pending_scrollback = Some(clamped);
                         }
                         self.screen.set_scrollback(clamped);
+                        self.invalidate_terminal_render_cache();
                         if self.screen.scrollback() == clamped {
                             self.pending_scrollback = None;
                         }
@@ -1239,6 +1271,8 @@ pub struct AppState {
     last_terminal_activity: Instant,
     last_download_activity: Instant,
     cursor_visible: bool,
+    low_power_renderer: bool,
+    snap_fractional_dpi: bool,
 
     tray: Option<crate::tray::TrayState>,
     tray_events: crossbeam_channel::Receiver<crate::tray::TrayAppEvent>,
@@ -1254,9 +1288,14 @@ pub struct AppState {
     pending_upload_conflict_prompts: VecDeque<ssh::UploadConflictPrompt>,
 
     style_initialized: bool,
+    style_pixels_per_point_bits: u32,
 
     layout_dirty: bool,
+    active_tile_dirty: bool,
     last_layout_save: Instant,
+    last_active_tile_change: Instant,
+    ui_profile_hot_frames: u32,
+    ui_profile_frame_index: u64,
     restored_window: bool,
     next_sftp_request_id: u64,
     pending_sftp_requests: HashMap<u64, TileId>,

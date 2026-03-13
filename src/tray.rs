@@ -47,6 +47,10 @@ fn wake_app() {
     }
 }
 
+pub fn request_app_repaint() {
+    wake_app();
+}
+
 pub fn set_hidden_to_tray_state(hidden: bool) {
     HIDDEN_TO_TRAY.store(hidden, Ordering::Relaxed);
 }
@@ -360,12 +364,22 @@ pub fn ensure_native_main_hit_test() {
         return;
     }
 
+    #[cfg(target_pointer_width = "64")]
     let prev = unsafe {
         SetWindowLongPtrW(
             hwnd,
             GWLP_WNDPROC,
             main_window_subclass_proc as *const () as isize,
-        )
+        ) as isize
+    };
+
+    #[cfg(target_pointer_width = "32")]
+    let prev = unsafe {
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            main_window_subclass_proc as *const () as i32,
+        ) as isize
     };
     if prev != 0 {
         MAIN_WNDPROC.store(prev, Ordering::Relaxed);

@@ -5,27 +5,28 @@ impl eframe::App for AppState {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // VM OpenGL paths can become blurry at fractional DPI scales (e.g. 125%).
-        // Enforce integer pixels-per-point every frame.
-        let ppp = ctx.pixels_per_point();
-        let snapped = ppp.round().max(1.0);
-        if (ppp - snapped).abs() > 0.01 {
-            ctx.set_pixels_per_point(snapped);
+        self.ui_profile_frame_index = self.ui_profile_frame_index.saturating_add(1);
+        let frame_index = self.ui_profile_frame_index;
+        let frame_started = Instant::now();
+        let profile_enabled = crate::logger::ui_profile_enabled();
+
+        // Some VM + wgpu-gl combinations render text more sharply when egui stays on an
+        // integer pixels-per-point. Do not force this on pure glow, where it can blur text.
+        if self.snap_fractional_dpi {
+            let ppp = ctx.pixels_per_point();
+            let snapped = ppp.round().max(1.0);
+            if (ppp - snapped).abs() > 0.01 {
+                ctx.set_pixels_per_point(snapped);
+            }
         }
 
         // Allow tray callbacks to wake the app even while the viewport is hidden.
         crate::tray::set_wake_ctx(ctx.clone());
 
-        if !self.style_initialized {
-            egui_extras::install_image_loaders(ctx);
-            self.apply_global_style(ctx);
-            self.style_initialized = true;
-        }
+        self.ensure_global_style(ctx);
 
         self.maybe_restore_window(ctx);
         crate::tray::ensure_native_main_hit_test();
-        // Keep the root viewport explicitly resizable across long uptime / tray restore cycles.
-        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
 
         // Tray integration (created lazily when enabled).
         // If tray minimize was turned off while hidden, bring the window back.
@@ -40,6 +41,7 @@ impl eframe::App for AppState {
 
         self.ensure_tree_non_empty();
 
+        let message_poll_started = Instant::now();
         let mut saw_terminal_activity = false;
         let mut live_session_count: usize = 0;
         for tile_id in self.pane_ids() {
@@ -68,48 +70,12 @@ impl eframe::App for AppState {
         self.poll_download_manager_events();
         self.sync_file_panes_with_sources();
         self.poll_update_check_result();
+        let message_poll_dt = message_poll_started.elapsed();
 
         let any_live_session = live_session_count > 0;
         let any_active_download = self.has_active_downloads();
-        let ui_modal_open = self.auth_dialog.is_some()
-            || self.host_key_dialog.is_some()
-            || self.rename_popup.is_some()
-            || self.downloads_window_open
-            || self.settings_dialog.open
-            || self.transfer_delete_dialog.is_some()
-            || self.upload_conflict_dialog.is_some();
-        let recent_terminal_activity = any_live_session
-            && self.last_terminal_activity.elapsed() <= Duration::from_millis(250);
-        let recent_download_activity = any_active_download
-            && self.last_download_activity.elapsed() <= Duration::from_millis(250);
-
-        let activity_repaint_ms = if live_session_count >= 3 {
-            28
-        } else if live_session_count >= 2 {
-            33
-        } else {
-            40
-        };
-        let mut repaint_ms = if self.hidden_to_tray {
-            500
-        } else if recent_terminal_activity {
-            activity_repaint_ms
-        } else if recent_download_activity {
-            66
-        } else if ui_modal_open {
-            125
-        } else if any_live_session || any_active_download {
-            250
-        } else {
-            500
-        };
-        if any_live_session {
-            repaint_ms = repaint_ms.min(self.ms_until_cursor_blink_toggle());
-        }
-        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
-
-        // Copy flash: after a successful copy, briefly flash the selection then clear it.
         let now = Instant::now();
+        let mut next_copy_flash_ms: Option<u64> = None;
         for tile_id in self.pane_ids() {
             if let Some(tab) = self.pane_mut(tile_id) {
                 if let Some(until) = tab.copy_flash_until {
@@ -117,9 +83,43 @@ impl eframe::App for AppState {
                         tab.copy_flash_until = None;
                         tab.selection = None;
                         tab.abs_selection = None;
+                    } else {
+                        let remaining_ms = until
+                            .saturating_duration_since(now)
+                            .as_millis()
+                            .clamp(1, u64::MAX as u128) as u64;
+                        next_copy_flash_ms = Some(
+                            next_copy_flash_ms
+                                .map(|current| current.min(remaining_ms))
+                                .unwrap_or(remaining_ms),
+                        );
                     }
                 }
             }
+        }
+
+        let mut repaint_ms = if any_live_session && !self.low_power_renderer {
+            Some(self.ms_until_cursor_blink_toggle())
+        } else {
+            None
+        };
+        if let Some(copy_flash_ms) = next_copy_flash_ms {
+            repaint_ms = Some(
+                repaint_ms
+                    .map(|current| current.min(copy_flash_ms))
+                    .unwrap_or(copy_flash_ms),
+            );
+        }
+        if !self.hidden_to_tray && (any_live_session || any_active_download) {
+            let fallback_ms = if self.low_power_renderer { 15_000 } else { 5_000 };
+            repaint_ms = Some(
+                repaint_ms
+                    .map(|current| current.min(fallback_ms))
+                    .unwrap_or(fallback_ms),
+            );
+        }
+        if let Some(repaint_ms) = repaint_ms {
+            ctx.request_repaint_after(Duration::from_millis(repaint_ms));
         }
 
         // If any SSH worker needs host-key trust confirmation, pop that modal first.
@@ -208,6 +208,7 @@ impl eframe::App for AppState {
         }
         term_font_size = term_font_size.clamp(TERM_FONT_SIZE_MIN, TERM_FONT_SIZE_MAX);
 
+        let chrome_started = Instant::now();
         paint_window_chrome(ctx, theme);
 
         // App-level title bar (used as the window chrome when native decorations are disabled).
@@ -216,10 +217,10 @@ impl eframe::App for AppState {
         egui::TopBottomPanel::top("rusty_title_bar")
             .exact_height(TITLE_BAR_H)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::NONE)
-                    .inner_margin(egui::Margin::symmetric(TITLE_PAD_X, 1.0)),
+                    .inner_margin(egui::Margin::symmetric(TITLE_PAD_X as i8, 1)),
             )
             .show(ctx, |ui| {
                 ui.visuals_mut().override_text_color = Some(theme.fg);
@@ -352,10 +353,10 @@ impl eframe::App for AppState {
             egui::TopBottomPanel::top("rusty_startup_notice")
                 .resizable(false)
                 .frame(
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(adjust_color(theme.top_bg, 0.10))
                         .stroke(Stroke::new(1.0, theme.top_border))
-                        .inner_margin(egui::Margin::symmetric(TITLE_PAD_X, 6.0)),
+                        .inner_margin(egui::Margin::symmetric(TITLE_PAD_X as i8, 6)),
                 )
                 .show(ctx, |ui| {
                     ui.visuals_mut().override_text_color = Some(theme.fg);
@@ -377,6 +378,16 @@ impl eframe::App for AppState {
                 self.startup_notice = None;
             }
         }
+        let chrome_dt = chrome_started.elapsed();
+
+        let profiles_build_started = Instant::now();
+        let profiles = self
+            .config
+            .profiles
+            .iter()
+            .map(|p| (p.name.clone(), config::write_profile_settings(p)))
+            .collect();
+        let profiles_build_dt = profiles_build_started.elapsed();
 
         let mut behavior = SshTilesBehavior::new(SshTilesBehaviorInit {
             theme,
@@ -385,30 +396,27 @@ impl eframe::App for AppState {
             term_font_size,
             allow_resize: !self.hidden_to_tray,
             focus_shade: self.config.focus_shade,
-            profiles: self
-                .config
-                .profiles
-                .iter()
-                .map(|p| (p.name.clone(), config::write_profile_settings(p)))
-                .collect(),
+            profiles,
             clipboard: &mut clipboard,
             active_tile: self.active_tile,
         });
 
+        let tree_ui_started = Instant::now();
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin {
-                        left: CONTENT_PAD,
-                        right: CONTENT_PAD,
-                        top: 0.0,
-                        bottom: CONTENT_PAD,
+                        left: CONTENT_PAD as i8,
+                        right: CONTENT_PAD as i8,
+                        top: 0,
+                        bottom: CONTENT_PAD as i8,
                     }),
             )
             .show(ctx, |ui| {
                 self.tree.ui(&mut behavior, ui);
             });
+        let tree_ui_dt = tree_ui_started.elapsed();
 
         self.active_tile = behavior.active_tile;
 
@@ -418,7 +426,39 @@ impl eframe::App for AppState {
         drop(behavior);
         self.clipboard = clipboard;
 
+        let mut action_labels: Vec<&'static str> = Vec::new();
+        let actions_started = Instant::now();
         for action in actions {
+            if action_labels.len() < 8 {
+                action_labels.push(match &action {
+                    TilesAction::NewTab { .. } => "new_tab",
+                    TilesAction::NewTabWithSettings { .. } => "new_tab_profile",
+                    TilesAction::TabActivated(_) => "tab_activated",
+                    TilesAction::Connect(_) => "connect",
+                    TilesAction::ToggleConnect(_) => "toggle_connect",
+                    TilesAction::OpenFileManager(_) => "open_file_manager",
+                    TilesAction::OpenSettings(_) => "open_settings",
+                    TilesAction::Rename(_) => "rename",
+                    TilesAction::SetColor { .. } => "set_color",
+                    TilesAction::Split { .. } => "split",
+                    TilesAction::FileRefresh { .. } => "file_refresh",
+                    TilesAction::FileUp(_) => "file_up",
+                    TilesAction::FileMkdir { .. } => "file_mkdir",
+                    TilesAction::FileRename { .. } => "file_rename",
+                    TilesAction::FileDelete { .. } => "file_delete",
+                    TilesAction::FileUploadFiles { .. } => "file_upload_files",
+                    TilesAction::FileUploadFolder { .. } => "file_upload_folder",
+                    TilesAction::FileUploadPaths { .. } => "file_upload_paths",
+                    TilesAction::FileDownload { .. } => "file_download",
+                    TilesAction::FileDownloadSelected { .. } => "file_download_selected",
+                    TilesAction::FileCopy { .. } => "file_copy",
+                    TilesAction::FileMove { .. } => "file_move",
+                    TilesAction::FileSetPermissions { .. } => "file_set_permissions",
+                    TilesAction::FileSetOwnership { .. } => "file_set_ownership",
+                    TilesAction::Close(_) => "close",
+                    TilesAction::Exit => "exit",
+                });
+            }
             match action {
                 TilesAction::NewTab {
                     tabs_container_id,
@@ -443,12 +483,11 @@ impl eframe::App for AppState {
                 }
                 TilesAction::TabActivated(tile_id) => {
                     if matches!(self.tree.tiles.get(tile_id), Some(Tile::Pane(_))) {
-                        self.active_tile = Some(tile_id);
+                        self.set_active_tile(Some(tile_id));
                         if self.terminal_pane(tile_id).is_some() {
                             self.settings_dialog.target_tile = Some(tile_id);
                             self.set_focus_next_frame(tile_id);
                         }
-                        self.layout_dirty = true;
                     }
                 }
                 TilesAction::Connect(tile_id) => {
@@ -471,7 +510,7 @@ impl eframe::App for AppState {
                         tab.start_connect();
                         tab.focus_terminal_next_frame = true;
                     }
-                    self.active_tile = Some(tile_id);
+                    self.set_active_tile(Some(tile_id));
                     self.settings_dialog.target_tile = Some(tile_id);
                 }
                 TilesAction::ToggleConnect(tile_id) => {
@@ -493,7 +532,7 @@ impl eframe::App for AppState {
                         }
                         tab.focus_terminal_next_frame = true;
                     }
-                    self.active_tile = Some(tile_id);
+                    self.set_active_tile(Some(tile_id));
                     self.settings_dialog.target_tile = Some(tile_id);
                 }
                 TilesAction::OpenSettings(tile_id) => {
@@ -600,14 +639,16 @@ impl eframe::App for AppState {
                 }
             }
         }
+        let actions_dt = actions_started.elapsed();
 
         // Ensure the active tile is still valid after actions (e.g. closing tabs).
         if let Some(active) = self.active_tile {
             if !matches!(self.tree.tiles.get(active), Some(Tile::Pane(_))) {
-                self.active_tile = self.first_pane_id();
+                self.set_active_tile(self.first_pane_id());
             }
         }
 
+        let rename_popup_started = Instant::now();
         // Rename popup (global).
         let mut rename_action: Option<(TileId, String)> = None;
         let mut close_popup = false;
@@ -659,19 +700,77 @@ impl eframe::App for AppState {
         if close_popup {
             self.rename_popup = None;
         }
+        let rename_popup_dt = rename_popup_started.elapsed();
 
         if self.minimize_to_tray_requested {
             self.minimize_to_tray_requested = false;
             self.hide_to_tray(ctx);
         }
 
+        let resize_started = Instant::now();
         handle_window_resize(ctx);
+        let resize_dt = resize_started.elapsed();
 
+        let dialogs_started = Instant::now();
         self.draw_settings_dialog(ctx);
         self.draw_host_key_dialog(ctx);
         self.draw_auth_dialog(ctx);
         self.draw_downloads_manager_window(ctx);
+        let dialogs_dt = dialogs_started.elapsed();
 
+        let save_started = Instant::now();
         self.maybe_save_session_layout(ctx);
+        let save_dt = save_started.elapsed();
+
+        let frame_dt = frame_started.elapsed();
+        if profile_enabled {
+            let hot = self.ui_profile_hot_frames > 0;
+            let log_due = hot
+                || frame_dt >= Duration::from_millis(16)
+                || message_poll_dt >= Duration::from_millis(8)
+                || chrome_dt >= Duration::from_millis(8)
+                || profiles_build_dt >= Duration::from_millis(4)
+                || tree_ui_dt >= Duration::from_millis(8)
+                || actions_dt >= Duration::from_millis(8)
+                || rename_popup_dt >= Duration::from_millis(8)
+                || resize_dt >= Duration::from_millis(8)
+                || dialogs_dt >= Duration::from_millis(8)
+                || save_dt >= Duration::from_millis(8);
+
+            if log_due {
+                let pane_count = self.pane_ids().len();
+                let action_summary = if action_labels.is_empty() {
+                    "none".to_string()
+                } else {
+                    action_labels.join(",")
+                };
+                crate::logger::log_ui_profile(&format!(
+                    "frame={} total_ms={:.2} poll_ms={:.2} chrome_ms={:.2} profiles_ms={:.2} tree_ms={:.2} actions_ms={:.2} rename_ms={:.2} resize_ms={:.2} dialogs_ms={:.2} save_ms={:.2} panes={} profiles={} live_sessions={} downloads={} active_tile={:?} hidden_to_tray={} settings_open={} downloads_open={} hot={} actions={}",
+                    frame_index,
+                    frame_dt.as_secs_f64() * 1000.0,
+                    message_poll_dt.as_secs_f64() * 1000.0,
+                    chrome_dt.as_secs_f64() * 1000.0,
+                    profiles_build_dt.as_secs_f64() * 1000.0,
+                    tree_ui_dt.as_secs_f64() * 1000.0,
+                    actions_dt.as_secs_f64() * 1000.0,
+                    rename_popup_dt.as_secs_f64() * 1000.0,
+                    resize_dt.as_secs_f64() * 1000.0,
+                    dialogs_dt.as_secs_f64() * 1000.0,
+                    save_dt.as_secs_f64() * 1000.0,
+                    pane_count,
+                    self.config.profiles.len(),
+                    live_session_count,
+                    any_active_download,
+                    self.active_tile,
+                    self.hidden_to_tray,
+                    self.settings_dialog.open,
+                    self.downloads_window_open,
+                    hot,
+                    action_summary,
+                ));
+            }
+
+            self.ui_profile_hot_frames = self.ui_profile_hot_frames.saturating_sub(1);
+        }
     }
 }

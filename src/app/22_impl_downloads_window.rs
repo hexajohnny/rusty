@@ -206,12 +206,17 @@ impl AppState {
         let bar_height = (ui.spacing().interact_size.y - 4.0).max(14.0);
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), bar_height), Sense::hover());
-        let rounding = egui::Rounding::same(4.0);
+        let rounding = egui::CornerRadius::same(4);
 
         ui.painter()
             .rect_filled(rect, rounding, adjust_color(self.theme.top_bg, 0.04));
         ui.painter()
-            .rect_stroke(rect, rounding, Stroke::new(1.0, self.theme.top_border));
+            .rect_stroke(
+                rect,
+                rounding,
+                Stroke::new(1.0, self.theme.top_border),
+                egui::StrokeKind::Inside,
+            );
 
         if frac > 0.0 {
             let fill_w = rect.width() * frac;
@@ -254,11 +259,11 @@ impl AppState {
         let btn_fill = adjust_color(theme.top_bg, 0.10);
         let controls_enabled = !embedded;
 
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(adjust_color(theme.top_bg, 0.08))
             .stroke(Stroke::new(1.0, theme.top_border))
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::symmetric(TITLE_PAD_X, 2.0))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(TITLE_PAD_X as i8, 2))
             .show(ui, |ui| {
                 ui.set_min_height(TITLE_BAR_H);
 
@@ -350,7 +355,7 @@ impl AppState {
         }
 
         egui::ScrollArea::vertical()
-            .id_source("downloads_manager_scroll")
+            .id_salt("downloads_manager_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mut cancel_ids: Vec<u64> = Vec::new();
@@ -633,14 +638,14 @@ impl AppState {
                 paint_window_chrome(ctx, self.theme);
                 handle_window_resize(ctx);
             }
-            let outer_frame = egui::Frame::none()
+            let outer_frame = egui::Frame::NONE
                 .fill(adjust_color(self.theme.top_bg, 0.06))
                 .stroke(Stroke::new(1.0, self.theme.top_border))
                 .inner_margin(egui::Margin {
-                    left: 10.0,
-                    right: 10.0,
-                    top: 4.0,
-                    bottom: 10.0,
+                    left: 10,
+                    right: 10,
+                    top: 4,
+                    bottom: 10,
                 });
             match class {
                 egui::ViewportClass::Embedded => {

@@ -30,6 +30,10 @@ impl AppState {
 
     pub fn new() -> Self {
         let _ = std::fs::create_dir_all("logs");
+        if crate::logger::ui_profile_enabled() {
+            let _ = std::fs::remove_file("logs\\ui-profile.log");
+            crate::logger::log_ui_profile(&format!("=== startup pid={} ===", std::process::id()));
+        }
         let load_outcome = config::load();
         let mut config = load_outcome.config;
         let startup_notice = load_outcome.notice;
@@ -118,6 +122,15 @@ impl AppState {
         let (theme, theme_source) =
             load_ui_theme(config.ui_theme_mode, config.ui_theme_file.as_deref());
         let mut initial_settings = ConnectionSettings::default();
+        let low_power_renderer = std::env::var_os("RUSTY_LOW_POWER_RENDERER")
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        let snap_fractional_dpi = std::env::var_os("RUSTY_RENDERER_KIND")
+            .map(|value| value == "wgpu")
+            .unwrap_or(false)
+            && std::env::var_os("RUSTY_WGPU_BACKEND")
+                .map(|value| value.to_string_lossy().eq_ignore_ascii_case("gl"))
+                .unwrap_or(false);
         let mut initial_profile_name: Option<String> = None;
         if let Some(idx) = default_profile_idx {
             let p = config.profiles[idx].clone();
@@ -227,6 +240,8 @@ impl AppState {
             last_terminal_activity: Instant::now(),
             last_download_activity: Instant::now(),
             cursor_visible: true,
+            low_power_renderer,
+            snap_fractional_dpi,
             tray: None,
             tray_events: crate::tray::install_handlers(),
             hidden_to_tray: false,
@@ -239,8 +254,13 @@ impl AppState {
             upload_conflict_dialog: None,
             pending_upload_conflict_prompts: VecDeque::new(),
             style_initialized: false,
+            style_pixels_per_point_bits: 0,
             layout_dirty: false,
+            active_tile_dirty: false,
             last_layout_save: Instant::now(),
+            last_active_tile_change: Instant::now(),
+            ui_profile_hot_frames: 0,
+            ui_profile_frame_index: 0,
             restored_window: false,
             next_sftp_request_id,
             pending_sftp_requests: HashMap::new(),
@@ -400,6 +420,7 @@ impl AppState {
             }
 
             let _ = tx.send(result);
+            crate::tray::request_app_repaint();
         });
     }
 
@@ -673,6 +694,19 @@ impl AppState {
         ctx.set_style(style);
     }
 
+    fn ensure_global_style(&mut self, ctx: &egui::Context) {
+        if !self.style_initialized {
+            egui_extras::install_image_loaders(ctx);
+            self.style_initialized = true;
+        }
+
+        let ppp_bits = ctx.pixels_per_point().to_bits();
+        if self.style_pixels_per_point_bits != ppp_bits {
+            self.apply_global_style(ctx);
+            self.style_pixels_per_point_bits = ppp_bits;
+        }
+    }
+
     fn pane_ids(&self) -> Vec<TileId> {
         self.tree
             .tiles
@@ -862,7 +896,7 @@ impl AppState {
         );
         let root = self.tree.tiles.insert_tab_tile(vec![pane_id]);
         self.tree.root = Some(root);
-        self.active_tile = Some(pane_id);
+        self.set_active_tile(Some(pane_id));
         self.settings_dialog.target_tile = Some(pane_id);
     }
 
@@ -1105,49 +1139,52 @@ impl AppState {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     }
 
+    fn snapshot_saved_window(&self, ctx: &egui::Context) -> Option<config::SavedWindow> {
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        if fullscreen {
+            return None;
+        }
+
+        let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+        let (outer, inner) = (outer?, inner?);
+        let snap = |value: f32| value.round();
+        Some(config::SavedWindow {
+            outer_pos: [snap(outer.min.x), snap(outer.min.y)],
+            inner_size: [snap(inner.width()), snap(inner.height())],
+            maximized,
+        })
+    }
+
     fn maybe_save_session_layout(&mut self, ctx: &egui::Context) {
         if !self.config.save_session_layout {
             return;
         }
 
-        // Save at most twice per second to avoid excessive disk writes.
-        if !self.layout_dirty && self.last_layout_save.elapsed() < Duration::from_secs(2) {
+        let pending_window = self.snapshot_saved_window(ctx);
+        let window_dirty = pending_window
+            .as_ref()
+            .map(|window| self.config.saved_window != Some(*window))
+            .unwrap_or(false);
+        let active_tile_save_due =
+            self.active_tile_dirty && self.last_active_tile_change.elapsed() >= Duration::from_secs(8);
+
+        if !self.layout_dirty && !window_dirty && !active_tile_save_due {
             return;
         }
         if self.last_layout_save.elapsed() < Duration::from_millis(500) {
             return;
         }
 
-        // Capture window geometry, but avoid overwriting the saved normal size while maximized/fullscreen.
-        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        if !fullscreen {
-            if let (Some(outer), Some(inner)) =
-                ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect))
-            {
-                if !maximized {
-                    self.config.saved_window = Some(config::SavedWindow {
-                        outer_pos: [outer.min.x, outer.min.y],
-                        inner_size: [inner.width(), inner.height()],
-                        maximized: false,
-                    });
-                } else if let Some(mut sw) = self.config.saved_window {
-                    sw.maximized = true;
-                    self.config.saved_window = Some(sw);
-                } else {
-                    self.config.saved_window = Some(config::SavedWindow {
-                        outer_pos: [outer.min.x, outer.min.y],
-                        inner_size: [inner.width(), inner.height()],
-                        maximized: true,
-                    });
-                }
-            }
+        if let Some(window) = pending_window {
+            self.config.saved_window = Some(window);
         }
 
         if let Some(json) = self.persist_session_tree() {
             self.config.saved_session_layout_json = Some(json);
             self.config_saver.request_save(self.config.clone());
             self.layout_dirty = false;
+            self.active_tile_dirty = false;
             self.last_layout_save = Instant::now();
         }
     }
@@ -1562,7 +1599,7 @@ impl AppState {
             self.tree.root = Some(root);
         }
 
-        self.active_tile = Some(pane_id);
+        self.set_active_tile(Some(pane_id));
         self.settings_dialog.target_tile = Some(source_tile);
         if source_connected {
             let _ = self.attach_file_manager_to_source(pane_id);
@@ -3072,6 +3109,25 @@ impl AppState {
         }
     }
 
+    fn note_ui_profile_activity(&mut self, reason: &str) {
+        if crate::logger::ui_profile_enabled() {
+            self.ui_profile_hot_frames = self.ui_profile_hot_frames.max(90);
+            crate::logger::log_ui_profile(&format!(
+                "activity frame={} active_tile={:?} reason={reason}",
+                self.ui_profile_frame_index, self.active_tile
+            ));
+        }
+    }
+
+    fn set_active_tile(&mut self, tile_id: Option<TileId>) {
+        if self.active_tile != tile_id {
+            self.active_tile = tile_id;
+            self.active_tile_dirty = true;
+            self.last_active_tile_change = Instant::now();
+            self.note_ui_profile_activity(&format!("set_active_tile -> {tile_id:?}"));
+        }
+    }
+
     fn clear_transient_prompts_for_tile(&mut self, tile_id: TileId) {
         if self
             .auth_dialog
@@ -3119,10 +3175,7 @@ impl AppState {
                 }
             });
 
-        if self.active_tile != Some(next_tile) {
-            self.layout_dirty = true;
-        }
-        self.active_tile = Some(next_tile);
+        self.set_active_tile(Some(next_tile));
         self.settings_dialog.target_tile = Some(next_tile);
         self.set_focus_next_frame(next_tile);
         true
@@ -3196,7 +3249,7 @@ impl AppState {
             self.tree.root = Some(root);
         }
 
-        self.active_tile = Some(pane_id);
+        self.set_active_tile(Some(pane_id));
         self.settings_dialog.target_tile = Some(pane_id);
         if let Some((worker_tx, connection_group_id)) = shared_session {
             if let Some(tab) = self.terminal_pane_mut(pane_id) {
@@ -3397,7 +3450,7 @@ impl AppState {
             self.tree.root = Some(root);
         }
 
-        self.active_tile = Some(pane_id);
+        self.set_active_tile(Some(pane_id));
         self.settings_dialog.target_tile = Some(pane_id);
 
         // If the profile is incomplete (e.g. missing username), prompt immediately instead of
@@ -3429,7 +3482,7 @@ impl AppState {
         }
 
         if self.active_tile == Some(pane_id) {
-            self.active_tile = self.first_pane_id();
+            self.set_active_tile(self.first_pane_id());
         }
         if self.settings_dialog.target_tile == Some(pane_id) {
             self.settings_dialog.target_tile = self.active_tile;
@@ -3521,7 +3574,7 @@ impl AppState {
             self.tree.root = Some(new_linear_id);
         }
 
-        self.active_tile = Some(new_pane_id);
+        self.set_active_tile(Some(new_pane_id));
         self.settings_dialog.target_tile = Some(new_pane_id);
         if let Some((worker_tx, connection_group_id)) = shared_session {
             if let Some(tab) = self.terminal_pane_mut(new_pane_id) {

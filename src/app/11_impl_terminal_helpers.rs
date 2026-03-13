@@ -26,9 +26,19 @@ impl AppState {
         (abs_row, col)
     }
 
-    fn cell_metrics(ctx: &egui::Context, font_id: &FontId) -> (f32, f32) {
+    fn cell_metrics(tab: &mut SshTab, ctx: &egui::Context, font_id: &FontId) -> (f32, f32) {
+        let font_size_bits = font_id.size.to_bits();
+        let pixels_per_point_bits = ctx.pixels_per_point().to_bits();
+        if let Some(cache) = tab.cell_metrics_cache.as_ref() {
+            if cache.font_size_bits == font_size_bits
+                && cache.pixels_per_point_bits == pixels_per_point_bits
+            {
+                return (cache.cell_w, cache.cell_h);
+            }
+        }
+
         let ppp = ctx.pixels_per_point();
-        ctx.fonts(|fonts| {
+        let (cell_w, cell_h) = ctx.fonts_mut(|fonts| {
             // Derive metrics from actual layout to better match pixel snapping in the text renderer.
             let sample = "WWWWWWWWWWWWWWWW";
             let galley = fonts.layout_no_wrap(sample.to_string(), font_id.clone(), Color32::WHITE);
@@ -41,7 +51,42 @@ impl AppState {
             w = w_px / ppp;
             h = h_px / ppp;
             (w, h)
-        })
+        });
+        tab.cell_metrics_cache = Some(CellMetricsCache {
+            font_size_bits,
+            pixels_per_point_bits,
+            cell_w,
+            cell_h,
+        });
+        (cell_w, cell_h)
+    }
+
+    fn terminal_galley(
+        ui: &egui::Ui,
+        tab: &mut SshTab,
+        font_id: &FontId,
+        term_theme: &TermTheme,
+    ) -> Arc<egui::Galley> {
+        let font_size_bits = font_id.size.to_bits();
+        let pixels_per_point_bits = ui.ctx().pixels_per_point().to_bits();
+        if let Some(cache) = tab.render_cache.as_ref() {
+            if cache.font_size_bits == font_size_bits
+                && cache.pixels_per_point_bits == pixels_per_point_bits
+                && cache.term_theme == *term_theme
+            {
+                return cache.galley.clone();
+            }
+        }
+
+        let job = Self::screen_to_layout_job(&tab.screen, font_id.clone(), term_theme);
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        tab.render_cache = Some(TerminalRenderCache {
+            font_size_bits,
+            pixels_per_point_bits,
+            term_theme: *term_theme,
+            galley: galley.clone(),
+        });
+        galley
     }
 
     fn vt_color_to_color32(c: crate::terminal_emulator::Color, default: Color32, term_theme: &TermTheme) -> Color32 {
@@ -159,6 +204,7 @@ impl AppState {
     fn set_scrollback(tab: &mut SshTab, rows: usize) {
         let target = rows.min(tab.scrollback_max);
         tab.screen.set_scrollback(target);
+        tab.invalidate_terminal_render_cache();
         tab.pending_scrollback = Some(target);
     }
 
@@ -232,13 +278,13 @@ impl AppState {
 
         if ui.add_enabled(can_copy, egui::Button::new("Copy")).clicked() {
             Self::copy_selection_with_flash(ctx, clipboard, tab, selected_text);
-            ui.close_menu();
+            ui.close();
         }
 
         if ui.add_enabled(tab.connected, egui::Button::new("Paste")).clicked() {
             Self::paste_from_clipboard(tab, clipboard);
             tab.pending_remote_click = None;
-            ui.close_menu();
+            ui.close();
         }
 
         ui.separator();
@@ -248,12 +294,12 @@ impl AppState {
             .clicked()
         {
             Self::select_all(tab);
-            ui.close_menu();
+            ui.close();
         }
     }
 
     fn copy_text_to_clipboard(ctx: &egui::Context, clipboard: &mut Option<Clipboard>, text: String) {
-        ctx.output_mut(|o| o.copied_text = text.clone());
+        ctx.copy_text(text.clone());
         if let Some(cb) = clipboard.as_mut() {
             let _ = cb.set_text(text);
         }
@@ -615,7 +661,7 @@ impl AppState {
         let primary_down = ui.input(|i| i.pointer.primary_down());
         let primary_released = ui.input(|i| i.pointer.primary_released());
         let hovering_term = pointer_pos.map(|pos| term_rect.contains(pos)).unwrap_or(false) || response.hovered();
-        let context_menu_open = ctx.is_context_menu_open();
+        let context_menu_open = ctx.is_popup_open();
 
         if response.middle_clicked() && tab.connected {
             Self::paste_from_clipboard(tab, clipboard);
@@ -683,7 +729,7 @@ impl AppState {
             // can keep scrolling on repaint ticks even after wheel input has stopped.
             let mut dy = 0.0f32;
             for ev in events.iter() {
-                if let egui::Event::Scroll(delta) = ev {
+                if let egui::Event::MouseWheel { delta, .. } = ev {
                     dy += delta.y;
                 }
             }
@@ -1078,14 +1124,14 @@ impl AppState {
 
         let mut row_idx: Option<usize> = None;
         for (i, row) in galley.rows.iter().take(usable_rows).enumerate() {
-            if y >= row.rect.top() && y < row.rect.bottom() {
+            if y >= row.rect().top() && y < row.rect().bottom() {
                 row_idx = Some(i);
                 break;
             }
         }
 
         let row_idx = row_idx.unwrap_or_else(|| {
-            if y >= galley.rows[usable_rows - 1].rect.bottom() {
+            if y >= galley.rows[usable_rows - 1].rect().bottom() {
                 usable_rows - 1
             } else {
                 0
@@ -1364,11 +1410,16 @@ impl AppState {
             let end_i = Self::col_to_char_index(&map, end_col.saturating_add(1));
             let x0 = origin.x + row_g.x_offset(start_i);
             let x1 = origin.x + row_g.x_offset(end_i);
-            let y0 = origin.y + row_g.rect.top();
-            let y1 = origin.y + row_g.rect.bottom();
+            let y0 = origin.y + row_g.rect().top();
+            let y1 = origin.y + row_g.rect().bottom();
             let rect = Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1));
             painter.rect_filled(rect, 0.0, selection_bg);
-            painter.rect_stroke(rect, 0.0, Stroke::new(1.0, with_alpha(term_theme.selection_fg, 70)));
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(1.0, with_alpha(term_theme.selection_fg, 70)),
+                egui::StrokeKind::Inside,
+            );
         }
     }
 
@@ -1409,7 +1460,7 @@ impl AppState {
         let w = (x1 - x0).max(2.0 / ppp.max(1.0));
 
         let thickness = (2.0 * ppp).round().max(1.0) / ppp.max(1.0);
-        let y1 = origin.y + row_g.rect.bottom();
+        let y1 = origin.y + row_g.rect().bottom();
         let rect = Rect::from_min_size(Pos2::new(x0, y1 - thickness), Vec2::new(w, thickness));
         painter.rect_filled(rect, 0.0, cursor_color);
     }

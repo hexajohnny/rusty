@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
-  <?define Version="0.1.5" ?>
+  <?define Version="0.1.6" ?>
   <?define MsiX86="dist\\Rusty-$(var.Version)-x86.msi" ?>
   <?define MsiX64="dist\\Rusty-$(var.Version)-x64.msi" ?>
 
