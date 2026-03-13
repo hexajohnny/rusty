@@ -1,4 +1,40 @@
 impl AppState {
+    fn request_close_downloads_window(&mut self) {
+        if let Some(dialog) = self.upload_conflict_dialog.as_ref() {
+            self.respond_to_upload_conflict(
+                dialog.prompt.request_id,
+                ssh::UploadConflictChoice::CancelTransfer,
+                false,
+            );
+            self.open_downloads_window();
+            return;
+        }
+        self.downloads_window_open = false;
+        self.transfer_delete_dialog = None;
+    }
+
+    fn format_transfer_size(value: u64) -> String {
+        let kilobytes = value as f64 / 1024.0;
+        if kilobytes >= 1024.0 * 1024.0 {
+            format!("{:.2} GB", kilobytes / (1024.0 * 1024.0))
+        } else if kilobytes >= 1024.0 {
+            format!("{:.1} MB", kilobytes / 1024.0)
+        } else {
+            format!("{:.1} KB", kilobytes)
+        }
+    }
+
+    fn format_transfer_speed(speed_bps: f64) -> String {
+        let kilobytes_per_second = speed_bps / 1024.0;
+        if kilobytes_per_second >= 1024.0 * 1024.0 {
+            format!("{:.2} GB/s", kilobytes_per_second / (1024.0 * 1024.0))
+        } else if kilobytes_per_second >= 1024.0 {
+            format!("{:.1} MB/s", kilobytes_per_second / 1024.0)
+        } else {
+            format!("{:.1} KB/s", kilobytes_per_second)
+        }
+    }
+
     fn draw_transfer_delete_dialog(&mut self, ctx: &egui::Context) {
         let Some(request_id) = self.transfer_delete_dialog.as_ref().map(|d| d.request_id) else {
             return;
@@ -26,7 +62,7 @@ impl AppState {
                 let is_running = matches!(job.state, DownloadState::Queued | DownloadState::Running);
                 ui.label(match job.direction {
                     TransferDirection::Download => {
-                        "Delete local file and remove this transfer from history?"
+                        "Delete the local download target and remove this transfer from history?"
                     }
                     TransferDirection::Upload => {
                         "Remove this transfer from history?"
@@ -37,12 +73,14 @@ impl AppState {
                 ui.label(format!("Local: {}", job.local_path));
                 if job.direction == TransferDirection::Download {
                     ui.label(
-                        egui::RichText::new("The local file will be deleted if it exists.")
+                        egui::RichText::new(
+                            "The local file or directory will be deleted if it exists.",
+                        )
                             .color(self.theme.muted),
                     );
                 } else {
                     ui.label(
-                        egui::RichText::new("The local file will not be deleted.")
+                        egui::RichText::new("The local download target will not be deleted.")
                             .color(self.theme.muted),
                     );
                 }
@@ -79,6 +117,83 @@ impl AppState {
         }
     }
 
+    fn draw_upload_conflict_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.upload_conflict_dialog.as_ref() else {
+            return;
+        };
+
+        let prompt = dialog.prompt.clone();
+        if !self
+            .download_jobs
+            .iter()
+            .any(|job| job.request_id == prompt.request_id)
+        {
+            self.clear_upload_conflict_request(prompt.request_id);
+            return;
+        }
+
+        let mut open = true;
+        let mut apply_to_all = dialog.apply_to_all;
+        let mut choice: Option<ssh::UploadConflictChoice> = None;
+        egui::Window::new("Upload Conflict")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Remote file already exists ({}/{}).",
+                    prompt.conflict_index, prompt.conflict_total
+                ));
+                ui.add_space(4.0);
+                ui.label(format!("Remote: {}", prompt.remote_path));
+                ui.label(format!("Local: {}", prompt.local_path));
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Existing folders are kept in place automatically. This prompt only applies to files.",
+                    )
+                    .color(self.theme.muted),
+                );
+                ui.checkbox(
+                    &mut apply_to_all,
+                    "Use this choice for the rest of this upload",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Skip").clicked() {
+                        choice = Some(ssh::UploadConflictChoice::Skip);
+                    }
+                    if ui.button("Overwrite If Different").clicked() {
+                        choice = Some(ssh::UploadConflictChoice::OverwriteIfDifferent);
+                    }
+                    if ui.button("Cancel Upload").clicked() {
+                        choice = Some(ssh::UploadConflictChoice::CancelTransfer);
+                    }
+                });
+            });
+
+        if let Some(dialog) = self.upload_conflict_dialog.as_mut() {
+            dialog.apply_to_all = apply_to_all;
+        }
+
+        if !open {
+            choice = Some(ssh::UploadConflictChoice::CancelTransfer);
+        }
+
+        if let Some(choice) = choice {
+            self.respond_to_upload_conflict(
+                prompt.request_id,
+                choice,
+                if choice == ssh::UploadConflictChoice::CancelTransfer {
+                    false
+                } else {
+                    apply_to_all
+                },
+            );
+        }
+    }
+
     fn draw_transfer_progress_bar(
         &self,
         ui: &mut egui::Ui,
@@ -86,6 +201,7 @@ impl AppState {
         text: &str,
         rtl_fill: bool,
     ) {
+        let has_percent = frac.is_some();
         let frac = frac.unwrap_or(0.0).clamp(0.0, 1.0);
         let bar_height = (ui.spacing().interact_size.y - 4.0).max(14.0);
         let (rect, _) =
@@ -114,7 +230,7 @@ impl AppState {
                 .rect_filled(fill_rect, rounding, self.theme.accent);
         }
 
-        let label = if frac > 0.0 {
+        let label = if has_percent {
             format!("{text} ({:.0}%)", frac * 100.0)
         } else {
             text.to_string()
@@ -174,8 +290,7 @@ impl AppState {
                         );
                         title_controls_hot |= close_resp.hovered();
                         if close_resp.clicked() {
-                            self.downloads_window_open = false;
-                            self.transfer_delete_dialog = None;
+                            self.request_close_downloads_window();
                         }
 
                         if controls_enabled {
@@ -336,7 +451,7 @@ impl AppState {
                                             .tint(self.theme.fg);
                                     let retry_hover_text = match job.direction {
                                         TransferDirection::Download => "Retry and resume partial download",
-                                        TransferDirection::Upload => "Retry upload",
+                                        TransferDirection::Upload => "Retry and resume partial upload",
                                     };
                                     if title_bar_image_button(
                                         ui,
@@ -391,10 +506,20 @@ impl AppState {
                             );
                         });
 
-                        let progress_text = if let Some(total) = job.total_bytes {
-                            format!("{}/{} bytes", job.downloaded_bytes, total)
+                        let progress_text = if matches!(job.state, DownloadState::Running)
+                            && job.total_bytes.is_none()
+                            && job.downloaded_bytes == 0
+                            && !job.message.trim().is_empty()
+                        {
+                            job.message.clone()
+                        } else if let Some(total) = job.total_bytes {
+                            format!(
+                                "{} / {}",
+                                Self::format_transfer_size(job.downloaded_bytes),
+                                Self::format_transfer_size(total)
+                            )
                         } else {
-                            format!("{} bytes", job.downloaded_bytes)
+                            Self::format_transfer_size(job.downloaded_bytes)
                         };
                         if let Some(total) = job.total_bytes {
                             let frac = if total == 0 {
@@ -418,13 +543,7 @@ impl AppState {
                         }
 
                         let speed_text = if job.speed_bps > 0.0 {
-                            if job.speed_bps >= 1_000_000.0 {
-                                format!("{:.2} MB/s", job.speed_bps / 1_000_000.0)
-                            } else if job.speed_bps >= 1_000.0 {
-                                format!("{:.1} KB/s", job.speed_bps / 1_000.0)
-                            } else {
-                                format!("{:.0} B/s", job.speed_bps)
-                            }
+                            Self::format_transfer_speed(job.speed_bps)
                         } else {
                             "-".to_string()
                         };
@@ -436,10 +555,14 @@ impl AppState {
                             );
                             if !job.message.trim().is_empty() {
                                 ui.separator();
+                                let message_color = job
+                                    .issue_kind
+                                    .map(|kind| issue_kind_color(self.theme, kind))
+                                    .unwrap_or(self.theme.muted);
                                 ui.label(
                                     egui::RichText::new(&job.message)
                                         .size(11.0)
-                                        .color(self.theme.muted),
+                                        .color(message_color),
                                 );
                             }
                         });
@@ -482,7 +605,7 @@ impl AppState {
             return;
         }
 
-        let viewport_id = egui::ViewportId::from_hash_of("rusty_transfers_viewport");
+        let viewport_id = transfers_viewport_id();
         let force_front = self.downloads_window_just_opened;
         let mut builder = egui::ViewportBuilder::default()
             .with_title("Rusty Transfers")
@@ -500,8 +623,7 @@ impl AppState {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             if ctx.input(|i| i.viewport().close_requested()) {
-                self.downloads_window_open = false;
-                self.transfer_delete_dialog = None;
+                self.request_close_downloads_window();
             }
             if !self.downloads_window_open {
                 return;
@@ -534,8 +656,7 @@ impl AppState {
                             self.draw_downloads_manager_contents(ui);
                         });
                     if !open {
-                        self.downloads_window_open = false;
-                        self.transfer_delete_dialog = None;
+                        self.request_close_downloads_window();
                     }
                 }
                 _ => {
@@ -549,6 +670,7 @@ impl AppState {
                 }
             }
             self.draw_transfer_delete_dialog(ctx);
+            self.draw_upload_conflict_dialog(ctx);
         });
         self.downloads_window_just_opened = false;
     }

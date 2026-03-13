@@ -50,6 +50,51 @@ impl AppState {
             .unwrap_or_else(|_| format!("{unix}"))
     }
 
+    fn file_permissions_label(permissions: Option<u32>) -> String {
+        permissions
+            .map(|mode| format!("{:04o}", mode & 0o7777))
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    fn file_owner_segment(name: Option<&str>, id: Option<u32>, label: &str) -> String {
+        match (name.filter(|value| !value.trim().is_empty()), id) {
+            (Some(name), Some(id)) => format!("{name} ({id})"),
+            (Some(name), None) => name.to_string(),
+            (None, Some(id)) => id.to_string(),
+            (None, None) => label.to_string(),
+        }
+    }
+
+    fn file_ownership_label(entry: &ssh::SftpEntry) -> String {
+        format!(
+            "{}:{}",
+            Self::file_owner_segment(entry.user.as_deref(), entry.uid, "owner -"),
+            Self::file_owner_segment(entry.group.as_deref(), entry.gid, "group -"),
+        )
+    }
+
+    fn parse_permission_mode(raw: &str) -> Option<u32> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let raw = raw
+            .strip_prefix("0o")
+            .or_else(|| raw.strip_prefix("0O"))
+            .or_else(|| raw.strip_prefix('0'))
+            .filter(|trimmed| !trimmed.is_empty())
+            .unwrap_or(raw);
+        (!raw.is_empty() && raw.len() <= 4 && raw.chars().all(|ch| matches!(ch, '0'..='7')))
+            .then(|| u32::from_str_radix(raw, 8).ok())
+            .flatten()
+            .filter(|mode| *mode <= 0o7777)
+    }
+
+    fn normalize_optional_remote_name(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
     fn file_manager_view(
         ui: &mut egui::Ui,
         pane: &mut SshTab,
@@ -84,7 +129,9 @@ impl AppState {
             );
             if !file.status.trim().is_empty() {
                 ui.separator();
-                ui.label(egui::RichText::new(&file.status).color(theme.muted));
+                ui.label(
+                    egui::RichText::new(&file.status).color(issue_kind_color(theme, file.status_kind)),
+                );
             }
         });
 
@@ -118,60 +165,62 @@ impl AppState {
         });
 
         content.add_space(4.0);
-        let selected_name = file.selected_name.clone();
-        let selected_entry = selected_name
-            .as_ref()
-            .and_then(|name| file.entries.iter().find(|e| e.file_name == name.as_str()));
-        let selected_downloadable = selected_entry.map(|e| !e.is_dir).unwrap_or(false);
-        let selected_is_dir = selected_entry.map(|e| e.is_dir).unwrap_or(false);
-        let selected_any = selected_name.is_some();
-        content.horizontal(|ui| {
+        let selected_names = file.selected_names_in_entry_order();
+        let selected_count = selected_names.len();
+        let selected_any = file.has_selection();
+        let single_selected_name = file.single_selected_name();
+        content.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!file.busy, egui::Button::new("Upload"))
-                .on_hover_text("Upload a local file to the current remote directory")
+                .add_enabled(!file.busy, rounded_button("Upload Files"))
+                .on_hover_text("Pick one or more local files to upload")
                 .clicked()
             {
-                actions.push(TilesAction::FileUpload { pane_id: tile_id });
+                actions.push(TilesAction::FileUploadFiles { pane_id: tile_id });
             }
             if ui
-                .add_enabled(
-                    !file.busy && selected_downloadable,
-                    rounded_button("Download"),
-                )
+                .add_enabled(!file.busy, rounded_button("Upload Folder"))
+                .on_hover_text("Pick a local folder and upload it recursively")
                 .clicked()
             {
-                if let Some(name) = file.selected_name.clone() {
-                    actions.push(TilesAction::FileDownload {
-                        pane_id: tile_id,
-                        name,
-                    });
-                }
+                actions.push(TilesAction::FileUploadFolder { pane_id: tile_id });
             }
-
             if ui
-                .add_enabled(!file.busy && selected_any, rounded_button("Rename"))
+                .add_enabled(!file.busy && selected_any, rounded_button("Download"))
+                .on_hover_text("Download the selected files and folders")
                 .clicked()
             {
-                if let Some(name) = selected_name.as_ref() {
+                actions.push(TilesAction::FileDownloadSelected { pane_id: tile_id });
+            }
+            if ui
+                .add_enabled(!file.busy && selected_any, rounded_button("Copy"))
+                .on_hover_text("Copy the selected items to another remote folder")
+                .clicked()
+            {
+                file.open_batch_destination_dialog(FileBatchDestinationMode::Copy);
+            }
+            if ui
+                .add_enabled(!file.busy && selected_any, rounded_button("Move"))
+                .on_hover_text("Move the selected items to another remote folder")
+                .clicked()
+            {
+                file.open_batch_destination_dialog(FileBatchDestinationMode::Move);
+            }
+            if ui
+                .add_enabled(!file.busy && selected_count == 1, rounded_button("Rename"))
+                .clicked()
+            {
+                if let Some(name) = single_selected_name.as_ref() {
                     file.rename_from = Some(name.clone());
                     file.rename_to = name.clone();
                     file.rename_dialog_open = true;
                 }
             }
-
             if ui
                 .add_enabled(!file.busy && selected_any, rounded_button("Delete"))
                 .clicked()
             {
-                if let Some(name) = selected_name.as_ref() {
-                    actions.push(TilesAction::FileDelete {
-                        pane_id: tile_id,
-                        name: name.clone(),
-                        is_dir: selected_is_dir,
-                    });
-                }
+                file.open_delete_confirm(selected_names.clone());
             }
-
             if ui
                 .add_enabled(!file.busy, rounded_button("Mkdir"))
                 .clicked()
@@ -187,6 +236,14 @@ impl AppState {
             let count = file.entries.len();
             let suffix = if count == 1 { "" } else { "s" };
             ui.label(egui::RichText::new(format!("{count} item{suffix}")).color(theme.muted));
+            if selected_any {
+                ui.separator();
+                let selected_suffix = if selected_count == 1 { "" } else { "s" };
+                ui.label(
+                    egui::RichText::new(format!("{selected_count} selected item{selected_suffix}"))
+                        .color(theme.accent),
+                );
+            }
         });
         content.add_space(6.0);
 
@@ -206,6 +263,8 @@ impl AppState {
                 let file_icon = egui::Image::new(egui::include_image!("../../assets/file.png"));
                 let card_size = Vec2::new(102.0, 92.0);
                 let icon_size = Vec2::splat(32.0);
+                let ordered_names: Vec<String> =
+                    entries.iter().map(|entry| entry.file_name.clone()).collect();
 
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
@@ -232,14 +291,14 @@ impl AppState {
                         icon.paint_at(ui, icon_rect);
                         ui.add_space(3.0);
                         ui.label(egui::RichText::new("..").color(theme.fg).strong());
-                        ui.label(
-                            egui::RichText::new("Parent folder")
-                                .color(theme.muted)
-                                .size(10.0),
+                            ui.label(
+                                egui::RichText::new("Parent folder")
+                                    .color(theme.muted)
+                                    .size(10.0),
                         );
                     });
                     if up_resp.clicked() || up_resp.double_clicked() {
-                        file.selected_name = None;
+                        file.clear_selection();
                         actions.push(TilesAction::FileUp(tile_id));
                     }
                     up_resp.context_menu(|ui| {
@@ -250,19 +309,17 @@ impl AppState {
                     });
 
                     for entry in entries {
-                        let selected = file
-                            .selected_name
-                            .as_deref()
-                            .map(|s| s == entry.file_name.as_str())
-                            .unwrap_or(false);
+                        let selected = file.selected_names.contains(&entry.file_name);
 
                         let (rect, base_resp) = ui.allocate_exact_size(card_size, Sense::click());
                         let hover_text = format!(
-                            "{}\nType: {}\nSize: {}\nModified: {}",
+                            "{}\nType: {}\nSize: {}\nModified: {}\nOwnership: {}\nPermissions: {}",
                             entry.file_name,
                             if entry.is_dir { "Folder" } else { "File" },
                             Self::file_size_label(entry.size, entry.is_dir),
                             Self::file_modified_label(entry.modified_unix),
+                            Self::file_ownership_label(&entry),
+                            Self::file_permissions_label(entry.permissions),
                         );
                         let resp = base_resp.on_hover_text(hover_text);
 
@@ -318,7 +375,16 @@ impl AppState {
                         });
 
                         if resp.clicked() {
-                            file.selected_name = Some(entry.file_name.clone());
+                            let modifiers = ui.input(|i| i.modifiers);
+                            file.apply_selection_click(
+                                &entry.file_name,
+                                &ordered_names,
+                                modifiers.command || modifiers.ctrl,
+                                modifiers.shift,
+                            );
+                        }
+                        if resp.secondary_clicked() && !selected {
+                            file.set_single_selection(entry.file_name.clone());
                         }
                         if resp.double_clicked() {
                             if entry.is_dir {
@@ -335,16 +401,15 @@ impl AppState {
                             }
                         }
                         resp.context_menu(|ui| {
-                            if entry.is_dir {
-                                if ui.button("Open").clicked() {
-                                    let path = Self::join_remote_path(&file.cwd, &entry.file_name);
-                                    actions.push(TilesAction::FileRefresh {
-                                        pane_id: tile_id,
-                                        path,
-                                    });
-                                    ui.close_menu();
-                                }
-                            } else if ui.button("Download").clicked() {
+                            if entry.is_dir && ui.button("Open").clicked() {
+                                let path = Self::join_remote_path(&file.cwd, &entry.file_name);
+                                actions.push(TilesAction::FileRefresh {
+                                    pane_id: tile_id,
+                                    path,
+                                });
+                                ui.close_menu();
+                            }
+                            if ui.button("Download").clicked() {
                                 actions.push(TilesAction::FileDownload {
                                     pane_id: tile_id,
                                     name: entry.file_name.clone(),
@@ -353,26 +418,84 @@ impl AppState {
                             }
 
                             ui.separator();
-                            if ui.button("Rename").clicked() {
-                                file.selected_name = Some(entry.file_name.clone());
-                                file.rename_from = Some(entry.file_name.clone());
-                                file.rename_to = entry.file_name.clone();
+                            if ui.button("Copy to...").clicked() {
+                                file.open_batch_destination_dialog(FileBatchDestinationMode::Copy);
+                                ui.close_menu();
+                            }
+                            if ui.button("Move to...").clicked() {
+                                file.open_batch_destination_dialog(FileBatchDestinationMode::Move);
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(file.selected_count() == 1, egui::Button::new("Rename"))
+                                .clicked()
+                            {
+                                if let Some(name) = file.single_selected_name() {
+                                    file.rename_from = Some(name.clone());
+                                    file.rename_to = name;
+                                }
                                 file.rename_dialog_open = true;
                                 ui.close_menu();
                             }
                             if ui.button("Delete").clicked() {
-                                file.selected_name = Some(entry.file_name.clone());
-                                actions.push(TilesAction::FileDelete {
-                                    pane_id: tile_id,
-                                    name: entry.file_name.clone(),
-                                    is_dir: entry.is_dir,
-                                });
+                                file.open_delete_confirm(file.selected_names_in_entry_order());
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Change Permissions...").clicked() {
+                                file.open_permissions_dialog(file.selected_names_in_entry_order());
+                                ui.close_menu();
+                            }
+                            if ui.button("Change Ownership...").clicked() {
+                                file.open_ownership_dialog(file.selected_names_in_entry_order());
                                 ui.close_menu();
                             }
                         });
                     }
                 });
             });
+
+        let drop_hover_paths: Vec<PathBuf> = ui
+            .ctx()
+            .input(|i| i.raw.hovered_files.iter().filter_map(|file| file.path.clone()).collect());
+        let dropped_paths: Vec<PathBuf> = ui
+            .ctx()
+            .input(|i| i.raw.dropped_files.iter().filter_map(|file| file.path.clone()).collect());
+        let pointer_inside = ui
+            .ctx()
+            .input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()))
+            .map(|pos| rect.contains(pos))
+            .unwrap_or(false);
+        if !file.busy && pointer_inside && !drop_hover_paths.is_empty() {
+            ui.painter().rect_filled(
+                rect.shrink(4.0),
+                10.0,
+                Color32::from_rgba_premultiplied(
+                    theme.accent.r(),
+                    theme.accent.g(),
+                    theme.accent.b(),
+                    32,
+                ),
+            );
+            ui.painter().rect_stroke(
+                rect.shrink(4.0),
+                10.0,
+                Stroke::new(2.0, theme.accent),
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop files or folders to upload",
+                FontId::proportional(16.0),
+                theme.fg,
+            );
+        }
+        if !file.busy && pointer_inside && !dropped_paths.is_empty() {
+            actions.push(TilesAction::FileUploadPaths {
+                pane_id: tile_id,
+                paths: dropped_paths,
+            });
+        }
 
         if file.rename_dialog_open {
             let mut open = true;
@@ -420,6 +543,273 @@ impl AppState {
                     }
                 }
                 file.rename_dialog_open = false;
+            }
+        }
+
+        if let Some(delete_confirm) = file.delete_confirm.clone() {
+            let mut open = true;
+            let mut confirm = false;
+            let mut cancel = false;
+            let delete_count = delete_confirm.names.len();
+            let delete_suffix = if delete_count == 1 { "" } else { "s" };
+            let delete_has_dirs = file.entries.iter().any(|entry| {
+                entry.is_dir && delete_confirm.names.iter().any(|name| name == &entry.file_name)
+            });
+            egui::Window::new("Confirm Delete")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "Delete {delete_count} selected item{delete_suffix} from the remote server?"
+                    ));
+                    ui.add_space(4.0);
+                    if delete_count == 1 {
+                        ui.label(format!("Name: {}", delete_confirm.names[0]));
+                    } else {
+                        ui.label(format!("First item: {}", delete_confirm.names[0]));
+                        ui.label(format!("Total selected: {delete_count}"));
+                    }
+                    let warning = if delete_has_dirs {
+                        "Folders will be deleted recursively. This cannot be undone."
+                    } else {
+                        "This cannot be undone."
+                    };
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(warning).color(theme.muted));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                        if ui.button("Delete").clicked() {
+                            confirm = true;
+                        }
+                    });
+                });
+
+            if !open || cancel {
+                file.delete_confirm = None;
+            } else if confirm {
+                actions.push(TilesAction::FileDelete {
+                    pane_id: tile_id,
+                    names: delete_confirm.names,
+                });
+                file.delete_confirm = None;
+            }
+        }
+
+        if let Some(mut permissions_dialog) = file.permissions_dialog.clone() {
+            let mut open = true;
+            let mut confirm = false;
+            let mut cancel = false;
+            let mut parsed_mode = Self::parse_permission_mode(&permissions_dialog.mode);
+            let selected_count = permissions_dialog.names.len();
+            let suffix = if selected_count == 1 { "" } else { "s" };
+            egui::Window::new("Change Permissions")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "Apply a new mode to {selected_count} selected item{suffix}:"
+                    ));
+                    if selected_count == 1 {
+                        ui.label(format!("Name: {}", permissions_dialog.names[0]));
+                    }
+                    ui.add_space(4.0);
+                    ui.label("Mode (octal):");
+                    let edit = ui.text_edit_singleline(&mut permissions_dialog.mode);
+                    parsed_mode = Self::parse_permission_mode(&permissions_dialog.mode);
+                    if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        confirm = true;
+                    }
+                    ui.label(
+                        egui::RichText::new("Use octal values like 755, 0644, or 1777.")
+                            .color(theme.muted),
+                    );
+                    if !permissions_dialog.mode.trim().is_empty() && parsed_mode.is_none() {
+                        ui.label(
+                            egui::RichText::new("Enter a valid octal mode.")
+                                .color(issue_kind_color(theme, ssh::IssueKind::Configuration)),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                        if ui
+                            .add_enabled(parsed_mode.is_some(), egui::Button::new("Apply"))
+                            .clicked()
+                        {
+                            confirm = true;
+                        }
+                    });
+                });
+
+            if !open || cancel {
+                file.permissions_dialog = None;
+            } else if confirm {
+                if let Some(mode) = Self::parse_permission_mode(&permissions_dialog.mode) {
+                    actions.push(TilesAction::FileSetPermissions {
+                        pane_id: tile_id,
+                        names: permissions_dialog.names,
+                        mode,
+                    });
+                    file.permissions_dialog = None;
+                } else {
+                    file.permissions_dialog = Some(permissions_dialog);
+                }
+            } else {
+                file.permissions_dialog = Some(permissions_dialog);
+            }
+        }
+
+        if let Some(mut ownership_dialog) = file.ownership_dialog.clone() {
+            let mut open = true;
+            let mut confirm = false;
+            let mut cancel = false;
+            let mut has_change =
+                !ownership_dialog.owner.trim().is_empty() || !ownership_dialog.group.trim().is_empty();
+            let selected_count = ownership_dialog.names.len();
+            let suffix = if selected_count == 1 { "" } else { "s" };
+            egui::Window::new("Change Ownership")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "Apply new ownership to {selected_count} selected item{suffix}:"
+                    ));
+                    if selected_count == 1 {
+                        ui.label(format!("Name: {}", ownership_dialog.names[0]));
+                    }
+                    ui.add_space(4.0);
+                    ui.label("Owner:");
+                    ui.text_edit_singleline(&mut ownership_dialog.owner);
+                    ui.label("Group:");
+                    let edit = ui.text_edit_singleline(&mut ownership_dialog.group);
+                    has_change =
+                        !ownership_dialog.owner.trim().is_empty()
+                            || !ownership_dialog.group.trim().is_empty();
+                    if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        confirm = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Use remote user/group names when available. Leave either field blank to keep it unchanged.",
+                        )
+                            .color(theme.muted),
+                    );
+                    if !has_change {
+                        ui.label(
+                            egui::RichText::new("Enter an owner, a group, or both.")
+                                .color(issue_kind_color(theme, ssh::IssueKind::Configuration)),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                        if ui
+                            .add_enabled(has_change, egui::Button::new("Apply"))
+                            .clicked()
+                        {
+                            confirm = true;
+                        }
+                    });
+                });
+
+            if !open || cancel {
+                file.ownership_dialog = None;
+            } else if confirm {
+                let owner = Self::normalize_optional_remote_name(&ownership_dialog.owner);
+                let group = Self::normalize_optional_remote_name(&ownership_dialog.group);
+                if owner.is_some() || group.is_some() {
+                    actions.push(TilesAction::FileSetOwnership {
+                        pane_id: tile_id,
+                        names: ownership_dialog.names,
+                        owner,
+                        group,
+                    });
+                    file.ownership_dialog = None;
+                } else {
+                    file.ownership_dialog = Some(ownership_dialog);
+                }
+            } else {
+                file.ownership_dialog = Some(ownership_dialog);
+            }
+        }
+
+        if let Some(mode) = file.batch_destination_mode {
+            let mut open = true;
+            let mut confirm = false;
+            let mut cancel = false;
+            let title = match mode {
+                FileBatchDestinationMode::Copy => "Copy Items",
+                FileBatchDestinationMode::Move => "Move Items",
+            };
+            let confirm_label = match mode {
+                FileBatchDestinationMode::Copy => "Copy",
+                FileBatchDestinationMode::Move => "Move",
+            };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    let selected_count = file.selected_count();
+                    let suffix = if selected_count == 1 { "" } else { "s" };
+                    ui.label(format!(
+                        "Target remote folder for {selected_count} selected item{suffix}:"
+                    ));
+                    let edit = ui.text_edit_singleline(&mut file.batch_target_dir);
+                    if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        confirm = true;
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !file.batch_target_dir.trim().is_empty() && file.has_selection(),
+                                egui::Button::new(confirm_label),
+                            )
+                            .clicked()
+                        {
+                            confirm = true;
+                        }
+                    });
+                });
+
+            if !open || cancel {
+                file.batch_destination_mode = None;
+            } else if confirm {
+                let destination_dir = file.batch_target_dir.trim().to_string();
+                let names = file.selected_names_in_entry_order();
+                if !destination_dir.is_empty() && !names.is_empty() {
+                    actions.push(match mode {
+                        FileBatchDestinationMode::Copy => TilesAction::FileCopy {
+                            pane_id: tile_id,
+                            names,
+                            destination_dir,
+                        },
+                        FileBatchDestinationMode::Move => TilesAction::FileMove {
+                            pane_id: tile_id,
+                            names,
+                            destination_dir,
+                        },
+                    });
+                }
+                file.batch_destination_mode = None;
             }
         }
 

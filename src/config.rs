@@ -604,6 +604,8 @@ pub fn read_profile_from_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn plaintext_fallback_strips_secrets() {
@@ -652,5 +654,42 @@ mod tests {
         assert_eq!(sanitized.transfer_history[0].settings.password, "");
         assert_eq!(sanitized.transfer_history[0].settings.key_passphrase, "");
         assert!(sanitized.saved_session_layout_json.is_none());
+    }
+
+    #[test]
+    fn unreadable_config_is_preserved_as_corrupt_backup() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rusty-config-test-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let bytes = br#"not valid config"#;
+        fs::write(&path, bytes).unwrap();
+
+        let outcome = unreadable_config_outcome(&path, bytes, "invalid config");
+
+        let notice = outcome.notice.unwrap_or_default();
+        assert!(notice.contains("defaults were loaded"));
+        assert!(!path.exists());
+
+        let backups: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.starts_with("config.corrupt-") && name.ends_with(".json"))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), bytes);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
@@ -27,6 +27,8 @@ enum PersistedPaneKind {
     Terminal,
     FileManager {
         source_terminal: TileId,
+        #[serde(default)]
+        source_connection_group_id: u64,
         path: String,
     },
 }
@@ -39,6 +41,10 @@ struct PersistedTab {
     profile_name: Option<String>,
     settings: ConnectionSettings,
     scrollback_len: usize,
+    #[serde(default)]
+    title_index: u64,
+    #[serde(default)]
+    connection_group_id: u64,
     #[serde(default)]
     autoconnect: bool,
     #[serde(default)]
@@ -455,6 +461,11 @@ struct TransferDeleteDialog {
     request_id: u64,
 }
 
+struct UploadConflictDialog {
+    prompt: ssh::UploadConflictPrompt,
+    apply_to_all: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsPage {
     Autostart,
@@ -536,6 +547,7 @@ struct DownloadJob {
     total_bytes: Option<u64>,
     speed_bps: f64,
     state: DownloadState,
+    issue_kind: Option<ssh::IssueKind>,
     message: String,
 }
 
@@ -545,49 +557,239 @@ enum PaneKind {
     FileManager(Box<FileBrowserState>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileBatchDestinationMode {
+    Copy,
+    Move,
+}
+
+#[derive(Clone, Debug)]
+struct FileDeleteConfirmState {
+    names: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FilePermissionsDialogState {
+    names: Vec<String>,
+    mode: String,
+}
+
+#[derive(Clone, Debug)]
+struct FileOwnershipDialogState {
+    names: Vec<String>,
+    owner: String,
+    group: String,
+}
+
 #[derive(Debug)]
 struct FileBrowserState {
     source_terminal: TileId,
+    source_connection_group_id: u64,
     source_connected: bool,
+    source_worker_tx: Option<Sender<WorkerMessage>>,
     cwd: String,
     path_input: String,
     entries: Vec<ssh::SftpEntry>,
     ui_rx: Option<Receiver<SftpUiMessage>>,
     worker_tx: Option<Sender<SftpWorkerMessage>>,
-    selected_name: Option<String>,
+    selected_names: BTreeSet<String>,
+    selection_anchor: Option<String>,
     rename_to: String,
     rename_from: Option<String>,
     rename_dialog_open: bool,
     mkdir_name: String,
     mkdir_dialog_open: bool,
+    delete_confirm: Option<FileDeleteConfirmState>,
+    permissions_dialog: Option<FilePermissionsDialogState>,
+    ownership_dialog: Option<FileOwnershipDialogState>,
+    batch_target_dir: String,
+    batch_destination_mode: Option<FileBatchDestinationMode>,
     busy: bool,
+    status_kind: ssh::IssueKind,
     status: String,
 }
 
 impl FileBrowserState {
-    fn new(source_terminal: TileId, path: String) -> Self {
+    fn new(source_terminal: TileId, source_connection_group_id: u64, path: String) -> Self {
         let path = if path.trim().is_empty() {
             ".".to_string()
         } else {
             path
         };
+        let cwd = path.clone();
         Self {
             source_terminal,
+            source_connection_group_id,
             source_connected: false,
-            cwd: path.clone(),
+            source_worker_tx: None,
+            cwd: cwd.clone(),
             path_input: path,
             entries: Vec::new(),
             ui_rx: None,
             worker_tx: None,
-            selected_name: None,
+            selected_names: BTreeSet::new(),
+            selection_anchor: None,
             rename_to: String::new(),
             rename_from: None,
             rename_dialog_open: false,
             mkdir_name: String::new(),
             mkdir_dialog_open: false,
+            delete_confirm: None,
+            permissions_dialog: None,
+            ownership_dialog: None,
+            batch_target_dir: cwd,
+            batch_destination_mode: None,
             busy: false,
+            status_kind: ssh::IssueKind::Info,
             status: "Not connected".to_string(),
         }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected_names.clear();
+        self.selection_anchor = None;
+    }
+
+    fn set_single_selection(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        self.selected_names.clear();
+        self.selected_names.insert(name.clone());
+        self.selection_anchor = Some(name);
+    }
+
+    fn toggle_selection(&mut self, name: &str) {
+        if !self.selected_names.insert(name.to_string()) {
+            self.selected_names.remove(name);
+        }
+        self.selection_anchor = Some(name.to_string());
+    }
+
+    fn apply_selection_click(
+        &mut self,
+        name: &str,
+        ordered_names: &[String],
+        additive: bool,
+        range: bool,
+    ) {
+        if range {
+            let anchor = self
+                .selection_anchor
+                .clone()
+                .unwrap_or_else(|| name.to_string());
+            let anchor_idx = ordered_names.iter().position(|entry| entry == &anchor);
+            let current_idx = ordered_names.iter().position(|entry| entry == name);
+            match (anchor_idx, current_idx) {
+                (Some(start), Some(end)) => {
+                    if !additive {
+                        self.selected_names.clear();
+                    }
+                    let (start, end) = if start <= end {
+                        (start, end)
+                    } else {
+                        (end, start)
+                    };
+                    for item in &ordered_names[start..=end] {
+                        self.selected_names.insert(item.clone());
+                    }
+                    self.selection_anchor = Some(anchor);
+                }
+                _ => self.set_single_selection(name.to_string()),
+            }
+            return;
+        }
+
+        if additive {
+            self.toggle_selection(name);
+        } else {
+            self.set_single_selection(name.to_string());
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        !self.selected_names.is_empty()
+    }
+
+    fn selected_count(&self) -> usize {
+        self.selected_names.len()
+    }
+
+    fn single_selected_name(&self) -> Option<String> {
+        (self.selected_names.len() == 1)
+            .then(|| self.selected_names.iter().next().cloned())
+            .flatten()
+    }
+
+    fn selected_names_in_entry_order(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|entry| self.selected_names.contains(&entry.file_name))
+            .map(|entry| entry.file_name.clone())
+            .collect()
+    }
+
+    fn open_batch_destination_dialog(&mut self, mode: FileBatchDestinationMode) {
+        self.batch_target_dir = self.cwd.clone();
+        self.batch_destination_mode = Some(mode);
+    }
+
+    fn open_delete_confirm(&mut self, names: Vec<String>) {
+        if names.is_empty() {
+            self.delete_confirm = None;
+            return;
+        }
+        self.delete_confirm = Some(FileDeleteConfirmState { names });
+    }
+
+    fn open_permissions_dialog(&mut self, names: Vec<String>) {
+        if names.is_empty() {
+            self.permissions_dialog = None;
+            return;
+        }
+        let mode = if names.len() == 1 {
+            self.entries
+                .iter()
+                .find(|entry| entry.file_name == names[0])
+                .and_then(|entry| entry.permissions)
+                .map(|permissions| format!("{:04o}", permissions & 0o7777))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.permissions_dialog = Some(FilePermissionsDialogState { names, mode });
+    }
+
+    fn open_ownership_dialog(&mut self, names: Vec<String>) {
+        if names.is_empty() {
+            self.ownership_dialog = None;
+            return;
+        }
+        let (owner, group) = if names.len() == 1 {
+            self.entries
+                .iter()
+                .find(|entry| entry.file_name == names[0])
+                .map(|entry| {
+                    (
+                        entry
+                            .user
+                            .clone()
+                            .or_else(|| entry.uid.map(|value| value.to_string()))
+                            .unwrap_or_default(),
+                        entry
+                            .group
+                            .clone()
+                            .or_else(|| entry.gid.map(|value| value.to_string()))
+                            .unwrap_or_default(),
+                    )
+                })
+                .unwrap_or_else(|| (String::new(), String::new()))
+        } else {
+            (String::new(), String::new())
+        };
+        self.ownership_dialog = Some(FileOwnershipDialogState {
+            names,
+            owner,
+            group,
+        });
     }
 }
 
@@ -595,19 +797,28 @@ impl Clone for FileBrowserState {
     fn clone(&self) -> Self {
         Self {
             source_terminal: self.source_terminal,
+            source_connection_group_id: self.source_connection_group_id,
             source_connected: self.source_connected,
+            source_worker_tx: None,
             cwd: self.cwd.clone(),
             path_input: self.path_input.clone(),
             entries: self.entries.clone(),
             ui_rx: None,
             worker_tx: None,
-            selected_name: self.selected_name.clone(),
+            selected_names: self.selected_names.clone(),
+            selection_anchor: self.selection_anchor.clone(),
             rename_to: self.rename_to.clone(),
             rename_from: self.rename_from.clone(),
             rename_dialog_open: self.rename_dialog_open,
             mkdir_name: self.mkdir_name.clone(),
             mkdir_dialog_open: self.mkdir_dialog_open,
+            delete_confirm: self.delete_confirm.clone(),
+            permissions_dialog: self.permissions_dialog.clone(),
+            ownership_dialog: self.ownership_dialog.clone(),
+            batch_target_dir: self.batch_target_dir.clone(),
+            batch_destination_mode: self.batch_destination_mode,
             busy: self.busy,
+            status_kind: self.status_kind,
             status: self.status.clone(),
         }
     }
@@ -615,14 +826,17 @@ impl Clone for FileBrowserState {
 
 struct SshTab {
     id: u64,
+    title_index: u64,
     title: String,
     user_title: Option<String>,
     color: Option<Color32>,
     profile_name: Option<String>,
+    connection_group_id: u64,
     scrollback_len: usize,
     settings: ConnectionSettings,
     connected: bool,
     connecting: bool,
+    last_status_kind: ssh::IssueKind,
     last_status: String,
 
     screen: crate::terminal_emulator::Screen,
@@ -648,6 +862,7 @@ struct SshTab {
 
     pending_auth: Option<ssh::AuthPrompt>,
     pending_host_key: Option<ssh::HostKeyPrompt>,
+    pending_restore_attach_group: Option<u64>,
     pending_scrollback: Option<usize>,
     last_selection_autoscroll: Instant,
     pending_sftp_events: Vec<ssh::SftpEvent>,
@@ -672,14 +887,17 @@ impl SshTab {
         let title = Self::title_for(id, &settings);
         Self {
             id,
+            title_index: id,
             title,
             user_title: None,
             color: None,
             profile_name,
+            connection_group_id: id,
             scrollback_len: len,
             settings,
             connected: false,
             connecting: false,
+            last_status_kind: ssh::IssueKind::Info,
             last_status: String::new(),
             screen,
             scroll_wheel_accum: 0.0,
@@ -699,6 +917,7 @@ impl SshTab {
             pending_remote_click: None,
             pending_auth: None,
             pending_host_key: None,
+            pending_restore_attach_group: None,
             pending_scrollback: None,
             last_selection_autoscroll: Instant::now(),
             pending_sftp_events: Vec::new(),
@@ -712,6 +931,7 @@ impl SshTab {
         profile_name: Option<String>,
         color: Option<Color32>,
         source_terminal: TileId,
+        source_connection_group_id: u64,
         path: String,
     ) -> Self {
         let mut tab = Self::new(
@@ -731,8 +951,13 @@ impl SshTab {
         };
         tab.title = format!("SFTP: {identity}");
         tab.color = color;
+        tab.last_status_kind = ssh::IssueKind::Info;
         tab.last_status = "Not connected".to_string();
-        tab.kind = PaneKind::FileManager(Box::new(FileBrowserState::new(source_terminal, path)));
+        tab.kind = PaneKind::FileManager(Box::new(FileBrowserState::new(
+            source_terminal,
+            source_connection_group_id,
+            path,
+        )));
         tab
     }
 
@@ -754,8 +979,8 @@ impl SshTab {
         }
     }
 
-    fn title_for(id: u64, _settings: &ConnectionSettings) -> String {
-        format!("Untitled Tab {id}")
+    fn title_for(title_index: u64, _settings: &ConnectionSettings) -> String {
+        format!("Untitled Tab {title_index}")
     }
 
     fn start_connect(&mut self) {
@@ -772,6 +997,7 @@ impl SshTab {
 
         self.pending_auth = None;
         self.pending_host_key = None;
+        self.pending_restore_attach_group = None;
 
         let (ui_tx, ui_rx) = mpsc::channel::<UiMessage>();
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>();
@@ -781,15 +1007,17 @@ impl SshTab {
         self.worker_tx = Some(worker_tx);
         self.host_key_tx = Some(host_key_tx);
         self.connecting = true;
+        self.last_status_kind = ssh::IssueKind::Info;
         self.last_status = "Connecting...".to_string();
         if self.is_terminal() {
-            self.title = Self::title_for(self.id, &self.settings);
+            self.title = Self::title_for(self.title_index, &self.settings);
         }
 
         let settings = self.settings.clone();
         let scrollback_len = self.scrollback_len;
         let log_path = self.log_path.clone();
         let _handle = ssh::start_shell(
+            self.id,
             settings,
             scrollback_len,
             ui_tx,
@@ -803,7 +1031,13 @@ impl SshTab {
         match &mut self.kind {
             PaneKind::Terminal => {
                 if let Some(tx) = self.worker_tx.take() {
-                    let _ = tx.send(WorkerMessage::Disconnect);
+                    if self.connecting && self.host_key_tx.is_some() {
+                        let _ = tx.send(WorkerMessage::Disconnect);
+                    } else {
+                        let _ = tx.send(WorkerMessage::DetachTerminalClient {
+                            client_id: self.id,
+                        });
+                    }
                 }
                 self.ui_rx = None;
                 self.host_key_tx = None;
@@ -815,10 +1049,12 @@ impl SshTab {
                 file.ui_rx = None;
                 file.source_connected = false;
                 file.busy = false;
+                file.status_kind = ssh::IssueKind::Info;
             }
         }
         self.connected = false;
         self.connecting = false;
+        self.last_status_kind = ssh::IssueKind::Info;
         self.last_status = "Disconnected".to_string();
         self.last_sent_size = None;
         self.pending_resize = None;
@@ -831,6 +1067,7 @@ impl SshTab {
         self.pending_remote_click = None;
         self.pending_auth = None;
         self.pending_host_key = None;
+        self.pending_restore_attach_group = None;
         self.pending_scrollback = None;
         self.last_selection_autoscroll = Instant::now();
         self.pending_sftp_events.clear();
@@ -854,7 +1091,8 @@ impl SshTab {
                     match rx.try_recv() {
                         Ok(UiMessage::Status(s)) => {
                             saw_message = true;
-                            self.last_status = s;
+                            self.last_status_kind = s.kind;
+                            self.last_status = s.message;
                         }
                         Ok(UiMessage::Screen(screen)) => {
                             saw_message = true;
@@ -870,6 +1108,8 @@ impl SshTab {
                             self.connecting = false;
                             self.pending_auth = None;
                             self.pending_host_key = None;
+                            self.host_key_tx = None;
+                            self.pending_restore_attach_group = None;
                             if ok {
                                 // A new shell starts at server-default PTY size (often 80x24).
                                 // Reset cached size so the next frame always sends current viewport size.
@@ -891,6 +1131,10 @@ impl SshTab {
                             saw_message = true;
                             self.connected = false;
                             self.connecting = false;
+                            if self.last_status.trim().is_empty() {
+                                self.last_status_kind = ssh::IssueKind::Transport;
+                                self.last_status = "Transport disconnected".to_string();
+                            }
                             self.pending_auth = None;
                             self.pending_host_key = None;
                             break;
@@ -937,9 +1181,11 @@ impl SshTab {
                     match rx.try_recv() {
                         Ok(SftpUiMessage::Status(s)) => {
                             saw_message = true;
-                            self.last_status = s.clone();
+                            self.last_status_kind = s.kind;
+                            self.last_status = s.message.clone();
                             if !file.busy || !self.connected {
-                                file.status = s;
+                                file.status_kind = s.kind;
+                                file.status = s.message;
                             }
                         }
                         Ok(SftpUiMessage::Connected(ok)) => {
@@ -956,7 +1202,11 @@ impl SshTab {
                             saw_message = true;
                             self.connected = false;
                             self.connecting = false;
+                            self.last_status_kind = ssh::IssueKind::Transport;
+                            self.last_status = "SFTP session disconnected".to_string();
                             file.source_connected = false;
+                            file.status_kind = ssh::IssueKind::Transport;
+                            file.status = "SFTP session disconnected".to_string();
                             file.ui_rx = None;
                             file.worker_tx = None;
                             break;
@@ -987,6 +1237,7 @@ pub struct AppState {
 
     last_cursor_blink: Instant,
     last_terminal_activity: Instant,
+    last_download_activity: Instant,
     cursor_visible: bool,
 
     tray: Option<crate::tray::TrayState>,
@@ -999,6 +1250,8 @@ pub struct AppState {
     auth_dialog: Option<AuthDialog>,
     host_key_dialog: Option<HostKeyDialog>,
     transfer_delete_dialog: Option<TransferDeleteDialog>,
+    upload_conflict_dialog: Option<UploadConflictDialog>,
+    pending_upload_conflict_prompts: VecDeque<ssh::UploadConflictPrompt>,
 
     style_initialized: bool,
 
@@ -1013,6 +1266,7 @@ pub struct AppState {
     download_event_tx: Sender<ssh::DownloadManagerEvent>,
     download_event_rx: Receiver<ssh::DownloadManagerEvent>,
     download_cancel_txs: HashMap<u64, Sender<()>>,
+    upload_conflict_response_txs: HashMap<u64, Sender<ssh::UploadConflictResponse>>,
     upload_refresh_targets: HashMap<u64, TileId>,
     update_check_in_progress: bool,
     update_check_rx: Option<Receiver<UpdateCheckResult>>,

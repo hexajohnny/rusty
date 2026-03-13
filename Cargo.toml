@@ -26,7 +26,8 @@ crossbeam-channel = "0.5"
 once_cell = "1.19"
 rfd = "0.14"
 base64 = "0.22"
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+md5 = "0.7"
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 ureq = { version = "2.12", features = ["json"] }
 

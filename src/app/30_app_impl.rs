@@ -23,6 +23,7 @@ impl eframe::App for AppState {
         }
 
         self.maybe_restore_window(ctx);
+        crate::tray::ensure_native_main_hit_test();
         // Keep the root viewport explicitly resizable across long uptime / tray restore cycles.
         ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
 
@@ -48,7 +49,10 @@ impl eframe::App for AppState {
                 }
                 if let Some(rows) = tab.pending_scrollback {
                     if let Some(tx) = tab.worker_tx.as_ref() {
-                        let _ = tx.send(WorkerMessage::SetScrollback(rows));
+                        let _ = tx.send(WorkerMessage::SetScrollback {
+                            client_id: tab.id,
+                            rows,
+                        });
                     }
                 }
                 if tab.poll_messages() {
@@ -59,6 +63,7 @@ impl eframe::App for AppState {
         if saw_terminal_activity {
             self.last_terminal_activity = Instant::now();
         }
+        self.sync_shared_terminal_groups();
         self.route_sftp_events();
         self.poll_download_manager_events();
         self.sync_file_panes_with_sources();
@@ -71,27 +76,32 @@ impl eframe::App for AppState {
             || self.rename_popup.is_some()
             || self.downloads_window_open
             || self.settings_dialog.open
-            || self.transfer_delete_dialog.is_some();
+            || self.transfer_delete_dialog.is_some()
+            || self.upload_conflict_dialog.is_some();
         let recent_terminal_activity = any_live_session
             && self.last_terminal_activity.elapsed() <= Duration::from_millis(250);
+        let recent_download_activity = any_active_download
+            && self.last_download_activity.elapsed() <= Duration::from_millis(250);
 
         let activity_repaint_ms = if live_session_count >= 3 {
-            24
+            28
         } else if live_session_count >= 2 {
-            20
-        } else {
-            16
-        };
-        let mut repaint_ms = if self.hidden_to_tray {
-            200
-        } else if ui_modal_open || any_active_download {
-            16
-        } else if recent_terminal_activity {
-            activity_repaint_ms
-        } else if any_live_session {
             33
         } else {
-            80
+            40
+        };
+        let mut repaint_ms = if self.hidden_to_tray {
+            500
+        } else if recent_terminal_activity {
+            activity_repaint_ms
+        } else if recent_download_activity {
+            66
+        } else if ui_modal_open {
+            125
+        } else if any_live_session || any_active_download {
+            250
+        } else {
+            500
         };
         if any_live_session {
             repaint_ms = repaint_ms.min(self.ms_until_cursor_blink_toggle());
@@ -405,6 +415,9 @@ impl eframe::App for AppState {
         // Apply behavior actions after the tree has been drawn.
         let mut actions = global_actions;
         actions.extend(std::mem::take(&mut behavior.actions));
+        drop(behavior);
+        self.clipboard = clipboard;
+
         for action in actions {
             match action {
                 TilesAction::NewTab {
@@ -518,11 +531,6 @@ impl eframe::App for AppState {
                 }
                 TilesAction::FileMkdir { pane_id, dir_name } => {
                     self.request_file_mkdir(pane_id, dir_name);
-                    let path = self
-                        .file_pane(pane_id)
-                        .map(|f| f.cwd.clone())
-                        .unwrap_or_else(|| ".".to_string());
-                    self.request_file_list(pane_id, path);
                 }
                 TilesAction::FileRename {
                     pane_id,
@@ -530,29 +538,56 @@ impl eframe::App for AppState {
                     to_name,
                 } => {
                     self.request_file_rename(pane_id, from_name, to_name);
-                    let path = self
-                        .file_pane(pane_id)
-                        .map(|f| f.cwd.clone())
-                        .unwrap_or_else(|| ".".to_string());
-                    self.request_file_list(pane_id, path);
                 }
                 TilesAction::FileDelete {
                     pane_id,
-                    name,
-                    is_dir,
+                    names,
                 } => {
-                    self.request_file_delete(pane_id, name, is_dir);
-                    let path = self
-                        .file_pane(pane_id)
-                        .map(|f| f.cwd.clone())
-                        .unwrap_or_else(|| ".".to_string());
-                    self.request_file_list(pane_id, path);
+                    self.request_file_delete(pane_id, names);
                 }
-                TilesAction::FileUpload { pane_id } => {
-                    let _ = self.start_upload_for_file(pane_id);
+                TilesAction::FileCopy {
+                    pane_id,
+                    names,
+                    destination_dir,
+                } => {
+                    self.request_file_copy(pane_id, names, destination_dir);
+                }
+                TilesAction::FileMove {
+                    pane_id,
+                    names,
+                    destination_dir,
+                } => {
+                    self.request_file_move(pane_id, names, destination_dir);
+                }
+                TilesAction::FileSetPermissions {
+                    pane_id,
+                    names,
+                    mode,
+                } => {
+                    self.request_file_set_permissions(pane_id, names, mode);
+                }
+                TilesAction::FileSetOwnership {
+                    pane_id,
+                    names,
+                    owner,
+                    group,
+                } => {
+                    self.request_file_set_ownership(pane_id, names, owner, group);
+                }
+                TilesAction::FileUploadFiles { pane_id } => {
+                    let _ = self.start_upload_from_files_picker(pane_id);
+                }
+                TilesAction::FileUploadFolder { pane_id } => {
+                    let _ = self.start_upload_from_folder_picker(pane_id);
+                }
+                TilesAction::FileUploadPaths { pane_id, paths } => {
+                    let _ = self.start_upload_paths(pane_id, paths);
                 }
                 TilesAction::FileDownload { pane_id, name } => {
-                    self.start_download_for_file(pane_id, name);
+                    let _ = self.start_download_for_file(pane_id, name);
+                }
+                TilesAction::FileDownloadSelected { pane_id } => {
+                    let _ = self.start_download_for_selected(pane_id);
                 }
                 TilesAction::Close(tile_id) => {
                     self.close_pane(tile_id);
@@ -638,7 +673,5 @@ impl eframe::App for AppState {
         self.draw_downloads_manager_window(ctx);
 
         self.maybe_save_session_layout(ctx);
-
-        self.clipboard = clipboard;
     }
 }

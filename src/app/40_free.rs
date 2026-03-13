@@ -21,6 +21,14 @@ fn paint_window_chrome(ctx: &egui::Context, theme: UiTheme) {
     );
 }
 
+fn settings_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("rusty_settings_viewport")
+}
+
+fn transfers_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("rusty_transfers_viewport")
+}
+
 fn handle_window_resize(ctx: &egui::Context) {
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -171,6 +179,19 @@ fn adjust_color(c: Color32, delta: f32) -> Color32 {
             .clamp(0.0, 255.0) as u8
     };
     Color32::from_rgba_premultiplied(lerp(r, tr), lerp(g, tg), lerp(b, tb), a)
+}
+
+fn issue_kind_color(theme: UiTheme, kind: crate::ssh::IssueKind) -> Color32 {
+    match kind {
+        crate::ssh::IssueKind::Info => theme.muted,
+        crate::ssh::IssueKind::Authentication => Color32::from_rgb(220, 120, 120),
+        crate::ssh::IssueKind::HostKey => Color32::from_rgb(220, 170, 90),
+        crate::ssh::IssueKind::Permission => Color32::from_rgb(230, 145, 85),
+        crate::ssh::IssueKind::Path => Color32::from_rgb(120, 180, 230),
+        crate::ssh::IssueKind::Transport => Color32::from_rgb(220, 120, 120),
+        crate::ssh::IssueKind::Configuration => Color32::from_rgb(195, 150, 230),
+        crate::ssh::IssueKind::Unknown => Color32::from_rgb(220, 140, 140),
+    }
 }
 
 fn title_bar_icon_button<'a>(

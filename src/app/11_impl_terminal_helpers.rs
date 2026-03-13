@@ -149,7 +149,10 @@ impl AppState {
 
     fn send_bytes(tab: &mut SshTab, bytes: Vec<u8>) {
         if let Some(tx) = tab.worker_tx.as_ref() {
-            let _ = tx.send(WorkerMessage::Input(bytes));
+            let _ = tx.send(WorkerMessage::Input {
+                client_id: tab.id,
+                data: bytes,
+            });
         }
     }
 
@@ -183,6 +186,72 @@ impl AppState {
         }
     }
 
+    fn selected_text(tab: &SshTab) -> String {
+        if let Some(abs_sel) = tab.abs_selection {
+            Self::selection_text_abs(&tab.screen, tab.scrollback_max, abs_sel)
+        } else if let Some(sel) = tab.selection {
+            Self::selection_text(&tab.screen, sel)
+        } else {
+            String::new()
+        }
+    }
+
+    fn select_all(tab: &mut SshTab) {
+        let (rows, cols) = tab.screen.size();
+        if rows == 0 || cols == 0 {
+            return;
+        }
+
+        let last_row = rows.saturating_sub(1);
+        let last_col = cols.saturating_sub(1);
+        let last_abs_row = tab.scrollback_max as i64 + last_row as i64;
+
+        tab.selection = Some(TermSelection {
+            anchor: (0, 0),
+            cursor: (last_row, last_col),
+            dragging: false,
+        });
+        tab.abs_selection = Some(TermAbsSelection {
+            anchor: (0, 0),
+            cursor: (last_abs_row, last_col),
+            dragging: false,
+        });
+        tab.pending_remote_click = None;
+    }
+
+    fn show_terminal_context_menu(
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        clipboard: &mut Option<Clipboard>,
+        tab: &mut SshTab,
+    ) {
+        let selected_text = Self::selected_text(tab);
+        let can_copy = !selected_text.is_empty();
+        let (rows, cols) = tab.screen.size();
+        let can_select_all = rows > 0 && cols > 0;
+
+        if ui.add_enabled(can_copy, egui::Button::new("Copy")).clicked() {
+            Self::copy_selection_with_flash(ctx, clipboard, tab, selected_text);
+            ui.close_menu();
+        }
+
+        if ui.add_enabled(tab.connected, egui::Button::new("Paste")).clicked() {
+            Self::paste_from_clipboard(tab, clipboard);
+            tab.pending_remote_click = None;
+            ui.close_menu();
+        }
+
+        ui.separator();
+
+        if ui
+            .add_enabled(can_select_all, egui::Button::new("Select All"))
+            .clicked()
+        {
+            Self::select_all(tab);
+            ui.close_menu();
+        }
+    }
+
     fn copy_text_to_clipboard(ctx: &egui::Context, clipboard: &mut Option<Clipboard>, text: String) {
         ctx.output_mut(|o| o.copied_text = text.clone());
         if let Some(cb) = clipboard.as_mut() {
@@ -205,72 +274,255 @@ impl AppState {
 
     fn key_to_ctrl_byte(key: egui::Key) -> Option<u8> {
         use egui::Key::*;
-        let c = match key {
-            A => b'a',
-            B => b'b',
-            C => b'c',
-            D => b'd',
-            E => b'e',
-            F => b'f',
-            G => b'g',
-            H => b'h',
-            I => b'i',
-            J => b'j',
-            K => b'k',
-            L => b'l',
-            M => b'm',
-            N => b'n',
-            O => b'o',
-            P => b'p',
-            Q => b'q',
-            R => b'r',
-            S => b's',
-            T => b't',
-            U => b'u',
-            V => b'v',
-            W => b'w',
-            X => b'x',
-            Y => b'y',
-            Z => b'z',
-            _ => return None,
-        };
-        Some(c & 0x1f)
+        match key {
+            A => Some(b'a' & 0x1f),
+            B => Some(b'b' & 0x1f),
+            C => Some(b'c' & 0x1f),
+            D => Some(b'd' & 0x1f),
+            E => Some(b'e' & 0x1f),
+            F => Some(b'f' & 0x1f),
+            G => Some(b'g' & 0x1f),
+            H => Some(b'h' & 0x1f),
+            I => Some(b'i' & 0x1f),
+            J => Some(b'j' & 0x1f),
+            K => Some(b'k' & 0x1f),
+            L => Some(b'l' & 0x1f),
+            M => Some(b'm' & 0x1f),
+            N => Some(b'n' & 0x1f),
+            O => Some(b'o' & 0x1f),
+            P => Some(b'p' & 0x1f),
+            Q => Some(b'q' & 0x1f),
+            R => Some(b'r' & 0x1f),
+            S => Some(b's' & 0x1f),
+            T => Some(b't' & 0x1f),
+            U => Some(b'u' & 0x1f),
+            V => Some(b'v' & 0x1f),
+            W => Some(b'w' & 0x1f),
+            X => Some(b'x' & 0x1f),
+            Y => Some(b'y' & 0x1f),
+            Z => Some(b'z' & 0x1f),
+            OpenBracket => Some(0x1b),
+            Backslash => Some(0x1c),
+            CloseBracket => Some(0x1d),
+            Num6 => Some(0x1e),
+            Slash => Some(0x1f),
+            Space => Some(0x00),
+            _ => None,
+        }
     }
 
-    fn send_key(tab: &mut SshTab, key: egui::Key, mods: egui::Modifiers) {
+    fn xterm_modifier_param(mods: egui::Modifiers) -> Option<u8> {
+        let mut value = 1u8;
+        if mods.shift {
+            value = value.saturating_add(1);
+        }
+        if mods.alt {
+            value = value.saturating_add(2);
+        }
+        if mods.ctrl {
+            value = value.saturating_add(4);
+        }
+        if value == 1 {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    fn with_escape_prefix(bytes: Vec<u8>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len().saturating_add(1));
+        out.push(0x1b);
+        out.extend_from_slice(&bytes);
+        out
+    }
+
+    fn csi_final(final_byte: u8) -> Vec<u8> {
+        vec![0x1b, b'[', final_byte]
+    }
+
+    fn ss3_final(final_byte: u8) -> Vec<u8> {
+        vec![0x1b, b'O', final_byte]
+    }
+
+    fn csi_with_modifier(final_byte: u8, modifier: u8) -> Vec<u8> {
+        format!("\x1b[1;{}{final}", modifier, final = final_byte as char).into_bytes()
+    }
+
+    fn csi_tilde(code: u8) -> Vec<u8> {
+        format!("\x1b[{code}~").into_bytes()
+    }
+
+    fn csi_tilde_with_modifier(code: u8, modifier: u8) -> Vec<u8> {
+        format!("\x1b[{code};{modifier}~").into_bytes()
+    }
+
+    fn function_key_bytes(key: egui::Key, modifier: Option<u8>) -> Option<Vec<u8>> {
+        use egui::Key::*;
+
+        match key {
+            F1 => Some(match modifier {
+                Some(m) => Self::csi_with_modifier(b'P', m),
+                None => Self::ss3_final(b'P'),
+            }),
+            F2 => Some(match modifier {
+                Some(m) => Self::csi_with_modifier(b'Q', m),
+                None => Self::ss3_final(b'Q'),
+            }),
+            F3 => Some(match modifier {
+                Some(m) => Self::csi_with_modifier(b'R', m),
+                None => Self::ss3_final(b'R'),
+            }),
+            F4 => Some(match modifier {
+                Some(m) => Self::csi_with_modifier(b'S', m),
+                None => Self::ss3_final(b'S'),
+            }),
+            F5 => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(15, m),
+                None => Self::csi_tilde(15),
+            }),
+            F6 => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(17, m),
+                None => Self::csi_tilde(17),
+            }),
+            F7 => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(18, m),
+                None => Self::csi_tilde(18),
+            }),
+            F8 => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(19, m),
+                None => Self::csi_tilde(19),
+            }),
+            F9 => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(20, m),
+                None => Self::csi_tilde(20),
+            }),
+            F10 => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(21, m),
+                None => Self::csi_tilde(21),
+            }),
+            F11 => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(23, m),
+                None => Self::csi_tilde(23),
+            }),
+            F12 => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(24, m),
+                None => Self::csi_tilde(24),
+            }),
+            _ => None,
+        }
+    }
+
+    fn key_event_bytes(
+        key: egui::Key,
+        mods: egui::Modifiers,
+        app_cursor: bool,
+    ) -> Option<Vec<u8>> {
         // Terminal-style copy shortcut that doesn't collide with SIGINT.
         if mods.ctrl && mods.shift && key == egui::Key::C {
-            return;
+            return None;
         }
 
-        if mods.ctrl {
+        // Keep AltGr-style text entry out of the control-byte path.
+        if mods.ctrl && !mods.alt {
             if let Some(b) = Self::key_to_ctrl_byte(key) {
-                Self::send_bytes(tab, vec![b]);
-                return;
+                return Some(vec![b]);
             }
         }
 
-        let app_cursor = tab.screen.application_cursor();
-        let bytes: Option<&'static [u8]> = match key {
-            egui::Key::Enter => Some(b"\r"),
-            egui::Key::Tab => Some(b"\t"),
-            egui::Key::Backspace => Some(&[0x7f]),
-            egui::Key::Escape => Some(&[0x1b]),
-            egui::Key::ArrowUp => Some(if app_cursor { b"\x1bOA" } else { b"\x1b[A" }),
-            egui::Key::ArrowDown => Some(if app_cursor { b"\x1bOB" } else { b"\x1b[B" }),
-            egui::Key::ArrowRight => Some(if app_cursor { b"\x1bOC" } else { b"\x1b[C" }),
-            egui::Key::ArrowLeft => Some(if app_cursor { b"\x1bOD" } else { b"\x1b[D" }),
-            egui::Key::Home => Some(if app_cursor { b"\x1bOH" } else { b"\x1b[H" }),
-            egui::Key::End => Some(if app_cursor { b"\x1bOF" } else { b"\x1b[F" }),
-            egui::Key::PageUp => Some(b"\x1b[5~"),
-            egui::Key::PageDown => Some(b"\x1b[6~"),
-            egui::Key::Insert => Some(b"\x1b[2~"),
-            egui::Key::Delete => Some(b"\x1b[3~"),
-            _ => None,
-        };
+        let modifier = Self::xterm_modifier_param(mods);
+        let mut bytes = match key {
+            egui::Key::Enter => Some(vec![b'\r']),
+            egui::Key::Tab => {
+                if mods.shift {
+                    Some(match modifier {
+                        Some(m) => format!("\x1b[1;{m}Z").into_bytes(),
+                        None => b"\x1b[Z".to_vec(),
+                    })
+                } else {
+                    Some(vec![b'\t'])
+                }
+            }
+            egui::Key::Backspace => Some(vec![0x7f]),
+            egui::Key::Escape => Some(vec![0x1b]),
+            egui::Key::ArrowUp => Some(match modifier {
+                Some(m) => Self::csi_with_modifier(b'A', m),
+                None if app_cursor => Self::ss3_final(b'A'),
+                None => Self::csi_final(b'A'),
+            }),
+            egui::Key::ArrowDown => Some(match modifier {
+                Some(m) => Self::csi_with_modifier(b'B', m),
+                None if app_cursor => Self::ss3_final(b'B'),
+                None => Self::csi_final(b'B'),
+            }),
+            egui::Key::ArrowRight => Some(match modifier {
+                Some(m) => Self::csi_with_modifier(b'C', m),
+                None if app_cursor => Self::ss3_final(b'C'),
+                None => Self::csi_final(b'C'),
+            }),
+            egui::Key::ArrowLeft => Some(match modifier {
+                Some(m) => Self::csi_with_modifier(b'D', m),
+                None if app_cursor => Self::ss3_final(b'D'),
+                None => Self::csi_final(b'D'),
+            }),
+            egui::Key::Home => Some(match modifier {
+                Some(m) => Self::csi_with_modifier(b'H', m),
+                None if app_cursor => Self::ss3_final(b'H'),
+                None => Self::csi_final(b'H'),
+            }),
+            egui::Key::End => Some(match modifier {
+                Some(m) => Self::csi_with_modifier(b'F', m),
+                None if app_cursor => Self::ss3_final(b'F'),
+                None => Self::csi_final(b'F'),
+            }),
+            egui::Key::PageUp => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(5, m),
+                None => Self::csi_tilde(5),
+            }),
+            egui::Key::PageDown => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(6, m),
+                None => Self::csi_tilde(6),
+            }),
+            egui::Key::Insert => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(2, m),
+                None => Self::csi_tilde(2),
+            }),
+            egui::Key::Delete => Some(match modifier {
+                Some(m) => Self::csi_tilde_with_modifier(3, m),
+                None => Self::csi_tilde(3),
+            }),
+            _ => Self::function_key_bytes(key, modifier),
+        }?;
 
-        if let Some(b) = bytes {
-            Self::send_bytes(tab, b.to_vec());
+        if mods.alt
+            && (matches!(
+                key,
+                egui::Key::Enter | egui::Key::Backspace | egui::Key::Escape
+            ) || (key == egui::Key::Tab && !mods.shift))
+        {
+            bytes = Self::with_escape_prefix(bytes);
+        }
+
+        Some(bytes)
+    }
+
+    fn text_event_bytes(text: &str, mods: egui::Modifiers) -> Option<Vec<u8>> {
+        if text.is_empty() {
+            return None;
+        }
+        if mods.command || (mods.ctrl && !mods.alt) {
+            return None;
+        }
+
+        let mut bytes = text.as_bytes().to_vec();
+        if mods.alt && !mods.ctrl {
+            bytes = Self::with_escape_prefix(bytes);
+        }
+        Some(bytes)
+    }
+
+    fn send_key(tab: &mut SshTab, key: egui::Key, mods: egui::Modifiers) {
+        if let Some(bytes) = Self::key_event_bytes(key, mods, tab.screen.application_cursor()) {
+            Self::send_bytes(tab, bytes);
         }
     }
 
@@ -363,9 +615,9 @@ impl AppState {
         let primary_down = ui.input(|i| i.pointer.primary_down());
         let primary_released = ui.input(|i| i.pointer.primary_released());
         let hovering_term = pointer_pos.map(|pos| term_rect.contains(pos)).unwrap_or(false) || response.hovered();
+        let context_menu_open = ctx.is_context_menu_open();
 
-        // Right-click paste (no context menu), matching common terminal behavior.
-        if response.secondary_clicked() && tab.connected {
+        if response.middle_clicked() && tab.connected {
             Self::paste_from_clipboard(tab, clipboard);
             response.request_focus();
             tab.pending_remote_click = None;
@@ -469,7 +721,7 @@ impl AppState {
             Pos2::new(x, y)
         };
 
-        if primary_pressed && !hovering_scrollbar {
+        if primary_pressed && !hovering_scrollbar && !context_menu_open {
             if let Some(pos) = pointer_pos {
                 if term_rect.contains(pos) {
                     let pos = clamp_pos_to_grid(pos);
@@ -694,8 +946,8 @@ impl AppState {
                         Self::send_bytes(tab, vec![0x18]);
                     }
                     egui::Event::Text(t) => {
-                        if !t.is_empty() {
-                            Self::send_bytes(tab, t.as_bytes().to_vec());
+                        if let Some(bytes) = Self::text_event_bytes(t, global_mods) {
+                            Self::send_bytes(tab, bytes);
                         }
                     }
                     egui::Event::Paste(s) => {
@@ -1209,5 +1461,95 @@ mod tests {
     #[test]
     fn ctrl_x_maps_to_terminal_control_byte() {
         assert_eq!(AppState::key_to_ctrl_byte(egui::Key::X), Some(0x18));
+    }
+
+    #[test]
+    fn ctrl_punctuation_maps_to_common_terminal_control_bytes() {
+        assert_eq!(AppState::key_to_ctrl_byte(egui::Key::OpenBracket), Some(0x1b));
+        assert_eq!(AppState::key_to_ctrl_byte(egui::Key::Backslash), Some(0x1c));
+        assert_eq!(AppState::key_to_ctrl_byte(egui::Key::CloseBracket), Some(0x1d));
+        assert_eq!(AppState::key_to_ctrl_byte(egui::Key::Num6), Some(0x1e));
+        assert_eq!(AppState::key_to_ctrl_byte(egui::Key::Slash), Some(0x1f));
+        assert_eq!(AppState::key_to_ctrl_byte(egui::Key::Space), Some(0x00));
+    }
+
+    #[test]
+    fn function_keys_encode_to_xterm_sequences() {
+        assert_eq!(
+            AppState::key_event_bytes(egui::Key::F1, egui::Modifiers::NONE, false),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            AppState::key_event_bytes(egui::Key::F5, egui::Modifiers::NONE, false),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            AppState::key_event_bytes(egui::Key::F12, egui::Modifiers::SHIFT, false),
+            Some(b"\x1b[24;2~".to_vec())
+        );
+    }
+
+    #[test]
+    fn arrows_and_navigation_keys_use_modifier_parameters() {
+        assert_eq!(
+            AppState::key_event_bytes(egui::Key::ArrowUp, egui::Modifiers::ALT, false),
+            Some(b"\x1b[1;3A".to_vec())
+        );
+        assert_eq!(
+            AppState::key_event_bytes(egui::Key::ArrowLeft, egui::Modifiers::CTRL, false),
+            Some(b"\x1b[1;5D".to_vec())
+        );
+        assert_eq!(
+            AppState::key_event_bytes(egui::Key::Home, egui::Modifiers::SHIFT, false),
+            Some(b"\x1b[1;2H".to_vec())
+        );
+        assert_eq!(
+            AppState::key_event_bytes(egui::Key::PageDown, egui::Modifiers::ALT, false),
+            Some(b"\x1b[6;3~".to_vec())
+        );
+    }
+
+    #[test]
+    fn shift_tab_encodes_backtab() {
+        assert_eq!(
+            AppState::key_event_bytes(egui::Key::Tab, egui::Modifiers::SHIFT, false),
+            Some(b"\x1b[1;2Z".to_vec())
+        );
+        assert_eq!(
+            AppState::key_event_bytes(
+                egui::Key::Tab,
+                egui::Modifiers::SHIFT | egui::Modifiers::ALT,
+                false,
+            ),
+            Some(b"\x1b[1;4Z".to_vec())
+        );
+    }
+
+    #[test]
+    fn alt_prefixed_text_and_keys_use_escape_prefix() {
+        assert_eq!(
+            AppState::text_event_bytes("b", egui::Modifiers::ALT),
+            Some(b"\x1bb".to_vec())
+        );
+        assert_eq!(
+            AppState::text_event_bytes("B", egui::Modifiers::ALT | egui::Modifiers::SHIFT),
+            Some(b"\x1bB".to_vec())
+        );
+        assert_eq!(
+            AppState::key_event_bytes(egui::Key::Backspace, egui::Modifiers::ALT, false),
+            Some(vec![0x1b, 0x7f])
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_text_is_left_for_altgr_style_input() {
+        assert_eq!(
+            AppState::text_event_bytes("@", egui::Modifiers::CTRL | egui::Modifiers::ALT),
+            Some(b"@".to_vec())
+        );
+        assert_eq!(
+            AppState::key_event_bytes(egui::Key::Q, egui::Modifiers::CTRL | egui::Modifiers::ALT, false),
+            None
+        );
     }
 }

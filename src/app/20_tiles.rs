@@ -48,15 +48,45 @@ enum TilesAction {
     },
     FileDelete {
         pane_id: TileId,
-        name: String,
-        is_dir: bool,
+        names: Vec<String>,
     },
-    FileUpload {
+    FileUploadFiles {
         pane_id: TileId,
+    },
+    FileUploadFolder {
+        pane_id: TileId,
+    },
+    FileUploadPaths {
+        pane_id: TileId,
+        paths: Vec<PathBuf>,
     },
     FileDownload {
         pane_id: TileId,
         name: String,
+    },
+    FileDownloadSelected {
+        pane_id: TileId,
+    },
+    FileCopy {
+        pane_id: TileId,
+        names: Vec<String>,
+        destination_dir: String,
+    },
+    FileMove {
+        pane_id: TileId,
+        names: Vec<String>,
+        destination_dir: String,
+    },
+    FileSetPermissions {
+        pane_id: TileId,
+        names: Vec<String>,
+        mode: u32,
+    },
+    FileSetOwnership {
+        pane_id: TileId,
+        names: Vec<String>,
+        owner: Option<String>,
+        group: Option<String>,
     },
     Close(TileId),
     Exit,

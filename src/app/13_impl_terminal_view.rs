@@ -36,13 +36,17 @@ impl AppState {
             );
         });
 
-        if response.clicked() {
+        if response.clicked() || response.secondary_clicked() || response.middle_clicked() {
             response.request_focus();
         }
         if tab.focus_terminal_next_frame {
             response.request_focus();
             tab.focus_terminal_next_frame = false;
         }
+
+        response.context_menu(|ui: &mut egui::Ui| {
+            Self::show_terminal_context_menu(ui, ctx, clipboard, tab);
+        });
 
         let painter = ui.painter().with_clip_rect(rect);
         let rounding = egui::Rounding::ZERO;
@@ -79,6 +83,7 @@ impl AppState {
                     if let Some((rows, cols, width_px, height_px)) = tab.pending_resize.take() {
                         tab.last_sent_size = Some((rows, cols, width_px, height_px));
                         let _ = tx.send(WorkerMessage::Resize {
+                            client_id: tab.id,
                             rows,
                             cols,
                             width_px,
@@ -150,12 +155,17 @@ impl AppState {
             } else {
                 "Not connected"
             };
+            let text_color = if tab.connecting {
+                options.theme.muted
+            } else {
+                issue_kind_color(options.theme, tab.last_status_kind)
+            };
             painter.text(
                 origin,
                 egui::Align2::LEFT_TOP,
                 text,
                 FontId::proportional(14.0),
-                options.theme.muted,
+                text_color,
             );
 
             Self::handle_terminal_io(

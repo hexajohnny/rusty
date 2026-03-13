@@ -16,6 +16,15 @@ impl AppState {
         }
     }
 
+    fn clipboard_text(clipboard: &mut Option<Clipboard>) -> Option<String> {
+        let cb = clipboard.as_mut()?;
+        let text = cb.get_text().ok()?;
+        if text.is_empty() {
+            return None;
+        }
+        Some(text)
+    }
+
     fn open_settings_dialog_for_tile(&mut self, tile_id: TileId) {
         let Some((settings, tab_profile_name)) = self
             .pane(tile_id)
@@ -1031,9 +1040,12 @@ impl AppState {
             .or_else(|| self.first_pane_id());
         if let Some(tile_id) = status_tile {
             if let Some(tab) = self.pane(tile_id) {
-                if tab.last_status.to_lowercase().contains("failed") {
+                if tab.last_status_kind.is_error() && !tab.last_status.trim().is_empty() {
                     ui.separator();
-                    ui.label(egui::RichText::new(&tab.last_status).color(theme.muted));
+                    ui.label(
+                        egui::RichText::new(&tab.last_status)
+                            .color(issue_kind_color(theme, tab.last_status_kind)),
+                    );
                 }
             }
         }
@@ -1327,7 +1339,7 @@ impl AppState {
             return;
         }
 
-        let viewport_id = egui::ViewportId::from_hash_of("rusty_settings_viewport");
+        let viewport_id = settings_viewport_id();
         let force_front = self.settings_dialog.just_opened;
         let mut builder = egui::ViewportBuilder::default()
             .with_title("Rusty Settings")
@@ -1664,11 +1676,28 @@ impl AppState {
                         let field_w = ui.available_width().min(360.0);
                         for (i, p) in auth.prompts.iter().enumerate() {
                             ui.label(egui::RichText::new(&p.text).strong());
-                            let edit =
-                                egui::TextEdit::singleline(auth.responses.get_mut(i).unwrap())
+                            let resp = {
+                                let value = auth.responses.get_mut(i).unwrap();
+                                egui::TextEdit::singleline(value)
                                     .password(!p.echo)
-                                    .desired_width(field_w);
-                            let resp = ui.add(edit);
+                                    .desired_width(field_w)
+                                    .show(ui)
+                                    .response
+                            };
+                            let response_id = resp.id;
+                            let field_index = i;
+                            resp.context_menu(|ui| {
+                                if ui.button("Paste").clicked() {
+                                    if let Some(text) = Self::clipboard_text(&mut self.clipboard) {
+                                        if let Some(value) = auth.responses.get_mut(field_index) {
+                                            *value = text;
+                                        }
+                                        ui.ctx().memory_mut(|mem| mem.request_focus(response_id));
+                                        ui.ctx().request_repaint();
+                                    }
+                                    ui.close_menu();
+                                }
+                            });
                             if auth.just_opened && i == 0 {
                                 resp.request_focus();
                             }
