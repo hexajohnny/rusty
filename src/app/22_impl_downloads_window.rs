@@ -206,7 +206,7 @@ impl AppState {
         let bar_height = (ui.spacing().interact_size.y - 4.0).max(14.0);
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), bar_height), Sense::hover());
-        let rounding = egui::CornerRadius::same(4);
+        let rounding = egui::Rounding::same(4.0);
 
         ui.painter()
             .rect_filled(rect, rounding, adjust_color(self.theme.top_bg, 0.04));
@@ -215,7 +215,6 @@ impl AppState {
                 rect,
                 rounding,
                 Stroke::new(1.0, self.theme.top_border),
-                egui::StrokeKind::Inside,
             );
 
         if frac > 0.0 {
@@ -259,15 +258,16 @@ impl AppState {
         let btn_fill = adjust_color(theme.top_bg, 0.10);
         let controls_enabled = !embedded;
 
-        egui::Frame::NONE
+        egui::Frame::none()
             .fill(adjust_color(theme.top_bg, 0.08))
             .stroke(Stroke::new(1.0, theme.top_border))
-            .corner_radius(egui::CornerRadius::same(8))
-            .inner_margin(egui::Margin::symmetric(TITLE_PAD_X as i8, 2))
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::symmetric(TITLE_PAD_X, 2.0))
             .show(ui, |ui| {
-                ui.set_min_height(TITLE_BAR_H);
-
-                let bar_rect = ui.max_rect();
+                let bar_rect = Rect::from_min_size(
+                    ui.cursor().min,
+                    Vec2::new(ui.available_width(), TITLE_BAR_H),
+                );
                 let drag_resp = ui.interact(
                     bar_rect,
                     Id::new("rusty_transfers_title_drag"),
@@ -275,63 +275,66 @@ impl AppState {
                 );
                 let mut title_controls_hot = false;
 
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Rusty Transfers")
-                            .strong()
-                            .size(16.0)
-                            .color(theme.accent),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        let close_icon =
-                            egui::Image::new(egui::include_image!("../../assets/x.png"))
-                                .tint(theme.fg);
-                        let close_resp = title_bar_image_button(
-                            ui,
-                            close_icon,
-                            Vec2::splat(12.0),
-                            btn_fill,
-                            theme.top_border,
+                ui.allocate_ui_at_rect(bar_rect, |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("Rusty Transfers")
+                                .strong()
+                                .size(16.0)
+                                .color(theme.accent),
                         );
-                        title_controls_hot |= close_resp.hovered();
-                        if close_resp.clicked() {
-                            self.request_close_downloads_window();
-                        }
-
-                        if controls_enabled {
-                            let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                            let maximize_icon =
-                                egui::Image::new(egui::include_image!("../../assets/square.png"))
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            let close_icon =
+                                egui::Image::new(egui::include_image!("../../assets/x.png"))
                                     .tint(theme.fg);
-                            let maximize_resp = title_bar_image_button(
+                            let close_resp = title_bar_image_button(
                                 ui,
-                                maximize_icon,
+                                close_icon,
                                 Vec2::splat(12.0),
                                 btn_fill,
                                 theme.top_border,
                             );
-                            title_controls_hot |= maximize_resp.hovered();
-                            if maximize_resp.clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                            title_controls_hot |= close_resp.hovered();
+                            if close_resp.clicked() {
+                                self.request_close_downloads_window();
                             }
 
-                            let minimize_icon =
-                                egui::Image::new(egui::include_image!("../../assets/minus.png"))
-                                    .tint(theme.fg);
-                            let minimize_resp = title_bar_image_button(
-                                ui,
-                                minimize_icon,
-                                Vec2::new(14.0, 14.0),
-                                btn_fill,
-                                theme.top_border,
-                            );
-                            title_controls_hot |= minimize_resp.hovered();
-                            if minimize_resp.clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                            if controls_enabled {
+                                let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                                let maximize_icon =
+                                    egui::Image::new(egui::include_image!("../../assets/square.png"))
+                                        .tint(theme.fg);
+                                let maximize_resp = title_bar_image_button(
+                                    ui,
+                                    maximize_icon,
+                                    Vec2::splat(12.0),
+                                    btn_fill,
+                                    theme.top_border,
+                                );
+                                title_controls_hot |= maximize_resp.hovered();
+                                if maximize_resp.clicked() {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                                }
+
+                                let minimize_icon =
+                                    egui::Image::new(egui::include_image!("../../assets/minus.png"))
+                                        .tint(theme.fg);
+                                let minimize_resp = title_bar_image_button(
+                                    ui,
+                                    minimize_icon,
+                                    Vec2::new(14.0, 14.0),
+                                    btn_fill,
+                                    theme.top_border,
+                                );
+                                title_controls_hot |= minimize_resp.hovered();
+                                if minimize_resp.clicked() {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                                }
                             }
-                        }
+                        });
                     });
                 });
+                ui.advance_cursor_after_rect(bar_rect);
 
                 if controls_enabled {
                     let pressed_on_title =
@@ -355,7 +358,7 @@ impl AppState {
         }
 
         egui::ScrollArea::vertical()
-            .id_salt("downloads_manager_scroll")
+            .id_source("downloads_manager_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mut cancel_ids: Vec<u64> = Vec::new();
@@ -638,14 +641,14 @@ impl AppState {
                 paint_window_chrome(ctx, self.theme);
                 handle_window_resize(ctx);
             }
-            let outer_frame = egui::Frame::NONE
+            let outer_frame = egui::Frame::none()
                 .fill(adjust_color(self.theme.top_bg, 0.06))
                 .stroke(Stroke::new(1.0, self.theme.top_border))
                 .inner_margin(egui::Margin {
-                    left: 10,
-                    right: 10,
-                    top: 4,
-                    bottom: 10,
+                    left: 10.0,
+                    right: 10.0,
+                    top: 4.0,
+                    bottom: 10.0,
                 });
             match class {
                 egui::ViewportClass::Embedded => {

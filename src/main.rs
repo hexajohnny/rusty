@@ -21,7 +21,7 @@ struct WgpuBackendAttempt {
     backend: wgpu::Backends,
     label: &'static str,
     score: i32,
-    low_power_hint: bool,
+    available: bool,
 }
 
 fn main() -> eframe::Result<()> {
@@ -46,31 +46,26 @@ fn main() -> eframe::Result<()> {
         return run_with_renderer(eframe::Renderer::Wgpu, None, "wgpu(env)");
     }
 
+    let mut last_err: Option<eframe::Error> = None;
     for attempt in guided_wgpu_backend_attempts() {
+        if !attempt.available {
+            logger::log_line(
+                RENDERER_LOG_PATH,
+                &format!(
+                    "Skipping wgpu backend {} because the probe found no adapters",
+                    attempt.label
+                ),
+            );
+            continue;
+        }
+
         logger::log_line(
             RENDERER_LOG_PATH,
             &format!(
-                "Trying wgpu backend {} (score={} low_power_hint={})",
-                attempt.label, attempt.score, attempt.low_power_hint
+                "Trying wgpu backend {} (score={})",
+                attempt.label, attempt.score
             ),
         );
-
-        let tried_glow_first = attempt.backend == wgpu::Backends::GL && attempt.low_power_hint;
-        if tried_glow_first {
-            logger::log_line(
-                RENDERER_LOG_PATH,
-                "Low-power GL adapter detected; trying glow before wgpu-gl.",
-            );
-            match run_with_renderer(eframe::Renderer::Glow, None, "glow(gl-preferred-low-power)") {
-                Ok(()) => return Ok(()),
-                Err(glow_err) => {
-                    logger::log_line(
-                        RENDERER_LOG_PATH,
-                        &format!("Preferred Glow GL path failed: {glow_err}"),
-                    );
-                }
-            }
-        }
 
         match run_with_renderer(eframe::Renderer::Wgpu, Some(attempt.backend), attempt.label) {
             Ok(()) => return Ok(()),
@@ -79,33 +74,12 @@ fn main() -> eframe::Result<()> {
                     RENDERER_LOG_PATH,
                     &format!("wgpu backend {} failed: {err}", attempt.label),
                 );
-                if attempt.backend == wgpu::Backends::GL && !tried_glow_first {
-                    logger::log_line(
-                        RENDERER_LOG_PATH,
-                        "wgpu-gl failed; trying glow before advancing to the next backend.",
-                    );
-                    match run_with_renderer(eframe::Renderer::Glow, None, "glow(gl-fallback)") {
-                        Ok(()) => return Ok(()),
-                        Err(glow_err) => {
-                            logger::log_line(
-                                RENDERER_LOG_PATH,
-                                &format!("Glow GL fallback failed: {glow_err}"),
-                            );
-                        }
-                    }
-                }
+                last_err = Some(err);
             }
         }
     }
 
-    logger::log_line(
-        RENDERER_LOG_PATH,
-        "All guided wgpu backend attempts failed; trying glow fallback.",
-    );
-    run_with_renderer(eframe::Renderer::Glow, None, "glow").map_err(|err| {
-        logger::log_line(RENDERER_LOG_PATH, &format!("Glow fallback failed: {err}"));
-        err
-    })
+    Err(last_err.expect("renderer attempts should produce an error"))
 }
 
 fn run_with_renderer(
@@ -118,14 +92,7 @@ fn run_with_renderer(
         ..Default::default()
     };
     if let Some(backends) = backend_override {
-        native_options.wgpu_options.wgpu_setup = egui_wgpu::WgpuSetupCreateNew {
-            instance_descriptor: wgpu::InstanceDescriptor {
-                backends,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-        .into();
+        native_options.wgpu_options.supported_backends = backends;
     }
     // Hide native window chrome; we draw our own title bar + close button in egui.
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok();
@@ -143,7 +110,7 @@ fn run_with_renderer(
         native_options,
         Box::new(move |cc| {
             log_renderer_selection(renderer, attempt_label, cc);
-            Ok(Box::new(app::AppState::new()))
+            Box::new(app::AppState::new())
         }),
     )
 }
@@ -161,26 +128,22 @@ fn platform_backend_candidates() -> Vec<(wgpu::Backends, &'static str)> {
         vec![
             (wgpu::Backends::VULKAN, "vulkan"),
             (wgpu::Backends::DX12, "dx12"),
-            (wgpu::Backends::GL, "gl"),
         ]
     }
 
     #[cfg(target_os = "macos")]
     {
-        vec![(wgpu::Backends::METAL, "metal"), (wgpu::Backends::GL, "gl")]
+        vec![(wgpu::Backends::VULKAN, "vulkan")]
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        vec![
-            (wgpu::Backends::VULKAN, "vulkan"),
-            (wgpu::Backends::GL, "gl"),
-        ]
+        vec![(wgpu::Backends::VULKAN, "vulkan")]
     }
 }
 
 fn probe_backend_attempt(backends: wgpu::Backends, label: &'static str) -> WgpuBackendAttempt {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
         ..Default::default()
     });
@@ -194,23 +157,20 @@ fn probe_backend_attempt(backends: wgpu::Backends, label: &'static str) -> WgpuB
             backend: backends,
             label,
             score: i32::MIN / 4,
-            low_power_hint: true,
+            available: false,
         };
     }
 
     let mut best_score = i32::MIN / 4;
-    let mut best_low_power_hint = true;
     let mut summaries = Vec::new();
     for adapter in adapters {
         let info = adapter.get_info();
         let score = adapter_score(&info);
-        let low_power_hint = is_low_power_adapter(&info);
         if score > best_score {
             best_score = score;
-            best_low_power_hint = low_power_hint;
         }
         summaries.push(format!(
-            "{}:{}:{:?}:score={score}:low_power={low_power_hint}",
+            "{}:{}:{:?}:score={score}",
             info.backend.to_str(),
             info.name,
             info.device_type,
@@ -224,7 +184,7 @@ fn probe_backend_attempt(backends: wgpu::Backends, label: &'static str) -> WgpuB
         backend: backends,
         label,
         score: best_score,
-        low_power_hint: best_low_power_hint,
+        available: true,
     }
 }
 
@@ -248,7 +208,7 @@ fn adapter_score(info: &wgpu::AdapterInfo) -> i32 {
             wgpu::Backend::Metal => 70,
             wgpu::Backend::Gl => 20,
             wgpu::Backend::BrowserWebGpu => 5,
-            wgpu::Backend::Noop => -1000,
+            wgpu::Backend::Empty => -1000,
         },
         wgpu::DeviceType::IntegratedGpu => match info.backend {
             wgpu::Backend::Vulkan => 70,
@@ -256,7 +216,7 @@ fn adapter_score(info: &wgpu::AdapterInfo) -> i32 {
             wgpu::Backend::Metal => 60,
             wgpu::Backend::Gl => 25,
             wgpu::Backend::BrowserWebGpu => 5,
-            wgpu::Backend::Noop => -1000,
+            wgpu::Backend::Empty => -1000,
         },
         wgpu::DeviceType::VirtualGpu => match info.backend {
             wgpu::Backend::Gl => 95,
@@ -264,7 +224,7 @@ fn adapter_score(info: &wgpu::AdapterInfo) -> i32 {
             wgpu::Backend::Metal => 35,
             wgpu::Backend::Dx12 => -10,
             wgpu::Backend::BrowserWebGpu => 5,
-            wgpu::Backend::Noop => -1000,
+            wgpu::Backend::Empty => -1000,
         },
         wgpu::DeviceType::Cpu => match info.backend {
             wgpu::Backend::Gl => 65,
@@ -272,7 +232,7 @@ fn adapter_score(info: &wgpu::AdapterInfo) -> i32 {
             wgpu::Backend::Metal => 10,
             wgpu::Backend::Dx12 => -60,
             wgpu::Backend::BrowserWebGpu => 5,
-            wgpu::Backend::Noop => -1000,
+            wgpu::Backend::Empty => -1000,
         },
         wgpu::DeviceType::Other => match info.backend {
             wgpu::Backend::Vulkan => 55,
@@ -280,7 +240,7 @@ fn adapter_score(info: &wgpu::AdapterInfo) -> i32 {
             wgpu::Backend::Metal => 45,
             wgpu::Backend::Gl => 35,
             wgpu::Backend::BrowserWebGpu => 5,
-            wgpu::Backend::Noop => -1000,
+            wgpu::Backend::Empty => -1000,
         },
     };
     device_score + backend_score + software_penalty
@@ -305,10 +265,6 @@ fn is_low_power_adapter(info: &wgpu::AdapterInfo) -> bool {
         info.device_type,
         wgpu::DeviceType::VirtualGpu | wgpu::DeviceType::Cpu
     ) || is_software_adapter_name(&info.name)
-}
-
-fn is_low_power_gl_renderer(vendor: &str, renderer_name: &str) -> bool {
-    is_software_adapter_name(&format!("{vendor} {renderer_name}"))
 }
 
 fn log_renderer_selection(
@@ -337,53 +293,11 @@ fn log_renderer_selection(
         );
         return;
     }
-
-    if let Some(gl) = cc.gl.as_ref() {
-        use eframe::glow::HasContext as _;
-        let version = unsafe { gl.get_parameter_string(eframe::glow::VERSION) };
-        let renderer_name = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
-        let vendor = unsafe { gl.get_parameter_string(eframe::glow::VENDOR) };
-        let low_power = is_low_power_gl_renderer(&vendor, &renderer_name);
-        std::env::set_var(
-            RUSTY_LOW_POWER_RENDERER_ENV,
-            if low_power { "1" } else { "0" },
-        );
-        std::env::set_var(RUSTY_RENDERER_KIND_ENV, "glow");
-        std::env::remove_var(RUSTY_WGPU_BACKEND_ENV);
-        logger::log_line(
-            RENDERER_LOG_PATH,
-            &format!(
-                "Glow context ({attempt_label}) vendor={vendor} renderer={renderer_name} version={version}"
-            ),
-        );
-        logger::log_line(
-            RENDERER_LOG_PATH,
-            &format!(
-                "Renderer {:?} ({attempt_label}) initialized low_power={low_power}",
-                renderer
-            ),
-        );
-        return;
-    }
-
-    let low_power = matches!(renderer, eframe::Renderer::Glow);
-    std::env::set_var(
-        RUSTY_LOW_POWER_RENDERER_ENV,
-        if low_power { "1" } else { "0" },
-    );
-    std::env::set_var(
-        RUSTY_RENDERER_KIND_ENV,
-        match renderer {
-            eframe::Renderer::Glow => "glow",
-            eframe::Renderer::Wgpu => "wgpu",
-        },
-    );
+    std::env::set_var(RUSTY_LOW_POWER_RENDERER_ENV, "0");
+    std::env::set_var(RUSTY_RENDERER_KIND_ENV, "wgpu");
     std::env::remove_var(RUSTY_WGPU_BACKEND_ENV);
     logger::log_line(
         RENDERER_LOG_PATH,
-        &format!(
-            "Renderer {:?} ({attempt_label}) initialized low_power={low_power}",
-            renderer
-        ),
+        &format!("Renderer {:?} ({attempt_label}) initialized", renderer),
     );
 }

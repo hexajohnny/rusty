@@ -21,6 +21,11 @@ impl AppState {
         let term_id = Id::new(("terminal_view", tab.id));
         let response = ui.interact(rect, term_id, Sense::click_and_drag());
         tab.last_view_rect = Some(rect);
+        let remote_mouse_capturing = tab.active_remote_mouse.is_some()
+            || (tab.connected
+                && tab.screen.mouse_protocol_mode()
+                    != crate::terminal_emulator::MouseProtocolMode::None
+                && !ui.input(|i| i.modifiers.shift));
 
         // Keep terminal focus locked to the terminal for common terminal keys (arrows/tab/escape).
         // Without this, egui may move focus to other widgets (e.g. the settings cog) on arrow keys.
@@ -36,7 +41,11 @@ impl AppState {
             );
         });
 
-        if response.clicked() || response.secondary_clicked() || response.middle_clicked() {
+        if response.is_pointer_button_down_on()
+            || response.clicked()
+            || response.secondary_clicked()
+            || response.middle_clicked()
+        {
             response.request_focus();
         }
         if tab.focus_terminal_next_frame {
@@ -44,12 +53,14 @@ impl AppState {
             tab.focus_terminal_next_frame = false;
         }
 
-        response.context_menu(|ui: &mut egui::Ui| {
-            Self::show_terminal_context_menu(ui, ctx, clipboard, tab);
-        });
+        if !remote_mouse_capturing {
+            response.context_menu(|ui: &mut egui::Ui| {
+                Self::show_terminal_context_menu(ui, ctx, clipboard, tab);
+            });
+        }
 
         let painter = ui.painter().with_clip_rect(rect);
-        let rounding = egui::CornerRadius::ZERO;
+        let rounding = egui::Rounding::ZERO;
         painter.rect_filled(rect, rounding, options.term_theme.bg);
 
         // Compute visible rows/cols and keep the remote PTY in sync.
@@ -216,8 +227,8 @@ impl AppState {
             let glow = Stroke::new(3.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a_glow));
             let r0 = rect.shrink(1.0);
             let r1 = rect.shrink(3.0);
-            painter.rect_stroke(r1, rounding, glow, egui::StrokeKind::Inside);
-            painter.rect_stroke(r0, rounding, stroke, egui::StrokeKind::Inside);
+            painter.rect_stroke(r1, rounding, glow);
+            painter.rect_stroke(r0, rounding, stroke);
         }
     }
 }

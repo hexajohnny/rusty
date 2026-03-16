@@ -140,6 +140,7 @@ pub enum UiMessage {
     Status(StatusUpdate),
     Screen(Box<crate::terminal_emulator::Screen>),
     ScrollbackMax(usize),
+    Clipboard(crate::terminal_emulator::ClipboardWrite),
     Connected(bool),
     AuthPrompt(AuthPrompt),
     HostKeyPrompt(HostKeyPrompt),
@@ -666,6 +667,12 @@ fn send_scrollback_max(ui_tx: &Sender<UiMessage>, parser: &mut Parser) {
         ui_tx,
         UiMessage::ScrollbackMax(parser.screen().scrollback_max()),
     );
+}
+
+fn send_clipboard_writes(ui_tx: &Sender<UiMessage>, parser: &mut Parser) {
+    for write in parser.take_clipboard_writes() {
+        send_message(ui_tx, UiMessage::Clipboard(write));
+    }
 }
 
 fn bridge_receiver_to_async<T: Send + 'static>(rx: Receiver<T>) -> UnboundedReceiver<T> {
@@ -4033,6 +4040,7 @@ async fn run_terminal_client_async(
                             data.as_ref(),
                         )
                         .await?;
+                        send_clipboard_writes(&ui_tx, &mut parser);
                         screen_rate_window_bytes =
                             screen_rate_window_bytes.saturating_add(data.len() as u64);
                         screen_dirty = true;
@@ -4046,6 +4054,7 @@ async fn run_terminal_client_async(
                             data.as_ref(),
                         )
                         .await?;
+                        send_clipboard_writes(&ui_tx, &mut parser);
                         screen_rate_window_bytes =
                             screen_rate_window_bytes.saturating_add(data.len() as u64);
                         screen_dirty = true;

@@ -432,9 +432,15 @@ impl TermAbsSelection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct PendingRemoteClick {
-    start_pos: Pos2,
-    start_cell: (u16, u16), // (row, col) 0-based
+struct RemoteMouseReportPosition {
+    x_1: u16,
+    y_1: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ActiveRemoteMouse {
+    button: egui::PointerButton,
+    pos: RemoteMouseReportPosition,
 }
 
 struct RenamePopup {
@@ -877,7 +883,9 @@ struct SshTab {
 
     selection: Option<TermSelection>,
     abs_selection: Option<TermAbsSelection>,
-    pending_remote_click: Option<PendingRemoteClick>,
+    active_remote_mouse: Option<ActiveRemoteMouse>,
+    remote_hover_pos: Option<RemoteMouseReportPosition>,
+    remote_scroll_accum: Vec2,
 
     pending_auth: Option<ssh::AuthPrompt>,
     pending_host_key: Option<ssh::HostKeyPrompt>,
@@ -938,7 +946,9 @@ impl SshTab {
             log_path,
             selection: None,
             abs_selection: None,
-            pending_remote_click: None,
+            active_remote_mouse: None,
+            remote_hover_pos: None,
+            remote_scroll_accum: Vec2::ZERO,
             pending_auth: None,
             pending_host_key: None,
             pending_restore_attach_group: None,
@@ -1089,7 +1099,9 @@ impl SshTab {
         self.copy_flash_until = None;
         self.selection = None;
         self.abs_selection = None;
-        self.pending_remote_click = None;
+        self.active_remote_mouse = None;
+        self.remote_hover_pos = None;
+        self.remote_scroll_accum = Vec2::ZERO;
         self.pending_auth = None;
         self.pending_host_key = None;
         self.pending_restore_attach_group = None;
@@ -1102,7 +1114,23 @@ impl SshTab {
         self.render_cache = None;
     }
 
-    fn poll_messages(&mut self) -> bool {
+    fn apply_remote_clipboard_write(
+        ctx: &egui::Context,
+        clipboard: &mut Option<Clipboard>,
+        write: crate::terminal_emulator::ClipboardWrite,
+    ) {
+        let crate::terminal_emulator::ClipboardWrite { target: _, text } = write;
+        if let Some(text) = text {
+            ctx.copy_text(text.clone());
+            if let Some(cb) = clipboard.as_mut() {
+                let _ = cb.set_text(text);
+            }
+        } else if let Some(cb) = clipboard.as_mut() {
+            let _ = cb.clear();
+        }
+    }
+
+    fn poll_messages(&mut self, ctx: &egui::Context, clipboard: &mut Option<Clipboard>) -> bool {
         const MAX_MSGS_PER_FRAME: usize = 256;
         let mut processed = 0usize;
         let mut saw_message = false;
@@ -1130,6 +1158,10 @@ impl SshTab {
                         Ok(UiMessage::ScrollbackMax(max)) => {
                             saw_message = true;
                             latest_scrollback_max = Some(max);
+                        }
+                        Ok(UiMessage::Clipboard(write)) => {
+                            saw_message = true;
+                            Self::apply_remote_clipboard_write(ctx, clipboard, write);
                         }
                         Ok(UiMessage::Connected(ok)) => {
                             saw_message = true;
@@ -1288,7 +1320,7 @@ pub struct AppState {
     pending_upload_conflict_prompts: VecDeque<ssh::UploadConflictPrompt>,
 
     style_initialized: bool,
-    style_pixels_per_point_bits: u32,
+    style_scale_key: u32,
 
     layout_dirty: bool,
     active_tile_dirty: bool,

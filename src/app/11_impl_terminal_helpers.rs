@@ -19,6 +19,17 @@ struct CellLookup<'a> {
     cols: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteMouseAction {
+    Press(egui::PointerButton),
+    Release(egui::PointerButton),
+    Move(Option<egui::PointerButton>),
+    WheelUp,
+    WheelDown,
+    WheelLeft,
+    WheelRight,
+}
+
 impl AppState {
     fn visible_cell_to_abs(tab: &SshTab, row: u16, col: u16) -> (i64, u16) {
         let top_abs = (tab.scrollback_max as i64 - tab.screen.scrollback() as i64).max(0);
@@ -38,7 +49,7 @@ impl AppState {
         }
 
         let ppp = ctx.pixels_per_point();
-        let (cell_w, cell_h) = ctx.fonts_mut(|fonts| {
+        let (cell_w, cell_h) = ctx.fonts(|fonts| {
             // Derive metrics from actual layout to better match pixel snapping in the text renderer.
             let sample = "WWWWWWWWWWWWWWWW";
             let galley = fonts.layout_no_wrap(sample.to_string(), font_id.clone(), Color32::WHITE);
@@ -79,7 +90,7 @@ impl AppState {
         }
 
         let job = Self::screen_to_layout_job(&tab.screen, font_id.clone(), term_theme);
-        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        let galley = ui.fonts(|fonts| fonts.layout_job(job));
         tab.render_cache = Some(TerminalRenderCache {
             font_size_bits,
             pixels_per_point_bits,
@@ -242,6 +253,12 @@ impl AppState {
         }
     }
 
+    fn clear_remote_mouse_state(tab: &mut SshTab) {
+        tab.active_remote_mouse = None;
+        tab.remote_hover_pos = None;
+        tab.remote_scroll_accum = Vec2::ZERO;
+    }
+
     fn select_all(tab: &mut SshTab) {
         let (rows, cols) = tab.screen.size();
         if rows == 0 || cols == 0 {
@@ -262,7 +279,7 @@ impl AppState {
             cursor: (last_abs_row, last_col),
             dragging: false,
         });
-        tab.pending_remote_click = None;
+        Self::clear_remote_mouse_state(tab);
     }
 
     fn show_terminal_context_menu(
@@ -278,13 +295,13 @@ impl AppState {
 
         if ui.add_enabled(can_copy, egui::Button::new("Copy")).clicked() {
             Self::copy_selection_with_flash(ctx, clipboard, tab, selected_text);
-            ui.close();
+            ui.close_menu();
         }
 
         if ui.add_enabled(tab.connected, egui::Button::new("Paste")).clicked() {
             Self::paste_from_clipboard(tab, clipboard);
-            tab.pending_remote_click = None;
-            ui.close();
+            Self::clear_remote_mouse_state(tab);
+            ui.close_menu();
         }
 
         ui.separator();
@@ -294,7 +311,7 @@ impl AppState {
             .clicked()
         {
             Self::select_all(tab);
-            ui.close();
+            ui.close_menu();
         }
     }
 
@@ -572,43 +589,143 @@ impl AppState {
         }
     }
 
+    fn mouse_modifier_bits(mods: egui::Modifiers) -> u8 {
+        let mut bits = 0u8;
+        if mods.shift {
+            bits = bits.saturating_add(4);
+        }
+        if mods.alt {
+            bits = bits.saturating_add(8);
+        }
+        if mods.ctrl {
+            bits = bits.saturating_add(16);
+        }
+        bits
+    }
+
+    fn mouse_button_code(button: egui::PointerButton) -> Option<u8> {
+        match button {
+            egui::PointerButton::Primary => Some(0),
+            egui::PointerButton::Middle => Some(1),
+            egui::PointerButton::Secondary => Some(2),
+            _ => None,
+        }
+    }
+
+    fn append_encoded_mouse_coord(coord_1: u16, utf8: bool, out: &mut Vec<u8>) -> bool {
+        let value = u32::from(coord_1).saturating_add(32);
+        if utf8 {
+            if value >= 0x800 {
+                return false;
+            }
+            let mut buf = [0; 2];
+            let Some(ch) = char::from_u32(value) else {
+                return false;
+            };
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            true
+        } else if value < 0x100 {
+            out.push(value as u8);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn mouse_report_position(
+        pos: Pos2,
+        lookup: &CellLookup<'_>,
+        screen: &crate::terminal_emulator::Screen,
+        encoding: crate::terminal_emulator::MouseProtocolEncoding,
+        pixels_per_point: f32,
+    ) -> Option<RemoteMouseReportPosition> {
+        match encoding {
+            crate::terminal_emulator::MouseProtocolEncoding::SgrPixels => {
+                let rel_x = ((pos.x - lookup.origin.x).max(0.0) * pixels_per_point).floor();
+                let rel_y = ((pos.y - lookup.origin.y).max(0.0) * pixels_per_point).floor();
+                let x_1 = (rel_x.max(0.0) as u32)
+                    .saturating_add(1)
+                    .min(u16::MAX as u32) as u16;
+                let y_1 = (rel_y.max(0.0) as u32)
+                    .saturating_add(1)
+                    .min(u16::MAX as u32) as u16;
+                Some(RemoteMouseReportPosition { x_1, y_1 })
+            }
+            _ => Self::pos_to_cell(pos, lookup, screen).map(|(row, col)| RemoteMouseReportPosition {
+                x_1: col.saturating_add(1),
+                y_1: row.saturating_add(1),
+            }),
+        }
+    }
+
     fn mouse_event_bytes(
         encoding: crate::terminal_emulator::MouseProtocolEncoding,
-        mode: crate::terminal_emulator::MouseProtocolMode,
-        pressed: bool,
-        button: egui::PointerButton,
-        col_1: u16,
-        row_1: u16,
+        action: RemoteMouseAction,
+        pos: RemoteMouseReportPosition,
+        mods: egui::Modifiers,
     ) -> Option<Vec<u8>> {
-        if mode == crate::terminal_emulator::MouseProtocolMode::None {
-            return None;
-        }
-
-        let btn_code = match button {
-            egui::PointerButton::Primary => 0u8,
-            egui::PointerButton::Middle => 1u8,
-            egui::PointerButton::Secondary => 2u8,
-            _ => return None,
+        let modifier_bits = Self::mouse_modifier_bits(mods);
+        let (cb, sgr_suffix) = match action {
+            RemoteMouseAction::Press(button) => {
+                (Self::mouse_button_code(button)?.saturating_add(modifier_bits), b'M')
+            }
+            RemoteMouseAction::Release(button) => match encoding {
+                crate::terminal_emulator::MouseProtocolEncoding::Sgr
+                | crate::terminal_emulator::MouseProtocolEncoding::SgrPixels => {
+                    (Self::mouse_button_code(button)?.saturating_add(modifier_bits), b'm')
+                }
+                _ => (3, b'M'),
+            },
+            RemoteMouseAction::Move(button) => {
+                let base = match button {
+                    Some(button) => Self::mouse_button_code(button)?,
+                    None => 3,
+                };
+                (32u8.saturating_add(base).saturating_add(modifier_bits), b'M')
+            }
+            RemoteMouseAction::WheelUp => (64u8.saturating_add(modifier_bits), b'M'),
+            RemoteMouseAction::WheelDown => (65u8.saturating_add(modifier_bits), b'M'),
+            RemoteMouseAction::WheelLeft => (66u8.saturating_add(modifier_bits), b'M'),
+            RemoteMouseAction::WheelRight => (67u8.saturating_add(modifier_bits), b'M'),
         };
 
-        // In press-only mode, ignore releases.
-        if mode == crate::terminal_emulator::MouseProtocolMode::Press && !pressed {
-            return None;
-        }
-
         match encoding {
-            crate::terminal_emulator::MouseProtocolEncoding::Sgr => {
-                let suffix = if pressed { b'M' } else { b'm' };
-                let s = format!("\x1b[<{};{};{}{}", btn_code, col_1, row_1, suffix as char);
+            crate::terminal_emulator::MouseProtocolEncoding::Sgr
+            | crate::terminal_emulator::MouseProtocolEncoding::SgrPixels => {
+                let s = format!("\x1b[<{};{};{}{}", cb, pos.x_1, pos.y_1, sgr_suffix as char);
                 Some(s.into_bytes())
             }
-            _ => {
-                // Default encoding: CSI M Cb Cx Cy. Release is encoded with Cb=3.
-                let cb = 32u8 + if pressed { btn_code } else { 3u8 };
-                let cx = 32u8.saturating_add(col_1.min(223) as u8);
-                let cy = 32u8.saturating_add(row_1.min(223) as u8);
-                Some(vec![0x1b, b'[', b'M', cb, cx, cy])
+            crate::terminal_emulator::MouseProtocolEncoding::Urxvt => {
+                let b = 32u16.saturating_add(cb as u16);
+                let s = format!("\x1b[{b};{};{}M", pos.x_1, pos.y_1);
+                Some(s.into_bytes())
             }
+            crate::terminal_emulator::MouseProtocolEncoding::Utf8
+            | crate::terminal_emulator::MouseProtocolEncoding::Default => {
+                let mut out = vec![0x1b, b'[', b'M', 32u8.saturating_add(cb)];
+                let utf8 = matches!(
+                    encoding,
+                    crate::terminal_emulator::MouseProtocolEncoding::Utf8
+                );
+                if !Self::append_encoded_mouse_coord(pos.x_1, utf8, &mut out)
+                    || !Self::append_encoded_mouse_coord(pos.y_1, utf8, &mut out)
+                {
+                    return None;
+                }
+                Some(out)
+            }
+        }
+    }
+
+    fn send_remote_mouse_action(
+        tab: &mut SshTab,
+        action: RemoteMouseAction,
+        pos: RemoteMouseReportPosition,
+        mods: egui::Modifiers,
+    ) {
+        let encoding = tab.screen.mouse_protocol_encoding();
+        if let Some(bytes) = Self::mouse_event_bytes(encoding, action, pos, mods) {
+            Self::send_bytes(tab, bytes);
         }
     }
 
@@ -657,16 +774,45 @@ impl AppState {
         let pointer_pos = response
             .interact_pointer_pos()
             .or_else(|| ui.input(|i| i.pointer.latest_pos()));
-        let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
-        let primary_down = ui.input(|i| i.pointer.primary_down());
-        let primary_released = ui.input(|i| i.pointer.primary_released());
+        let primary_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+        let primary_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+        let primary_released =
+            ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+        let middle_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+        let middle_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+        let middle_released =
+            ui.input(|i| i.pointer.button_released(egui::PointerButton::Middle));
+        let secondary_pressed =
+            ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
+        let secondary_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+        let secondary_released =
+            ui.input(|i| i.pointer.button_released(egui::PointerButton::Secondary));
         let hovering_term = pointer_pos.map(|pos| term_rect.contains(pos)).unwrap_or(false) || response.hovered();
-        let context_menu_open = ctx.is_popup_open();
+        let context_menu_open = ctx.memory(|mem| mem.any_popup_open());
+        let pixels_per_point = ctx.pixels_per_point().max(1.0);
+        let mouse_mode = tab.screen.mouse_protocol_mode();
+        let mouse_encoding = tab.screen.mouse_protocol_encoding();
+        // Clamp to the text grid area (not the outer padding) so selections still work if
+        // you start dragging inside the padding.
+        let grid_min = origin;
+        let mut grid_max = Pos2::new(term_rect.right() - TERM_PAD_X, term_rect.bottom() - TERM_PAD_Y);
+        grid_max.x = grid_max.x.max(grid_min.x + 1.0);
+        grid_max.y = grid_max.y.max(grid_min.y + 1.0);
+        let clamp_pos_to_grid = |p: Pos2| -> Pos2 {
+            let x = p.x.clamp(grid_min.x, grid_max.x - 0.001);
+            let y = p.y.clamp(grid_min.y, grid_max.y - 0.001);
+            Pos2::new(x, y)
+        };
 
-        if response.middle_clicked() && tab.connected {
+        if !allow_remote_mouse && tab.active_remote_mouse.is_none() {
+            tab.remote_hover_pos = None;
+            tab.remote_scroll_accum = Vec2::ZERO;
+        }
+
+        if !allow_remote_mouse && response.middle_clicked() && tab.connected {
             Self::paste_from_clipboard(tab, clipboard);
             response.request_focus();
-            tab.pending_remote_click = None;
+            Self::clear_remote_mouse_state(tab);
         }
 
         // Scrollbar interaction (hover-only; click-drag to scroll).
@@ -723,49 +869,100 @@ impl AppState {
             }
         }
 
-        // Local scrollback (mouse wheel / trackpad). This is independent of any remote app state.
-        if hovering_term && tab.connected {
-            // Prefer per-frame wheel events. `smooth_scroll_delta` introduces inertial drift and
-            // can keep scrolling on repaint ticks even after wheel input has stopped.
-            let mut dy = 0.0f32;
-            for ev in events.iter() {
-                if let egui::Event::MouseWheel { delta, .. } = ev {
-                    dy += delta.y;
-                }
+        let mut wheel_delta = Vec2::ZERO;
+        for ev in events.iter() {
+            if let egui::Event::MouseWheel { delta, .. } = ev {
+                wheel_delta += *delta;
             }
-            if dy.abs() <= 0.001 {
-                dy = ui.input(|i| i.raw_scroll_delta.y);
-            }
+        }
 
-            if dy.abs() > 0.001 {
-                // Accumulate into rows and apply integer deltas.
-                let step = cell_h.max(1.0);
-                tab.scroll_wheel_accum += dy / step;
-                let rows_delta = (tab.scroll_wheel_accum.trunc() as i64).clamp(-256, 256) as i32;
-                if rows_delta != 0 {
-                    tab.scroll_wheel_accum -= rows_delta as f32;
-                    let cur = tab.screen.scrollback() as i64;
-                    let max = tab.scrollback_max as i64;
-                    let delta = rows_delta as i64;
-                    let next = (cur + delta).clamp(0, max) as usize;
-                    if next != tab.screen.scrollback() {
-                        Self::set_scrollback(tab, next);
+        // Local scrollback or remote wheel reporting.
+        if hovering_term && tab.connected {
+            if allow_remote_mouse {
+                let step_x = cell_w.max(1.0);
+                let step_y = cell_h.max(1.0);
+                tab.remote_scroll_accum.x += wheel_delta.x / step_x;
+                tab.remote_scroll_accum.y += wheel_delta.y / step_y;
+
+                let x_steps = (tab.remote_scroll_accum.x.trunc() as i64).clamp(-32, 32) as i32;
+                if x_steps != 0 {
+                    tab.remote_scroll_accum.x -= x_steps as f32;
+                    let action = if x_steps > 0 {
+                        RemoteMouseAction::WheelRight
+                    } else {
+                        RemoteMouseAction::WheelLeft
+                    };
+                    if let Some(report_pos) = pointer_pos
+                        .filter(|pos| term_rect.contains(*pos))
+                        .map(clamp_pos_to_grid)
+                        .and_then(|pos| {
+                            Self::mouse_report_position(
+                                pos,
+                                &cell_lookup,
+                                &tab.screen,
+                                mouse_encoding,
+                                pixels_per_point,
+                            )
+                        })
+                    {
+                        for _ in 0..x_steps.unsigned_abs() {
+                            Self::send_remote_mouse_action(tab, action, report_pos, global_mods);
+                        }
+                    }
+                }
+
+                let y_steps = (tab.remote_scroll_accum.y.trunc() as i64).clamp(-32, 32) as i32;
+                if y_steps != 0 {
+                    tab.remote_scroll_accum.y -= y_steps as f32;
+                    let action = if y_steps > 0 {
+                        RemoteMouseAction::WheelUp
+                    } else {
+                        RemoteMouseAction::WheelDown
+                    };
+                    if let Some(report_pos) = pointer_pos
+                        .filter(|pos| term_rect.contains(*pos))
+                        .map(clamp_pos_to_grid)
+                        .and_then(|pos| {
+                            Self::mouse_report_position(
+                                pos,
+                                &cell_lookup,
+                                &tab.screen,
+                                mouse_encoding,
+                                pixels_per_point,
+                            )
+                        })
+                    {
+                        for _ in 0..y_steps.unsigned_abs() {
+                            Self::send_remote_mouse_action(tab, action, report_pos, global_mods);
+                        }
+                    }
+                }
+            } else {
+                // Prefer per-frame wheel events. `smooth_scroll_delta` introduces inertial drift and
+                // can keep scrolling on repaint ticks even after wheel input has stopped.
+                let mut dy = wheel_delta.y;
+                if dy.abs() <= 0.001 {
+                    dy = ui.input(|i| i.raw_scroll_delta.y);
+                }
+
+                if dy.abs() > 0.001 {
+                    // Accumulate into rows and apply integer deltas.
+                    let step = cell_h.max(1.0);
+                    tab.scroll_wheel_accum += dy / step;
+                    let rows_delta = (tab.scroll_wheel_accum.trunc() as i64).clamp(-256, 256) as i32;
+                    if rows_delta != 0 {
+                        tab.scroll_wheel_accum -= rows_delta as f32;
+                        let cur = tab.screen.scrollback() as i64;
+                        let max = tab.scrollback_max as i64;
+                        let delta = rows_delta as i64;
+                        let next = (cur + delta).clamp(0, max) as usize;
+                        if next != tab.screen.scrollback() {
+                            Self::set_scrollback(tab, next);
+                        }
                     }
                 }
             }
         }
-
-        // Clamp to the text grid area (not the outer padding) so selections still work if
-        // you start dragging inside the padding.
-        let grid_min = origin;
-        let mut grid_max = Pos2::new(term_rect.right() - TERM_PAD_X, term_rect.bottom() - TERM_PAD_Y);
-        grid_max.x = grid_max.x.max(grid_min.x + 1.0);
-        grid_max.y = grid_max.y.max(grid_min.y + 1.0);
-        let clamp_pos_to_grid = |p: Pos2| -> Pos2 {
-            let x = p.x.clamp(grid_min.x, grid_max.x - 0.001);
-            let y = p.y.clamp(grid_min.y, grid_max.y - 0.001);
-            Pos2::new(x, y)
-        };
 
         if primary_pressed && !hovering_scrollbar && !context_menu_open {
             if let Some(pos) = pointer_pos {
@@ -773,7 +970,7 @@ impl AppState {
                     let pos = clamp_pos_to_grid(pos);
 
                     if local_select_enabled {
-                        tab.pending_remote_click = None;
+                        Self::clear_remote_mouse_state(tab);
                         if let Some((row, col)) = Self::pos_to_cell(pos, &cell_lookup, &tab.screen)
                         {
                             tab.selection = Some(TermSelection {
@@ -788,26 +985,11 @@ impl AppState {
                                 dragging: true,
                             });
                         }
-                    } else if allow_remote_mouse {
-                        // Remote mouse is enabled. Treat this as a remote click unless the user drags,
-                        // in which case we switch into local selection mode.
-                        tab.selection = None;
-                        tab.abs_selection = None;
-                        if let Some((row, col)) = Self::pos_to_cell(pos, &cell_lookup, &tab.screen)
-                        {
-                            tab.pending_remote_click = Some(PendingRemoteClick {
-                                start_pos: pos,
-                                start_cell: (row, col),
-                            });
-                        } else {
-                            tab.pending_remote_click = None;
-                        }
                     }
                 } else {
-                    // Clicking outside clears selection and any pending click.
+                    // Clicking outside clears any local selection.
                     tab.selection = None;
                     tab.abs_selection = None;
-                    tab.pending_remote_click = None;
                 }
             }
         }
@@ -824,31 +1006,6 @@ impl AppState {
                             if let Some(abs_sel) = tab.abs_selection.as_mut() {
                                 abs_sel.cursor = abs_cursor;
                                 abs_sel.dragging = true;
-                            }
-                        }
-                    }
-                } else if allow_remote_mouse {
-                    // When remote mouse is enabled, a small drag switches the gesture into local selection mode.
-                    if let Some(pending) = tab.pending_remote_click {
-                        let d = pos - pending.start_pos;
-                        if d.length_sq() >= 6.0 * 6.0 {
-                            if let Some((row, col)) =
-                                Self::pos_to_cell(pos, &cell_lookup, &tab.screen)
-                            {
-                                tab.selection = Some(TermSelection {
-                                    anchor: pending.start_cell,
-                                    cursor: (row, col),
-                                    dragging: true,
-                                });
-                                let abs_anchor =
-                                    Self::visible_cell_to_abs(tab, pending.start_cell.0, pending.start_cell.1);
-                                let abs_cursor = Self::visible_cell_to_abs(tab, row, col);
-                                tab.abs_selection = Some(TermAbsSelection {
-                                    anchor: abs_anchor,
-                                    cursor: abs_cursor,
-                                    dragging: true,
-                                });
-                                tab.pending_remote_click = None;
                             }
                         }
                     }
@@ -918,50 +1075,139 @@ impl AppState {
                 if tab.abs_selection.map(|s| s.is_empty()).unwrap_or(false) {
                     tab.abs_selection = None;
                 }
-                // Local selection consumes the gesture: do not send remote click.
-                tab.pending_remote_click = None;
-            } else if allow_remote_mouse {
-                // Dispatch remote click if it was not turned into a local selection.
-                if let Some(pending) = tab.pending_remote_click.take() {
-                    let mode = tab.screen.mouse_protocol_mode();
-                    let encoding = tab.screen.mouse_protocol_encoding();
+            }
+        }
 
-                    let release_cell = pointer_pos
-                        .map(clamp_pos_to_grid)
-                        .and_then(|pos| Self::pos_to_cell(pos, &cell_lookup, &tab.screen))
-                        .unwrap_or(pending.start_cell);
+        if allow_remote_mouse && !hovering_scrollbar && !context_menu_open {
+            for (button, pressed) in [
+                (egui::PointerButton::Primary, primary_pressed),
+                (egui::PointerButton::Middle, middle_pressed),
+                (egui::PointerButton::Secondary, secondary_pressed),
+            ] {
+                if !pressed {
+                    continue;
+                }
+                let Some(pos) = pointer_pos.filter(|pos| term_rect.contains(*pos)) else {
+                    continue;
+                };
+                let pos = clamp_pos_to_grid(pos);
+                let Some(report_pos) = Self::mouse_report_position(
+                    pos,
+                    &cell_lookup,
+                    &tab.screen,
+                    mouse_encoding,
+                    pixels_per_point,
+                ) else {
+                    continue;
+                };
 
-                    // xterm mouse protocol is 1-based coordinates.
-                    let (sr, sc) = pending.start_cell;
-                    let (rr, rc) = release_cell;
-                    let sc_1 = sc.saturating_add(1);
-                    let sr_1 = sr.saturating_add(1);
-                    let rc_1 = rc.saturating_add(1);
-                    let rr_1 = rr.saturating_add(1);
+                tab.selection = None;
+                tab.abs_selection = None;
+                tab.active_remote_mouse = Some(ActiveRemoteMouse {
+                    button,
+                    pos: report_pos,
+                });
+                tab.remote_hover_pos = None;
+                Self::send_remote_mouse_action(tab, RemoteMouseAction::Press(button), report_pos, global_mods);
+                response.request_focus();
+            }
+        }
 
-                    if let Some(bytes) = Self::mouse_event_bytes(
-                        encoding,
-                        mode,
-                        true,
-                        egui::PointerButton::Primary,
-                        sc_1,
-                        sr_1,
+        if let Some(active) = tab.active_remote_mouse {
+            let still_down = match active.button {
+                egui::PointerButton::Primary => primary_down,
+                egui::PointerButton::Middle => middle_down,
+                egui::PointerButton::Secondary => secondary_down,
+                _ => false,
+            };
+            if still_down
+                && !tab.scrollbar_dragging
+                && matches!(
+                    mouse_mode,
+                    crate::terminal_emulator::MouseProtocolMode::Drag
+                        | crate::terminal_emulator::MouseProtocolMode::Move
+                )
+            {
+                if let Some(raw_pos) = pointer_pos {
+                    let pos = clamp_pos_to_grid(raw_pos);
+                    if let Some(report_pos) = Self::mouse_report_position(
+                        pos,
+                        &cell_lookup,
+                        &tab.screen,
+                        mouse_encoding,
+                        pixels_per_point,
                     ) {
-                        Self::send_bytes(tab, bytes);
-                    }
-                    if let Some(bytes) = Self::mouse_event_bytes(
-                        encoding,
-                        mode,
-                        false,
-                        egui::PointerButton::Primary,
-                        rc_1,
-                        rr_1,
-                    ) {
-                        Self::send_bytes(tab, bytes);
+                        if report_pos != active.pos {
+                            Self::send_remote_mouse_action(
+                                tab,
+                                RemoteMouseAction::Move(Some(active.button)),
+                                report_pos,
+                                global_mods,
+                            );
+                            tab.active_remote_mouse = Some(ActiveRemoteMouse {
+                                button: active.button,
+                                pos: report_pos,
+                            });
+                        }
                     }
                 }
-            } else {
-                tab.pending_remote_click = None;
+            }
+        } else if allow_remote_mouse
+            && mouse_mode == crate::terminal_emulator::MouseProtocolMode::Move
+            && hovering_term
+            && !context_menu_open
+        {
+            if let Some(raw_pos) = pointer_pos {
+                let pos = clamp_pos_to_grid(raw_pos);
+                if let Some(report_pos) = Self::mouse_report_position(
+                    pos,
+                    &cell_lookup,
+                    &tab.screen,
+                    mouse_encoding,
+                    pixels_per_point,
+                ) {
+                    if tab.remote_hover_pos != Some(report_pos) {
+                        Self::send_remote_mouse_action(
+                            tab,
+                            RemoteMouseAction::Move(None),
+                            report_pos,
+                            global_mods,
+                        );
+                        tab.remote_hover_pos = Some(report_pos);
+                    }
+                }
+            }
+        } else if !hovering_term || !allow_remote_mouse {
+            tab.remote_hover_pos = None;
+        }
+
+        if let Some(active) = tab.active_remote_mouse {
+            let released = match active.button {
+                egui::PointerButton::Primary => primary_released,
+                egui::PointerButton::Middle => middle_released,
+                egui::PointerButton::Secondary => secondary_released,
+                _ => false,
+            };
+            if released {
+                let report_pos = pointer_pos
+                    .map(clamp_pos_to_grid)
+                    .and_then(|pos| {
+                        Self::mouse_report_position(
+                            pos,
+                            &cell_lookup,
+                            &tab.screen,
+                            mouse_encoding,
+                            pixels_per_point,
+                        )
+                    })
+                    .unwrap_or(active.pos);
+                Self::send_remote_mouse_action(
+                    tab,
+                    RemoteMouseAction::Release(active.button),
+                    report_pos,
+                    global_mods,
+                );
+                tab.active_remote_mouse = None;
             }
         }
 
@@ -1124,14 +1370,14 @@ impl AppState {
 
         let mut row_idx: Option<usize> = None;
         for (i, row) in galley.rows.iter().take(usable_rows).enumerate() {
-            if y >= row.rect().top() && y < row.rect().bottom() {
+            if y >= row.rect.top() && y < row.rect.bottom() {
                 row_idx = Some(i);
                 break;
             }
         }
 
         let row_idx = row_idx.unwrap_or_else(|| {
-            if y >= galley.rows[usable_rows - 1].rect().bottom() {
+            if y >= galley.rows[usable_rows - 1].rect.bottom() {
                 usable_rows - 1
             } else {
                 0
@@ -1410,15 +1656,14 @@ impl AppState {
             let end_i = Self::col_to_char_index(&map, end_col.saturating_add(1));
             let x0 = origin.x + row_g.x_offset(start_i);
             let x1 = origin.x + row_g.x_offset(end_i);
-            let y0 = origin.y + row_g.rect().top();
-            let y1 = origin.y + row_g.rect().bottom();
+            let y0 = origin.y + row_g.rect.top();
+            let y1 = origin.y + row_g.rect.bottom();
             let rect = Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1));
             painter.rect_filled(rect, 0.0, selection_bg);
             painter.rect_stroke(
                 rect,
                 0.0,
                 Stroke::new(1.0, with_alpha(term_theme.selection_fg, 70)),
-                egui::StrokeKind::Inside,
             );
         }
     }
@@ -1460,7 +1705,7 @@ impl AppState {
         let w = (x1 - x0).max(2.0 / ppp.max(1.0));
 
         let thickness = (2.0 * ppp).round().max(1.0) / ppp.max(1.0);
-        let y1 = origin.y + row_g.rect().bottom();
+        let y1 = origin.y + row_g.rect.bottom();
         let rect = Rect::from_min_size(Pos2::new(x0, y1 - thickness), Vec2::new(w, thickness));
         painter.rect_filled(rect, 0.0, cursor_color);
     }
@@ -1537,6 +1782,30 @@ mod tests {
         assert_eq!(
             AppState::key_event_bytes(egui::Key::F12, egui::Modifiers::SHIFT, false),
             Some(b"\x1b[24;2~".to_vec())
+        );
+    }
+
+    #[test]
+    fn mouse_events_encode_sgr_releases_and_urxvt_wheel() {
+        let pos = RemoteMouseReportPosition { x_1: 7, y_1: 3 };
+        assert_eq!(
+            AppState::mouse_event_bytes(
+                crate::terminal_emulator::MouseProtocolEncoding::Sgr,
+                RemoteMouseAction::Release(egui::PointerButton::Secondary),
+                pos,
+                egui::Modifiers::NONE,
+            ),
+            Some(b"\x1b[<2;7;3m".to_vec())
+        );
+
+        assert_eq!(
+            AppState::mouse_event_bytes(
+                crate::terminal_emulator::MouseProtocolEncoding::Urxvt,
+                RemoteMouseAction::WheelUp,
+                RemoteMouseReportPosition { x_1: 10, y_1: 4 },
+                egui::Modifiers::CTRL,
+            ),
+            Some(b"\x1b[112;10;4M".to_vec())
         );
     }
 

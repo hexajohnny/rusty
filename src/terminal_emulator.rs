@@ -1,9 +1,11 @@
+use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{
-    CellAttributes as WezCellAttributes, Intensity, Line, Terminal, TerminalConfiguration,
+    CellAttributes as WezCellAttributes, Clipboard as WezClipboard,
+    ClipboardSelection as WezClipboardSelection, Intensity, Line, Terminal, TerminalConfiguration,
     TerminalSize, Underline,
 };
 
@@ -29,6 +31,18 @@ pub enum MouseProtocolMode {
     Press,
     Drag,
     Move,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardTarget {
+    Clipboard,
+    PrimarySelection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardWrite {
+    pub target: ClipboardTarget,
+    pub text: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -293,6 +307,7 @@ pub struct Parser {
     scrollback: usize,
     mode_state: ModeState,
     seq_filter: SeqFilter,
+    clipboard: Arc<ClipboardCollector>,
 }
 
 impl Parser {
@@ -307,21 +322,26 @@ impl Parser {
             pixel_height: rows.saturating_mul(16),
             dpi: 0,
         };
+        let clipboard = Arc::new(ClipboardCollector::default());
+        let mut terminal = Terminal::new(
+            term_size,
+            Arc::new(ParserConfig {
+                scrollback: scrollback_len,
+            }),
+            "Rusty",
+            env!("CARGO_PKG_VERSION"),
+            Box::new(NullWriter),
+        );
+        let wezterm_clipboard: Arc<dyn WezClipboard> = clipboard.clone();
+        terminal.set_clipboard(&wezterm_clipboard);
         let mut parser = Self {
-            terminal: Terminal::new(
-                term_size,
-                Arc::new(ParserConfig {
-                    scrollback: scrollback_len,
-                }),
-                "Rusty",
-                env!("CARGO_PKG_VERSION"),
-                Box::new(NullWriter),
-            ),
+            terminal,
             screen: Screen::from_snapshot(ScreenSnapshot::empty(rows as u16, cols as u16)),
             screen_dirty: false,
             scrollback: 0,
             mode_state: ModeState::default(),
             seq_filter: SeqFilter::default(),
+            clipboard,
         };
         parser.refresh_screen();
         parser
@@ -357,6 +377,10 @@ impl Parser {
     pub fn set_scrollback(&mut self, rows: usize) {
         self.scrollback = rows;
         self.screen_dirty = true;
+    }
+
+    pub fn take_clipboard_writes(&mut self) -> Vec<ClipboardWrite> {
+        self.clipboard.take_all()
     }
 
     fn refresh_screen_if_dirty(&mut self) {
@@ -649,6 +673,34 @@ fn map_color(attr: ColorAttribute) -> Color {
     }
 }
 
+#[derive(Default)]
+struct ClipboardCollector {
+    writes: Mutex<VecDeque<ClipboardWrite>>,
+}
+
+impl ClipboardCollector {
+    fn take_all(&self) -> Vec<ClipboardWrite> {
+        let mut writes = self.writes.lock().expect("clipboard collector poisoned");
+        writes.drain(..).collect()
+    }
+}
+
+impl WezClipboard for ClipboardCollector {
+    fn set_contents(
+        &self,
+        selection: WezClipboardSelection,
+        data: Option<String>,
+    ) -> anyhow::Result<()> {
+        let target = match selection {
+            WezClipboardSelection::Clipboard => ClipboardTarget::Clipboard,
+            WezClipboardSelection::PrimarySelection => ClipboardTarget::PrimarySelection,
+        };
+        let mut writes = self.writes.lock().expect("clipboard collector poisoned");
+        writes.push_back(ClipboardWrite { target, text: data });
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,5 +733,18 @@ mod tests {
         let mut parser = Parser::new(4, 8, 32);
         parser.process(b"hello");
         assert!(parser.screen().contents().contains("hello"));
+    }
+
+    #[test]
+    fn parser_collects_osc52_clipboard_writes() {
+        let mut parser = Parser::new(4, 8, 32);
+        parser.process(b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(
+            parser.take_clipboard_writes(),
+            vec![ClipboardWrite {
+                target: ClipboardTarget::Clipboard,
+                text: Some("hello".to_string()),
+            }]
+        );
     }
 }

@@ -41,6 +41,7 @@ impl eframe::App for AppState {
 
         self.ensure_tree_non_empty();
 
+        let mut clipboard = self.clipboard.take();
         let message_poll_started = Instant::now();
         let mut saw_terminal_activity = false;
         let mut live_session_count: usize = 0;
@@ -57,7 +58,7 @@ impl eframe::App for AppState {
                         });
                     }
                 }
-                if tab.poll_messages() {
+                if tab.poll_messages(ctx, &mut clipboard) {
                     saw_terminal_activity = true;
                 }
             }
@@ -195,7 +196,6 @@ impl eframe::App for AppState {
             }
         }
 
-        let mut clipboard = self.clipboard.take();
         self.handle_terminal_focus_shortcuts(ctx);
 
         let theme = self.theme;
@@ -217,16 +217,18 @@ impl eframe::App for AppState {
         egui::TopBottomPanel::top("rusty_title_bar")
             .exact_height(TITLE_BAR_H)
             .frame(
-                egui::Frame::NONE
+                egui::Frame::none()
                     .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::NONE)
-                    .inner_margin(egui::Margin::symmetric(TITLE_PAD_X as i8, 1)),
+                    .inner_margin(egui::Margin::symmetric(TITLE_PAD_X, 1.0)),
             )
             .show(ctx, |ui| {
                 ui.visuals_mut().override_text_color = Some(theme.fg);
 
-                // Draggable title bar background. Buttons placed on top will "win" hit-testing.
-                let bar_rect = ui.max_rect();
+                let bar_rect = Rect::from_min_size(
+                    ui.cursor().min,
+                    Vec2::new(ui.available_width(), TITLE_BAR_H),
+                );
                 let drag_resp = ui.interact(
                     bar_rect,
                     Id::new("rusty_title_drag"),
@@ -236,105 +238,107 @@ impl eframe::App for AppState {
                 let btn_fill = adjust_color(theme.top_bg, 0.10);
                 let mut title_controls_hot = false;
 
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(APP_TITLE_TEXT)
-                            .strong()
-                            .color(theme.accent)
-                            .size(16.0),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        let close_icon =
-                            egui::Image::new(egui::include_image!("../../assets/x.png"))
-                                .tint(theme.fg);
-                        let close_resp = title_bar_image_button(
-                            ui,
-                            close_icon,
-                            Vec2::splat(12.0),
-                            btn_fill,
-                            theme.top_border,
+                ui.allocate_ui_at_rect(bar_rect, |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(APP_TITLE_TEXT)
+                                .strong()
+                                .color(theme.accent)
+                                .size(16.0),
                         );
-                        title_controls_hot |= close_resp.hovered();
-                        if close_resp.clicked() {
-                            global_actions.push(TilesAction::Exit);
-                        }
 
-                        let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                        let maximize_icon =
-                            egui::Image::new(egui::include_image!("../../assets/square.png"))
-                                .tint(theme.fg);
-                        let maximize_resp = title_bar_image_button(
-                            ui,
-                            maximize_icon,
-                            Vec2::splat(12.0),
-                            btn_fill,
-                            theme.top_border,
-                        );
-                        title_controls_hot |= maximize_resp.hovered();
-                        if maximize_resp.clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
-                        }
-
-                        // Minimize button (taskbar or tray, depending on settings).
-                        let minimize_icon =
-                            egui::Image::new(egui::include_image!("../../assets/minus.png"))
-                                .tint(theme.fg);
-                        let minimize_resp = title_bar_image_button(
-                            ui,
-                            minimize_icon,
-                            Vec2::new(14.0, 14.0),
-                            btn_fill,
-                            theme.top_border,
-                        );
-                        title_controls_hot |= minimize_resp.hovered();
-                        if minimize_resp.clicked() {
-                            if self.config.minimize_to_tray {
-                                self.minimize_to_tray_requested = true;
-                            } else {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            let close_icon =
+                                egui::Image::new(egui::include_image!("../../assets/x.png"))
+                                    .tint(theme.fg);
+                            let close_resp = title_bar_image_button(
+                                ui,
+                                close_icon,
+                                Vec2::splat(12.0),
+                                btn_fill,
+                                theme.top_border,
+                            );
+                            title_controls_hot |= close_resp.hovered();
+                            if close_resp.clicked() {
+                                global_actions.push(TilesAction::Exit);
                             }
-                        }
 
-                        let target = self.cog_target_tile();
-
-                        let settings_icon =
-                            egui::Image::new(egui::include_image!("../../assets/settings.png"))
-                                .tint(theme.fg);
-                        let settings_resp = title_bar_image_button(
-                            ui,
-                            settings_icon,
-                            Vec2::splat(14.0),
-                            btn_fill,
-                            theme.top_border,
-                        )
-                        .on_hover_text("Open Settings");
-                        title_controls_hot |= settings_resp.hovered();
-                        if settings_resp.clicked() {
-                            if let Some(tile_id) = target {
-                                global_actions.push(TilesAction::OpenSettings(tile_id));
+                            let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                            let maximize_icon =
+                                egui::Image::new(egui::include_image!("../../assets/square.png"))
+                                    .tint(theme.fg);
+                            let maximize_resp = title_bar_image_button(
+                                ui,
+                                maximize_icon,
+                                Vec2::splat(12.0),
+                                btn_fill,
+                                theme.top_border,
+                            );
+                            title_controls_hot |= maximize_resp.hovered();
+                            if maximize_resp.clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
                             }
-                        }
 
-                        // Global downloads manager opener.
-                        let download_icon =
-                            egui::Image::new(egui::include_image!("../../assets/download.png"))
-                                .tint(theme.fg);
-                        let downloads_resp = title_bar_image_button(
-                            ui,
-                            download_icon,
-                            Vec2::splat(14.0),
-                            btn_fill,
-                            theme.top_border,
-                        )
-                        .on_hover_text("Open Transfers Manager");
-                        title_controls_hot |= downloads_resp.hovered();
-                        if downloads_resp.clicked() {
-                            self.open_downloads_window();
-                        }
+                            // Minimize button (taskbar or tray, depending on settings).
+                            let minimize_icon =
+                                egui::Image::new(egui::include_image!("../../assets/minus.png"))
+                                    .tint(theme.fg);
+                            let minimize_resp = title_bar_image_button(
+                                ui,
+                                minimize_icon,
+                                Vec2::new(14.0, 14.0),
+                                btn_fill,
+                                theme.top_border,
+                            );
+                            title_controls_hot |= minimize_resp.hovered();
+                            if minimize_resp.clicked() {
+                                if self.config.minimize_to_tray {
+                                    self.minimize_to_tray_requested = true;
+                                } else {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                                }
+                            }
 
+                            let target = self.cog_target_tile();
+
+                            let settings_icon =
+                                egui::Image::new(egui::include_image!("../../assets/settings.png"))
+                                    .tint(theme.fg);
+                            let settings_resp = title_bar_image_button(
+                                ui,
+                                settings_icon,
+                                Vec2::splat(14.0),
+                                btn_fill,
+                                theme.top_border,
+                            )
+                            .on_hover_text("Open Settings");
+                            title_controls_hot |= settings_resp.hovered();
+                            if settings_resp.clicked() {
+                                if let Some(tile_id) = target {
+                                    global_actions.push(TilesAction::OpenSettings(tile_id));
+                                }
+                            }
+
+                            // Global downloads manager opener.
+                            let download_icon =
+                                egui::Image::new(egui::include_image!("../../assets/download.png"))
+                                    .tint(theme.fg);
+                            let downloads_resp = title_bar_image_button(
+                                ui,
+                                download_icon,
+                                Vec2::splat(14.0),
+                                btn_fill,
+                                theme.top_border,
+                            )
+                            .on_hover_text("Open Transfers Manager");
+                            title_controls_hot |= downloads_resp.hovered();
+                            if downloads_resp.clicked() {
+                                self.open_downloads_window();
+                            }
+                        });
                     });
                 });
+                ui.advance_cursor_after_rect(bar_rect);
 
                 let pressed_on_title =
                     drag_resp.hovered() && ctx.input(|i| i.pointer.primary_pressed());
@@ -353,10 +357,10 @@ impl eframe::App for AppState {
             egui::TopBottomPanel::top("rusty_startup_notice")
                 .resizable(false)
                 .frame(
-                    egui::Frame::NONE
+                    egui::Frame::none()
                         .fill(adjust_color(theme.top_bg, 0.10))
                         .stroke(Stroke::new(1.0, theme.top_border))
-                        .inner_margin(egui::Margin::symmetric(TITLE_PAD_X as i8, 6)),
+                        .inner_margin(egui::Margin::symmetric(TITLE_PAD_X, 6.0)),
                 )
                 .show(ctx, |ui| {
                     ui.visuals_mut().override_text_color = Some(theme.fg);
@@ -404,13 +408,13 @@ impl eframe::App for AppState {
         let tree_ui_started = Instant::now();
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::NONE
+                egui::Frame::none()
                     .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin {
-                        left: CONTENT_PAD as i8,
-                        right: CONTENT_PAD as i8,
-                        top: 0,
-                        bottom: CONTENT_PAD as i8,
+                        left: CONTENT_PAD,
+                        right: CONTENT_PAD,
+                        top: 0.0,
+                        bottom: CONTENT_PAD,
                     }),
             )
             .show(ctx, |ui| {

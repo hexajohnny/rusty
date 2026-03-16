@@ -1,6 +1,6 @@
 [package]
 name = "rusty"
-version = "0.1.6"
+version = "0.1.7"
 authors = ["hexajohnny"]
 edition = "2021"
 build = "build.rs"
@@ -9,11 +9,10 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 anyhow = "1.0"
 arboard = { version = "3.4", default-features = false }
-eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "glow", "default_fonts"] }
-wgpu = { version = "27.0.1", default-features = false, features = ["dx12", "gles", "vulkan", "wgsl"] }
-egui_extras = { version = "0.33.3", features = ["image"] }
-egui-wgpu = { version = "0.33.3", default-features = false, features = ["winit"] }
-egui_tiles = "0.14.1"
+eframe = { version = "=0.26.2", default-features = false, features = ["wgpu", "default_fonts"] }
+wgpu = { version = "=0.19.4", default-features = false, features = ["dx12", "wgsl"] }
+egui_extras = { version = "=0.26.2", features = ["image"] }
+egui_tiles = "=0.7.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"

@@ -1,6 +1,6 @@
 fn paint_window_chrome(ctx: &egui::Context, theme: UiTheme) {
-    let rect = ctx.content_rect();
-    let window_rounding = egui::CornerRadius::ZERO;
+    let rect = ctx.screen_rect();
+    let window_rounding = egui::Rounding::ZERO;
     // Use the shared background layer so our fills are always behind panels/widgets.
     let painter_bg = ctx.layer_painter(egui::LayerId::background());
     // Draw the border/lines above all UI so minimal padding doesn't hide them.
@@ -18,7 +18,6 @@ fn paint_window_chrome(ctx: &egui::Context, theme: UiTheme) {
         rect.shrink(0.5),
         window_rounding,
         Stroke::new(1.0, theme.top_border),
-        egui::StrokeKind::Inside,
     );
 }
 
@@ -37,7 +36,7 @@ fn handle_window_resize(ctx: &egui::Context) {
         return;
     }
 
-    let rect = ctx.content_rect();
+    let rect = ctx.screen_rect();
     let resize_dir_for = |pos: Pos2| {
         let left = pos.x <= rect.left() + RESIZE_MARGIN;
         let right = pos.x >= rect.right() - RESIZE_MARGIN;
@@ -203,7 +202,7 @@ fn title_bar_icon_button<'a>(
     button
         .fill(fill)
         .stroke(Stroke::new(1.0, border))
-        .corner_radius(egui::CornerRadius::same(8))
+        .rounding(egui::Rounding::same(8.0))
         .min_size(Vec2::new(30.0, 24.0))
 }
 

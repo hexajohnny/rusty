@@ -110,13 +110,9 @@ impl AppState {
         let (rect, _) = ui.allocate_exact_size(avail, Sense::hover());
         ui.painter()
             .rect_filled(rect, 0.0, adjust_color(theme.top_bg, 0.05));
-        let mut content = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(rect.shrink(8.0))
-                .layout(egui::Layout::top_down(Align::Min)),
-        );
+        let mut content = ui.child_ui(rect.shrink(8.0), egui::Layout::top_down(Align::Min));
         let rounded_button =
-            |label: &str| egui::Button::new(label).corner_radius(egui::CornerRadius::same(6));
+            |label: &str| egui::Button::new(label).rounding(egui::Rounding::same(6.0));
 
         content.horizontal(|ui| {
             let status_color = if file.source_connected {
@@ -253,7 +249,7 @@ impl AppState {
         content.add_space(6.0);
 
         egui::ScrollArea::vertical()
-            .id_salt(("file_entries", tile_id))
+            .id_source(("file_entries", tile_id))
             .auto_shrink([false, false])
             .show(&mut content, |ui| {
                 let mut entries = file.entries.clone();
@@ -288,12 +284,10 @@ impl AppState {
                         up_rect,
                         10.0,
                         Stroke::new(1.0, theme.top_border),
-                        egui::StrokeKind::Inside,
                     );
-                    let mut up_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(up_rect.shrink2(Vec2::new(4.0, 4.0)))
-                            .layout(egui::Layout::top_down(Align::Center)),
+                    let mut up_ui = ui.child_ui(
+                        up_rect.shrink2(Vec2::new(4.0, 4.0)),
+                        egui::Layout::top_down(Align::Center),
                     );
                     up_ui.vertical_centered(|ui| {
                         let icon = folder_icon.clone().tint(adjust_color(theme.accent, -0.05));
@@ -314,7 +308,7 @@ impl AppState {
                     up_resp.context_menu(|ui| {
                         if ui.button("Open parent").clicked() {
                             actions.push(TilesAction::FileUp(tile_id));
-                            ui.close();
+                            ui.close_menu();
                         }
                     });
 
@@ -346,13 +340,11 @@ impl AppState {
                             Stroke::new(1.0, theme.top_border)
                         };
                         ui.painter().rect_filled(rect, 10.0, fill);
-                        ui.painter()
-                            .rect_stroke(rect, 10.0, stroke, egui::StrokeKind::Inside);
+                        ui.painter().rect_stroke(rect, 10.0, stroke);
 
-                        let mut card_ui = ui.new_child(
-                            egui::UiBuilder::new()
-                                .max_rect(rect.shrink2(Vec2::new(4.0, 4.0)))
-                                .layout(egui::Layout::top_down(Align::Center)),
+                        let mut card_ui = ui.child_ui(
+                            rect.shrink2(Vec2::new(4.0, 4.0)),
+                            egui::Layout::top_down(Align::Center),
                         );
                         card_ui.vertical_centered(|ui| {
                             let icon_tint = if entry.is_dir {
@@ -419,24 +411,24 @@ impl AppState {
                                     pane_id: tile_id,
                                     path,
                                 });
-                                ui.close();
+                                ui.close_menu();
                             }
                             if ui.button("Download").clicked() {
                                 actions.push(TilesAction::FileDownload {
                                     pane_id: tile_id,
                                     name: entry.file_name.clone(),
                                 });
-                                ui.close();
+                                ui.close_menu();
                             }
 
                             ui.separator();
                             if ui.button("Copy to...").clicked() {
                                 file.open_batch_destination_dialog(FileBatchDestinationMode::Copy);
-                                ui.close();
+                                ui.close_menu();
                             }
                             if ui.button("Move to...").clicked() {
                                 file.open_batch_destination_dialog(FileBatchDestinationMode::Move);
-                                ui.close();
+                                ui.close_menu();
                             }
                             if ui
                                 .add_enabled(file.selected_count() == 1, egui::Button::new("Rename"))
@@ -447,20 +439,20 @@ impl AppState {
                                     file.rename_to = name;
                                 }
                                 file.rename_dialog_open = true;
-                                ui.close();
+                                ui.close_menu();
                             }
                             if ui.button("Delete").clicked() {
                                 file.open_delete_confirm(file.selected_names_in_entry_order());
-                                ui.close();
+                                ui.close_menu();
                             }
                             ui.separator();
                             if ui.button("Change Permissions...").clicked() {
                                 file.open_permissions_dialog(file.selected_names_in_entry_order());
-                                ui.close();
+                                ui.close_menu();
                             }
                             if ui.button("Change Ownership...").clicked() {
                                 file.open_ownership_dialog(file.selected_names_in_entry_order());
-                                ui.close();
+                                ui.close_menu();
                             }
                         });
                     }
@@ -493,7 +485,6 @@ impl AppState {
                 rect.shrink(4.0),
                 10.0,
                 Stroke::new(2.0, theme.accent),
-                egui::StrokeKind::Inside,
             );
             ui.painter().text(
                 rect.center(),

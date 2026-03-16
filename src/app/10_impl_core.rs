@@ -175,7 +175,7 @@ impl AppState {
             pane_id.map(|pane_id| (t, pane_id))
         });
 
-        let (tree, _first_tile_id, _initial_active_tile) = if let Some((t, pane_id)) = restored {
+        let (tree, _first_tile_id, initial_active_tile) = if let Some((t, pane_id)) = restored {
             settings_dialog.target_tile = Some(pane_id);
             settings_dialog.open = false;
             (t, pane_id, Some(pane_id))
@@ -233,8 +233,7 @@ impl AppState {
             config_saver,
             settings_dialog,
             tree,
-            // Start without a focused/active pane; user interaction picks one.
-            active_tile: None,
+            active_tile: initial_active_tile,
             next_session_id,
             last_cursor_blink: Instant::now(),
             last_terminal_activity: Instant::now(),
@@ -254,7 +253,7 @@ impl AppState {
             upload_conflict_dialog: None,
             pending_upload_conflict_prompts: VecDeque::new(),
             style_initialized: false,
-            style_pixels_per_point_bits: 0,
+            style_scale_key: 0,
             layout_dirty: false,
             active_tile_dirty: false,
             last_layout_save: Instant::now(),
@@ -694,16 +693,24 @@ impl AppState {
         ctx.set_style(style);
     }
 
+    fn style_scale_key(pixels_per_point: f32) -> u32 {
+        let ppp = pixels_per_point.max(1.0);
+        let heading_px = (18.0 * ppp).round().clamp(0.0, u16::MAX as f32) as u32;
+        let body_px = (14.0 * ppp).round().clamp(0.0, u16::MAX as f32) as u32;
+        (heading_px << 16) | body_px
+    }
+
     fn ensure_global_style(&mut self, ctx: &egui::Context) {
         if !self.style_initialized {
             egui_extras::install_image_loaders(ctx);
             self.style_initialized = true;
         }
 
-        let ppp_bits = ctx.pixels_per_point().to_bits();
-        if self.style_pixels_per_point_bits != ppp_bits {
+        // Refresh style only when the snapped text pixel sizes would actually change.
+        let scale_key = Self::style_scale_key(ctx.pixels_per_point());
+        if self.style_scale_key != scale_key {
             self.apply_global_style(ctx);
-            self.style_pixels_per_point_bits = ppp_bits;
+            self.style_scale_key = scale_key;
         }
     }
 
@@ -1299,6 +1306,33 @@ impl AppState {
 
     fn local_transfer_temp_path(local_path: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(format!("{local_path}.rusty-part"))
+    }
+
+    fn delete_local_download_artifacts(local_path: &str) {
+        let primary_path = std::path::PathBuf::from(local_path);
+        let temp_path = Self::local_transfer_temp_path(local_path);
+        let mut paths = vec![primary_path];
+        if paths[0] != temp_path {
+            paths.push(temp_path);
+        }
+
+        for path in paths {
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+                continue;
+            }
+
+            for _ in 0..20 {
+                match std::fs::remove_file(&path) {
+                    Ok(_) => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
     }
 
     fn sender_for_terminal_tile(&self, terminal_tile: TileId) -> Option<Sender<WorkerMessage>> {
@@ -2499,22 +2533,7 @@ impl AppState {
         let local_path = self.download_jobs[job_idx].local_path.clone();
         if direction == TransferDirection::Download && !local_path.trim().is_empty() {
             std::thread::spawn(move || {
-                let path = std::path::PathBuf::from(local_path);
-                if path.is_dir() {
-                    let _ = std::fs::remove_dir_all(&path);
-                    return;
-                }
-                for _ in 0..20 {
-                    match std::fs::remove_file(&path) {
-                        Ok(_) => return,
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
-                        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                        Err(_) => return,
-                    }
-                }
-                let _ = std::fs::remove_file(&path);
+                Self::delete_local_download_artifacts(&local_path);
             });
         }
         self.download_jobs.remove(job_idx);
@@ -3594,6 +3613,8 @@ impl AppState {
 #[cfg(test)]
 mod title_index_tests {
     use super::AppState;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn lowest_unused_terminal_title_index_reuses_gaps() {
@@ -3601,5 +3622,26 @@ mod title_index_tests {
         assert_eq!(AppState::lowest_unused_terminal_title_index([1, 3]), 2);
         assert_eq!(AppState::lowest_unused_terminal_title_index([1, 2, 3]), 4);
         assert_eq!(AppState::lowest_unused_terminal_title_index([0, 1, 1, 4]), 2);
+    }
+
+    #[test]
+    fn delete_local_download_artifacts_removes_partial_temp_file() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rusty-download-delete-{stamp}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let local_path = dir.join("report.txt");
+        let temp_path = AppState::local_transfer_temp_path(&local_path.display().to_string());
+        fs::write(&temp_path, b"partial").expect("write temp file");
+
+        AppState::delete_local_download_artifacts(&local_path.display().to_string());
+
+        assert!(!local_path.exists());
+        assert!(!temp_path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
