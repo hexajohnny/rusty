@@ -219,10 +219,10 @@ impl AppState {
             );
         }
 
-        // Active-pane affordance: subtle border/glow so it's obvious which terminal is "current".
-        if options.is_active || response.has_focus() {
+        // Only show the typing-focus border when the terminal widget actually owns keyboard focus.
+        if response.has_focus() {
             let c = options.theme.accent;
-            let (a_stroke, a_glow) = if response.has_focus() { (180u8, 70u8) } else { (110u8, 38u8) };
+            let (a_stroke, a_glow) = (180u8, 70u8);
             let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a_stroke));
             let glow = Stroke::new(3.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a_glow));
             let r0 = rect.shrink(1.0);

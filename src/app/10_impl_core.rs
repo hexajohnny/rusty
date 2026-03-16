@@ -281,6 +281,84 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
+    fn new_for_tests() -> Self {
+        let config = config::AppConfig::default();
+        let config_saver = AsyncConfigSaver::new();
+        let mut settings_dialog = SettingsDialog::closed();
+        let (download_event_tx, download_event_rx) = mpsc::channel::<ssh::DownloadManagerEvent>();
+        let (_tray_tx, tray_events) = crossbeam_channel::unbounded();
+
+        let mut tiles = egui_tiles::Tiles::default();
+        let first = SshTab::new(
+            1,
+            ConnectionSettings::default(),
+            None,
+            config.terminal_scrollback_lines,
+            "logs\\tab-1.log".to_string(),
+        );
+        let pane_id = tiles.insert_pane(first);
+        let root = tiles.insert_tab_tile(vec![pane_id]);
+        let tree = Tree::new("ssh_tree", root, tiles);
+        settings_dialog.target_tile = Some(pane_id);
+
+        Self {
+            theme: UiTheme::default(),
+            theme_source: None,
+            term_theme: TermTheme::default(),
+            terminal_theme_registry: ThemeRegistry::default(),
+            config,
+            config_saver,
+            settings_dialog,
+            tree,
+            active_tile: Some(pane_id),
+            next_session_id: 2,
+            last_cursor_blink: Instant::now(),
+            last_terminal_activity: Instant::now(),
+            last_download_activity: Instant::now(),
+            cursor_visible: true,
+            low_power_renderer: false,
+            snap_fractional_dpi: false,
+            tray: None,
+            tray_events,
+            hidden_to_tray: false,
+            minimize_to_tray_requested: false,
+            clipboard: None,
+            rename_popup: None,
+            auth_dialog: None,
+            host_key_dialog: None,
+            transfer_delete_dialog: None,
+            upload_conflict_dialog: None,
+            pending_upload_conflict_prompts: VecDeque::new(),
+            style_initialized: false,
+            style_scale_key: 0,
+            layout_dirty: false,
+            active_tile_dirty: false,
+            last_layout_save: Instant::now(),
+            last_active_tile_change: Instant::now(),
+            ui_profile_hot_frames: 0,
+            ui_profile_frame_index: 0,
+            restored_window: true,
+            next_sftp_request_id: 1,
+            pending_sftp_requests: HashMap::new(),
+            downloads_window_open: false,
+            downloads_window_just_opened: false,
+            download_jobs: Vec::new(),
+            download_event_tx,
+            download_event_rx,
+            download_cancel_txs: HashMap::new(),
+            upload_conflict_response_txs: HashMap::new(),
+            upload_refresh_targets: HashMap::new(),
+            update_check_in_progress: false,
+            update_check_rx: None,
+            update_available_version: None,
+            update_available_url: None,
+            update_manual_open_if_newer: false,
+            update_manual_status: None,
+            startup_notice: None,
+        }
+    }
+
     fn refresh_terminal_theme_registry(&mut self) {
         self.terminal_theme_registry = ThemeRegistry::load();
         if let Some(selected) = self.config.selected_terminal_theme.clone() {
@@ -1392,6 +1470,175 @@ impl AppState {
             }
         }
         (connected, connecting, status)
+    }
+
+    fn terminal_tiles_for_connection_group(&self, connection_group_id: u64) -> Vec<TileId> {
+        self.pane_ids()
+            .into_iter()
+            .filter(|tile_id| {
+                self.terminal_pane(*tile_id)
+                    .map(|pane| pane.connection_group_id == connection_group_id)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    fn clear_transient_prompts_for_connection_group(&mut self, connection_group_id: u64) {
+        let pane_ids = self.terminal_tiles_for_connection_group(connection_group_id);
+        for pane_id in pane_ids {
+            self.clear_transient_prompts_for_tile(pane_id);
+        }
+    }
+
+    fn queue_terminal_for_shared_reconnect(&mut self, pane_id: TileId, connection_group_id: u64) {
+        let Some(tab) = self.terminal_pane_mut(pane_id) else {
+            return;
+        };
+        if tab.connected || tab.connecting {
+            return;
+        }
+
+        if let Some(tx) = tab.worker_tx.take() {
+            let _ = tx.send(WorkerMessage::DetachTerminalClient { client_id: tab.id });
+        }
+
+        tab.ui_rx = None;
+        tab.host_key_tx = None;
+        tab.connected = false;
+        tab.connecting = true;
+        tab.last_status_kind = ssh::IssueKind::Info;
+        tab.last_status = "Waiting for shared SSH session...".to_string();
+        tab.last_sent_size = None;
+        tab.pending_resize = None;
+        tab.render_cache = None;
+        tab.scroll_wheel_accum = 0.0;
+        tab.scrollback_max = 0;
+        tab.scrollbar_dragging = false;
+        tab.copy_flash_until = None;
+        tab.selection = None;
+        tab.abs_selection = None;
+        tab.active_remote_mouse = None;
+        tab.remote_hover_pos = None;
+        tab.remote_scroll_accum = Vec2::ZERO;
+        tab.pending_auth = None;
+        tab.pending_host_key = None;
+        tab.pending_restore_attach_group = Some(connection_group_id);
+        tab.pending_scrollback = None;
+        tab.last_selection_autoscroll = Instant::now();
+        tab.pending_sftp_events.clear();
+        tab.title = SshTab::title_for(tab.title_index, &tab.settings);
+    }
+
+    fn plan_terminal_group_reconnect(&self, pane_id: TileId) -> Option<TerminalGroupReconnectPlan> {
+        let target = self.terminal_pane(pane_id)?;
+        let connection_group_id = target.connection_group_id;
+        let group_tiles = self.terminal_tiles_for_connection_group(connection_group_id);
+        if group_tiles.is_empty() {
+            return None;
+        }
+
+        if let Some(worker_tx) = self.sender_for_connection_group(connection_group_id) {
+            let pane_ids: Vec<TileId> = group_tiles
+                .iter()
+                .copied()
+                .filter(|group_tile| {
+                    self.terminal_pane(*group_tile)
+                        .map(|tab| !tab.connected && !tab.connecting)
+                        .unwrap_or(false)
+                })
+                .collect();
+            return (!pane_ids.is_empty()).then_some(
+                TerminalGroupReconnectPlan::AttachToExisting {
+                    connection_group_id,
+                    worker_tx,
+                    pane_ids,
+                },
+            );
+        }
+
+        let disconnected_tiles: Vec<TileId> = group_tiles
+            .iter()
+            .copied()
+            .filter(|group_tile| {
+                self.terminal_pane(*group_tile)
+                    .map(|tab| !tab.connected && !tab.connecting)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if disconnected_tiles.is_empty() {
+            return None;
+        }
+
+        if group_tiles.iter().copied().any(|group_tile| {
+            self.terminal_pane(group_tile)
+                .map(|tab| tab.connecting)
+                .unwrap_or(false)
+        }) {
+            return Some(TerminalGroupReconnectPlan::WaitForConnecting {
+                connection_group_id,
+                pane_ids: disconnected_tiles,
+            });
+        }
+
+        let waiting_pane_ids = disconnected_tiles
+            .into_iter()
+            .filter(|group_tile| *group_tile != pane_id)
+            .collect();
+        Some(TerminalGroupReconnectPlan::StartNew {
+            connection_group_id,
+            primary_pane_id: pane_id,
+            waiting_pane_ids,
+        })
+    }
+
+    fn reconnect_terminal_group(&mut self, pane_id: TileId) -> bool {
+        let Some(plan) = self.plan_terminal_group_reconnect(pane_id) else {
+            return false;
+        };
+
+        match plan {
+            TerminalGroupReconnectPlan::AttachToExisting {
+                connection_group_id,
+                worker_tx,
+                pane_ids,
+            } => {
+                for attach_id in pane_ids {
+                    if self.attach_terminal_to_existing_session(attach_id, worker_tx.clone()) {
+                        if let Some(tab) = self.terminal_pane_mut(attach_id) {
+                            tab.connection_group_id = connection_group_id;
+                            tab.pending_restore_attach_group = None;
+                        }
+                    }
+                }
+            }
+            TerminalGroupReconnectPlan::WaitForConnecting {
+                connection_group_id,
+                pane_ids,
+            } => {
+                for wait_id in pane_ids {
+                    self.queue_terminal_for_shared_reconnect(wait_id, connection_group_id);
+                }
+            }
+            TerminalGroupReconnectPlan::StartNew {
+                connection_group_id,
+                primary_pane_id,
+                waiting_pane_ids,
+            } => {
+                for wait_id in waiting_pane_ids {
+                    self.queue_terminal_for_shared_reconnect(wait_id, connection_group_id);
+                }
+                let Some(tab) = self.terminal_pane_mut(primary_pane_id) else {
+                    return false;
+                };
+                tab.connection_group_id = connection_group_id;
+                tab.start_connect();
+            }
+        }
+
+        if let Some(tab) = self.terminal_pane_mut(pane_id) {
+            tab.focus_terminal_next_frame = true;
+        }
+        true
     }
 
     fn sync_shared_terminal_groups(&mut self) {
@@ -3612,8 +3859,11 @@ impl AppState {
 
 #[cfg(test)]
 mod title_index_tests {
-    use super::AppState;
+    use super::{AppState, TerminalGroupReconnectPlan};
+    use crate::ssh::WorkerMessage;
+    use egui_tiles::{Container, Tile};
     use std::fs;
+    use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -3643,5 +3893,127 @@ mod title_index_tests {
         assert!(!temp_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_terminal_group_reconnect_starts_one_session_and_queues_siblings() {
+        let mut app = AppState::new_for_tests();
+        let first_id = app.first_pane_id().expect("first pane");
+        let tabs_id = app.tree.root.expect("root tabs");
+
+        let second_id = app
+            .add_new_pane_to_tabs_with_settings(tabs_id, Default::default(), None, None)
+            .expect("second pane");
+
+        let group_id = 77;
+        for pane_id in [first_id, second_id] {
+            let tab = app.terminal_pane_mut(pane_id).expect("terminal pane");
+            tab.connection_group_id = group_id;
+            tab.connected = false;
+            tab.connecting = false;
+            tab.worker_tx = None;
+            tab.ui_rx = None;
+        }
+
+        let Some(TerminalGroupReconnectPlan::StartNew {
+            connection_group_id,
+            primary_pane_id,
+            waiting_pane_ids,
+        }) = app.plan_terminal_group_reconnect(first_id)
+        else {
+            panic!("expected start-new reconnect plan");
+        };
+
+        assert_eq!(connection_group_id, group_id);
+        assert_eq!(primary_pane_id, first_id);
+        assert_eq!(waiting_pane_ids, vec![second_id]);
+    }
+
+    #[test]
+    fn reconnect_terminal_group_waits_for_inflight_group_session() {
+        let mut app = AppState::new_for_tests();
+        let first_id = app.first_pane_id().expect("first pane");
+        let tabs_id = app.tree.root.expect("root tabs");
+
+        let second_id = app
+            .add_new_pane_to_tabs_with_settings(tabs_id, Default::default(), None, None)
+            .expect("second pane");
+
+        let group_id = 91;
+        let (stale_tx, _stale_rx) = mpsc::channel::<WorkerMessage>();
+        {
+            let tab = app.terminal_pane_mut(first_id).expect("first terminal");
+            tab.connection_group_id = group_id;
+            tab.connecting = true;
+            tab.connected = false;
+        }
+        {
+            let tab = app.terminal_pane_mut(second_id).expect("second terminal");
+            tab.connection_group_id = group_id;
+            tab.connecting = false;
+            tab.connected = false;
+            tab.worker_tx = Some(stale_tx);
+        }
+
+        assert!(app.reconnect_terminal_group(second_id));
+
+        let second = app.terminal_pane(second_id).expect("second terminal");
+        assert!(second.connecting);
+        assert!(!second.connected);
+        assert!(second.worker_tx.is_none());
+        assert!(second.ui_rx.is_none());
+        assert_eq!(second.pending_restore_attach_group, Some(group_id));
+        assert_eq!(second.last_status, "Waiting for shared SSH session...");
+    }
+
+    #[test]
+    fn reconnect_terminal_group_attaches_to_existing_live_session() {
+        let mut app = AppState::new_for_tests();
+        let first_id = app.first_pane_id().expect("first pane");
+        let tabs_id = app.tree.root.expect("root tabs");
+
+        let second_id = app
+            .add_new_pane_to_tabs_with_settings(tabs_id, Default::default(), None, None)
+            .expect("second pane");
+
+        let group_id = 123;
+        let (live_tx, live_rx) = mpsc::channel::<WorkerMessage>();
+        {
+            let tab = app.terminal_pane_mut(first_id).expect("first terminal");
+            tab.connection_group_id = group_id;
+            tab.connected = true;
+            tab.connecting = false;
+            tab.worker_tx = Some(live_tx.clone());
+        }
+        {
+            let tab = app.terminal_pane_mut(second_id).expect("second terminal");
+            tab.connection_group_id = group_id;
+            tab.connected = false;
+            tab.connecting = false;
+            tab.worker_tx = None;
+            tab.ui_rx = None;
+        }
+
+        assert!(app.reconnect_terminal_group(second_id));
+
+        let second = app.terminal_pane(second_id).expect("second terminal");
+        assert!(second.connecting);
+        assert!(!second.connected);
+        assert!(second.pending_restore_attach_group.is_none());
+        assert!(second.worker_tx.is_some());
+
+        let attach_message = live_rx.try_recv().expect("attach message");
+        match attach_message {
+            WorkerMessage::AttachTerminalClient { client_id, .. } => {
+                assert_eq!(client_id, second.id);
+            }
+            other => panic!("unexpected worker message: {other:?}"),
+        }
+
+        let root_tile = app.tree.root.expect("root tile");
+        assert!(matches!(
+            app.tree.tiles.get(root_tile),
+            Some(Tile::Container(Container::Tabs(_)))
+        ));
     }
 }

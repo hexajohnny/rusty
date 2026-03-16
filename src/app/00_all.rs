@@ -80,6 +80,24 @@ struct UpdateCheckResult {
     available_url: Option<String>,
 }
 
+#[derive(Clone)]
+enum TerminalGroupReconnectPlan {
+    AttachToExisting {
+        connection_group_id: u64,
+        worker_tx: Sender<WorkerMessage>,
+        pane_ids: Vec<TileId>,
+    },
+    WaitForConnecting {
+        connection_group_id: u64,
+        pane_ids: Vec<TileId>,
+    },
+    StartNew {
+        connection_group_id: u64,
+        primary_pane_id: TileId,
+        waiting_pane_ids: Vec<TileId>,
+    },
+}
+
 #[derive(Clone, Copy)]
 struct UiTheme {
     bg: Color32,

@@ -495,7 +495,14 @@ impl eframe::App for AppState {
                     }
                 }
                 TilesAction::Connect(tile_id) => {
-                    self.clear_transient_prompts_for_tile(tile_id);
+                    if let Some(connection_group_id) = self
+                        .terminal_pane(tile_id)
+                        .map(|tab| tab.connection_group_id)
+                    {
+                        self.clear_transient_prompts_for_connection_group(connection_group_id);
+                    } else {
+                        self.clear_transient_prompts_for_tile(tile_id);
+                    }
                     let (missing_settings, connected_or_connecting) = self
                         .terminal_pane(tile_id)
                         .map(|t| {
@@ -510,15 +517,21 @@ impl eframe::App for AppState {
                     if missing_settings || connected_or_connecting {
                         self.open_settings_dialog_for_tile(tile_id);
                         self.settings_dialog.page = SettingsPage::ProfilesAndAccount;
-                    } else if let Some(tab) = self.terminal_pane_mut(tile_id) {
-                        tab.start_connect();
-                        tab.focus_terminal_next_frame = true;
+                    } else {
+                        let _ = self.reconnect_terminal_group(tile_id);
                     }
                     self.set_active_tile(Some(tile_id));
                     self.settings_dialog.target_tile = Some(tile_id);
                 }
                 TilesAction::ToggleConnect(tile_id) => {
-                    self.clear_transient_prompts_for_tile(tile_id);
+                    if let Some(connection_group_id) = self
+                        .terminal_pane(tile_id)
+                        .map(|tab| tab.connection_group_id)
+                    {
+                        self.clear_transient_prompts_for_connection_group(connection_group_id);
+                    } else {
+                        self.clear_transient_prompts_for_tile(tile_id);
+                    }
                     let needs_settings = self
                         .terminal_pane(tile_id)
                         .map(|t| {
@@ -528,13 +541,19 @@ impl eframe::App for AppState {
                         .unwrap_or(true);
                     if needs_settings {
                         self.open_settings_dialog_for_tile(tile_id);
-                    } else if let Some(tab) = self.terminal_pane_mut(tile_id) {
-                        if tab.connecting || tab.connected {
-                            tab.disconnect();
+                    } else {
+                        let live_connection = self
+                            .terminal_pane(tile_id)
+                            .map(|tab| tab.connecting || tab.connected)
+                            .unwrap_or(false);
+                        if live_connection {
+                            if let Some(tab) = self.terminal_pane_mut(tile_id) {
+                                tab.disconnect();
+                                tab.focus_terminal_next_frame = true;
+                            }
                         } else {
-                            tab.start_connect();
+                            let _ = self.reconnect_terminal_group(tile_id);
                         }
-                        tab.focus_terminal_next_frame = true;
                     }
                     self.set_active_tile(Some(tile_id));
                     self.settings_dialog.target_tile = Some(tile_id);

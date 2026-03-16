@@ -219,6 +219,55 @@ impl AppState {
         tab.pending_scrollback = Some(target);
     }
 
+    fn mouse_wheel_delta_in_terminal_cells(
+        delta: Vec2,
+        unit: egui::MouseWheelUnit,
+        cell_w: f32,
+        cell_h: f32,
+        page_cols: f32,
+        page_rows: f32,
+    ) -> Vec2 {
+        match unit {
+            egui::MouseWheelUnit::Point => egui::vec2(
+                delta.x / cell_w.max(1.0),
+                delta.y / cell_h.max(1.0),
+            ),
+            egui::MouseWheelUnit::Line => delta,
+            egui::MouseWheelUnit::Page => egui::vec2(
+                delta.x * page_cols.max(1.0),
+                delta.y * page_rows.max(1.0),
+            ),
+        }
+    }
+
+    fn accumulated_mouse_wheel_delta_in_terminal_cells(
+        events: &[egui::Event],
+        cell_w: f32,
+        cell_h: f32,
+        page_cols: f32,
+        page_rows: f32,
+    ) -> Vec2 {
+        let mut delta = Vec2::ZERO;
+        for event in events {
+            if let egui::Event::MouseWheel {
+                unit,
+                delta: wheel_delta,
+                ..
+            } = event
+            {
+                delta += Self::mouse_wheel_delta_in_terminal_cells(
+                    *wheel_delta,
+                    *unit,
+                    cell_w,
+                    cell_h,
+                    page_cols,
+                    page_rows,
+                );
+            }
+        }
+        delta
+    }
+
     fn send_paste_text(tab: &mut SshTab, s: &str) {
         if s.is_empty() {
             return;
@@ -869,20 +918,18 @@ impl AppState {
             }
         }
 
-        let mut wheel_delta = Vec2::ZERO;
-        for ev in events.iter() {
-            if let egui::Event::MouseWheel { delta, .. } = ev {
-                wheel_delta += *delta;
-            }
-        }
+        let wheel_delta = Self::accumulated_mouse_wheel_delta_in_terminal_cells(
+            &events,
+            cell_w,
+            cell_h,
+            screen_cols as f32,
+            screen_rows as f32,
+        );
 
         // Local scrollback or remote wheel reporting.
         if hovering_term && tab.connected {
             if allow_remote_mouse {
-                let step_x = cell_w.max(1.0);
-                let step_y = cell_h.max(1.0);
-                tab.remote_scroll_accum.x += wheel_delta.x / step_x;
-                tab.remote_scroll_accum.y += wheel_delta.y / step_y;
+                tab.remote_scroll_accum += wheel_delta;
 
                 let x_steps = (tab.remote_scroll_accum.x.trunc() as i64).clamp(-32, 32) as i32;
                 if x_steps != 0 {
@@ -942,13 +989,21 @@ impl AppState {
                 // can keep scrolling on repaint ticks even after wheel input has stopped.
                 let mut dy = wheel_delta.y;
                 if dy.abs() <= 0.001 {
-                    dy = ui.input(|i| i.raw_scroll_delta.y);
+                    let raw_delta = ui.input(|i| i.raw_scroll_delta);
+                    dy = Self::mouse_wheel_delta_in_terminal_cells(
+                        raw_delta,
+                        egui::MouseWheelUnit::Point,
+                        cell_w,
+                        cell_h,
+                        screen_cols as f32,
+                        screen_rows as f32,
+                    )
+                    .y;
                 }
 
                 if dy.abs() > 0.001 {
                     // Accumulate into rows and apply integer deltas.
-                    let step = cell_h.max(1.0);
-                    tab.scroll_wheel_accum += dy / step;
+                    tab.scroll_wheel_accum += dy;
                     let rows_delta = (tab.scroll_wheel_accum.trunc() as i64).clamp(-256, 256) as i32;
                     if rows_delta != 0 {
                         tab.scroll_wheel_accum -= rows_delta as f32;
@@ -1807,6 +1862,42 @@ mod tests {
             ),
             Some(b"\x1b[112;10;4M".to_vec())
         );
+    }
+
+    #[test]
+    fn wheel_line_units_map_directly_to_terminal_rows() {
+        let delta = AppState::mouse_wheel_delta_in_terminal_cells(
+            egui::vec2(0.0, 3.0),
+            egui::MouseWheelUnit::Line,
+            9.0,
+            18.0,
+            80.0,
+            24.0,
+        );
+        assert_eq!(delta, egui::vec2(0.0, 3.0));
+    }
+
+    #[test]
+    fn wheel_point_and_page_units_convert_to_terminal_cells() {
+        let point_delta = AppState::mouse_wheel_delta_in_terminal_cells(
+            egui::vec2(18.0, 36.0),
+            egui::MouseWheelUnit::Point,
+            9.0,
+            18.0,
+            80.0,
+            24.0,
+        );
+        assert_eq!(point_delta, egui::vec2(2.0, 2.0));
+
+        let page_delta = AppState::mouse_wheel_delta_in_terminal_cells(
+            egui::vec2(1.0, -1.0),
+            egui::MouseWheelUnit::Page,
+            9.0,
+            18.0,
+            80.0,
+            24.0,
+        );
+        assert_eq!(page_delta, egui::vec2(80.0, -24.0));
     }
 
     #[test]
