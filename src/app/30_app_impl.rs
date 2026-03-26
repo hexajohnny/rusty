@@ -400,6 +400,7 @@ impl eframe::App for AppState {
             term_font_size,
             allow_resize: !self.hidden_to_tray,
             focus_shade: self.config.focus_shade,
+            show_active_border: !self.config.hide_active_terminal_border,
             profiles,
             clipboard: &mut clipboard,
             active_tile: self.active_tile,

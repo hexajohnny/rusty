@@ -1,4 +1,9 @@
 impl AppState {
+    fn persist_config_now(&self) {
+        self.config_saver.request_save(self.config.clone());
+        self.config_saver.flush(Duration::from_secs(2));
+    }
+
     fn ms_until_cursor_blink_toggle(&self) -> u64 {
         if self.low_power_renderer {
             return u64::MAX;
@@ -118,7 +123,7 @@ impl AppState {
                 Some(self.config.profiles.len().saturating_sub(1));
         }
 
-        self.config_saver.request_save(self.config.clone());
+        self.persist_config_now();
 
         let updated_settings = self.settings_dialog.draft.clone();
         let target_tile = self.settings_dialog.target_tile;
@@ -164,7 +169,7 @@ impl AppState {
             self.config.default_profile = None;
         }
 
-        self.config_saver.request_save(self.config.clone());
+        self.persist_config_now();
     }
 
     fn draw_settings_page_autostart(&mut self, ui: &mut egui::Ui) {
@@ -269,32 +274,20 @@ impl AppState {
         ui.separator();
         ui.add_space(10.0);
 
-        self.config.terminal_font_size = self
-            .config
-            .terminal_font_size
-            .clamp(TERM_FONT_SIZE_MIN, TERM_FONT_SIZE_MAX);
-        let before = self.config.terminal_font_size;
-        let resp = ui.add(
-            egui::Slider::new(
-                &mut self.config.terminal_font_size,
-                TERM_FONT_SIZE_MIN..=TERM_FONT_SIZE_MAX,
-            )
-            .text("Terminal font size")
-            .fixed_decimals(0),
+        let before_hide_active_terminal_border = self.config.hide_active_terminal_border;
+        ui.checkbox(
+            &mut self.config.hide_active_terminal_border,
+            "Hide active terminal border",
         );
-        // Persist on release to avoid writing to disk on every slider tick.
-        // Note: on the release-frame `resp.changed()` may be false, so key off `drag_stopped`.
-        if resp.drag_released()
-            || (resp.changed()
-                && !resp.dragged()
-                && (self.config.terminal_font_size - before).abs() > f32::EPSILON)
-        {
+        if self.config.hide_active_terminal_border != before_hide_active_terminal_border {
             self.config_saver.request_save(self.config.clone());
         }
-
-        ui.add_space(6.0);
         ui.label(
-            egui::RichText::new("Updates live, even for existing sessions.").color(theme.muted),
+            egui::RichText::new(
+                "Removes the highlight border/glow from the terminal that currently has keyboard focus.",
+            )
+            .color(theme.muted)
+            .size(12.0),
         );
 
         ui.add_space(12.0);
@@ -327,6 +320,182 @@ impl AppState {
         );
     }
 
+    fn draw_settings_page_fonts(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme;
+        let ctx = ui.ctx().clone();
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Terminal Font").strong());
+            if ui.button("Refresh list").clicked() {
+                self.reload_terminal_font_catalog();
+                if self.sync_selected_terminal_font_path_from_catalog() {
+                    self.config_saver.request_save(self.config.clone());
+                }
+                self.apply_font_preferences(&ctx);
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "Only monospaced system fonts are listed so terminal alignment stays intact.",
+            )
+            .color(theme.muted)
+            .size(12.0),
+        );
+
+        let current_font = self
+            .config
+            .terminal_font_name
+            .as_deref()
+            .unwrap_or("Default terminal monospace");
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(format!("Current font: {current_font}"))
+                .color(theme.muted)
+                .size(12.0),
+        );
+
+        let mut font_settings_changed = false;
+        let before_apply_to_ui = self.config.terminal_font_apply_to_ui;
+        ui.checkbox(
+            &mut self.config.terminal_font_apply_to_ui,
+            "Apply the selected terminal font to the UI",
+        );
+        if self.config.terminal_font_apply_to_ui != before_apply_to_ui {
+            font_settings_changed = true;
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "When enabled, the same font is inserted at the front of Rusty's UI proportional font stack.",
+            )
+            .color(theme.muted)
+            .size(12.0),
+        );
+
+        ui.add_space(12.0);
+        self.config.terminal_font_size = self
+            .config
+            .terminal_font_size
+            .clamp(TERM_FONT_SIZE_MIN, TERM_FONT_SIZE_MAX);
+        let before_font_size = self.config.terminal_font_size;
+        let font_size_resp = ui.add(
+            egui::Slider::new(
+                &mut self.config.terminal_font_size,
+                TERM_FONT_SIZE_MIN..=TERM_FONT_SIZE_MAX,
+            )
+            .text("Terminal font size")
+            .fixed_decimals(0),
+        );
+        if font_size_resp.drag_released()
+            || (font_size_resp.changed()
+                && !font_size_resp.dragged()
+                && (self.config.terminal_font_size - before_font_size).abs() > f32::EPSILON)
+        {
+            self.config_saver.request_save(self.config.clone());
+            self.invalidate_terminal_font_caches();
+            ctx.request_repaint();
+        }
+
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("Updates live, even for existing sessions.")
+                .color(theme.muted)
+                .size(12.0),
+        );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        let mut selected_font: Option<(Option<String>, Option<String>)> = None;
+        egui::ScrollArea::vertical()
+            .id_source("settings_terminal_font_picker")
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .max_height(240.0)
+            .show(ui, |ui| {
+                if ui
+                    .selectable_label(
+                        self.config.terminal_font_name.is_none(),
+                        "Default terminal monospace",
+                    )
+                    .clicked()
+                {
+                    selected_font = Some((None, None));
+                }
+
+                for font in self.terminal_font_catalog.iter() {
+                    let selected = self
+                        .config
+                        .terminal_font_name
+                        .as_deref()
+                        .map(|name| name.eq_ignore_ascii_case(&font.name))
+                        .unwrap_or(false);
+                    if ui.selectable_label(selected, &font.name).clicked() {
+                        selected_font = Some((
+                            Some(font.name.clone()),
+                            Some(font.path.to_string_lossy().to_string()),
+                        ));
+                    }
+                }
+            });
+
+        if let Some((selected_font_name, selected_font_path)) = selected_font {
+            if self.config.terminal_font_name != selected_font_name
+                || self.config.terminal_font_path != selected_font_path
+            {
+                self.config.terminal_font_name = selected_font_name;
+                self.config.terminal_font_path = selected_font_path;
+                font_settings_changed = true;
+            }
+        }
+
+        if let Some(status) = self.applied_font_status.as_deref() {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(status)
+                    .color(Color32::from_rgb(220, 170, 90))
+                    .size(12.0),
+            );
+        } else if let Some(status) = self.terminal_font_catalog_status.as_deref() {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(status)
+                    .color(Color32::from_rgb(220, 170, 90))
+                    .size(12.0),
+            );
+        }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Preview").strong());
+        egui::Frame::none()
+            .fill(adjust_color(theme.top_bg, 0.06))
+            .stroke(Stroke::new(1.0, theme.top_border))
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("The quick brown fox jumps over 13 lazy tabs.")
+                        .monospace()
+                        .size(self.config.terminal_font_size),
+                );
+                ui.label(
+                    egui::RichText::new("./home/user $ ls -la")
+                        .monospace()
+                        .size(self.config.terminal_font_size),
+                );
+            });
+
+        if font_settings_changed {
+            self.config_saver.request_save(self.config.clone());
+            self.mark_font_preferences_dirty();
+            self.apply_font_preferences(&ctx);
+        }
+    }
+
     fn draw_settings_page_ui_theme(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
         let ctx = ui.ctx().clone();
@@ -351,6 +520,7 @@ impl AppState {
         egui::ScrollArea::vertical()
             .id_source("settings_ui_theme_list_scroll")
             .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .max_height(list_height)
             .show(ui, |ui| {
                 let default_title = format!("Mode default ({mode_file})");
@@ -839,6 +1009,7 @@ impl AppState {
         ui.label(egui::RichText::new("Profiles").strong());
         egui::ScrollArea::vertical()
             .id_source("settings_profiles_list_scroll")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .max_height(120.0)
             .show(ui, |ui| {
                 let mut load_idx: Option<usize> = None;
@@ -889,13 +1060,13 @@ impl AppState {
 
                 if clear_default {
                     self.config.default_profile = None;
-                    self.config_saver.request_save(self.config.clone());
+                    self.persist_config_now();
                 }
 
                 if let Some(i) = set_default_idx {
                     if let Some(profile) = self.config.profiles.get(i) {
                         self.config.default_profile = Some(profile.name.clone());
-                        self.config_saver.request_save(self.config.clone());
+                        self.persist_config_now();
                     }
                 }
 
@@ -943,7 +1114,7 @@ impl AppState {
                 .clicked()
             {
                 self.config.default_profile = selected_profile_name;
-                self.config_saver.request_save(self.config.clone());
+                self.persist_config_now();
             }
         });
 
@@ -1233,6 +1404,7 @@ impl AppState {
             egui::ScrollArea::vertical()
                 .id_source("settings_nav_scroll")
                 .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show(&mut nav_ui, |ui| {
                     let item_h = 34.0;
                     let rounding = egui::Rounding::same(10.0);
@@ -1306,12 +1478,21 @@ impl AppState {
 
                         if resp.clicked() {
                             self.settings_dialog.page = page;
+                            if page == SettingsPage::Fonts {
+                                self.ensure_terminal_font_catalog();
+                                if self.sync_selected_terminal_font_path_from_catalog() {
+                                    self.config_saver.request_save(self.config.clone());
+                                    self.mark_font_preferences_dirty();
+                                    self.apply_font_preferences(ui.ctx());
+                                }
+                            }
                         }
                     };
 
                     item(ui, SettingsPage::Autostart);
                     item(ui, SettingsPage::Behavior);
                     item(ui, SettingsPage::Appearance);
+                    item(ui, SettingsPage::Fonts);
                     item(ui, SettingsPage::Updates);
                     item(ui, SettingsPage::UiTheme);
                     item(ui, SettingsPage::TerminalColors);
@@ -1340,10 +1521,12 @@ impl AppState {
             egui::ScrollArea::vertical()
                 .id_source("settings_content_scroll")
                 .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show(&mut content_ui, |ui| match self.settings_dialog.page {
                     SettingsPage::Autostart => self.draw_settings_page_autostart(ui),
                     SettingsPage::Behavior => self.draw_settings_page_behavior(ui),
                     SettingsPage::Appearance => self.draw_settings_page_appearance(ui),
+                    SettingsPage::Fonts => self.draw_settings_page_fonts(ui),
                     SettingsPage::Updates => self.draw_settings_page_updates(ui),
                     SettingsPage::UiTheme => self.draw_settings_page_ui_theme(ui),
                     SettingsPage::TerminalColors => self.draw_settings_page_terminal_colors(ui),

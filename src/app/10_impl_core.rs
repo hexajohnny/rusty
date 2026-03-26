@@ -229,6 +229,11 @@ impl AppState {
             theme_source,
             term_theme: TermTheme::from_config(&config.terminal_colors),
             terminal_theme_registry,
+            terminal_font_catalog: Vec::new(),
+            terminal_font_catalog_loaded: false,
+            terminal_font_catalog_status: None,
+            applied_font_key: String::new(),
+            applied_font_status: None,
             config,
             config_saver,
             settings_dialog,
@@ -307,6 +312,11 @@ impl AppState {
             theme_source: None,
             term_theme: TermTheme::default(),
             terminal_theme_registry: ThemeRegistry::default(),
+            terminal_font_catalog: Vec::new(),
+            terminal_font_catalog_loaded: false,
+            terminal_font_catalog_status: None,
+            applied_font_key: String::new(),
+            applied_font_status: None,
             config,
             config_saver,
             settings_dialog,
@@ -414,6 +424,254 @@ impl AppState {
             self.config_saver.request_save(self.config.clone());
         }
         changed
+    }
+
+    fn terminal_font_config_key(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.config.terminal_font_name.as_deref().unwrap_or_default(),
+            self.config.terminal_font_path.as_deref().unwrap_or_default(),
+            self.config.terminal_font_apply_to_ui
+        )
+    }
+
+    fn invalidate_terminal_font_caches(&mut self) {
+        for pane_id in self.terminal_pane_ids() {
+            if let Some(tab) = self.terminal_pane_mut(pane_id) {
+                tab.cell_metrics_cache = None;
+                tab.render_cache = None;
+            }
+        }
+    }
+
+    fn mark_font_preferences_dirty(&mut self) {
+        self.applied_font_key.clear();
+        self.applied_font_status = None;
+        self.style_scale_key = 0;
+        self.invalidate_terminal_font_caches();
+    }
+
+    fn is_supported_terminal_font_file(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "ttf" | "otf" | "ttc" | "otc"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn preferred_terminal_font_name(face: &ttf_parser::Face<'_>) -> Option<String> {
+        let mut best: Option<(u8, String)> = None;
+        for name in face.names() {
+            let rank_base = match name.name_id {
+                ttf_parser::name_id::TYPOGRAPHIC_FAMILY => 0u8,
+                ttf_parser::name_id::FAMILY => 1u8,
+                ttf_parser::name_id::FULL_NAME => 2u8,
+                ttf_parser::name_id::POST_SCRIPT_NAME => 3u8,
+                _ => continue,
+            };
+            let Some(value) = name.to_string() else {
+                continue;
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            let language_penalty = if name.language() == ttf_parser::Language::English_UnitedStates
+            {
+                0u8
+            } else {
+                1u8
+            };
+            let rank = rank_base.saturating_mul(2).saturating_add(language_penalty);
+            let replace = best
+                .as_ref()
+                .map(|(best_rank, _)| rank < *best_rank)
+                .unwrap_or(true);
+            if replace {
+                best = Some((rank, value.to_string()));
+            }
+        }
+        best.map(|(_, value)| value)
+    }
+
+    fn scan_installed_terminal_fonts() -> (Vec<InstalledTerminalFont>, Option<String>) {
+        #[cfg(target_os = "windows")]
+        {
+            let fonts_dir = std::env::var_os("WINDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+                .join("Fonts");
+            let entries = match fs::read_dir(&fonts_dir) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    return (
+                        Vec::new(),
+                        Some(format!(
+                            "Failed to read installed fonts from {}: {err}",
+                            fonts_dir.display()
+                        )),
+                    );
+                }
+            };
+
+            let mut fonts_by_name: BTreeMap<String, InstalledTerminalFont> = BTreeMap::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() || !Self::is_supported_terminal_font_file(&path) {
+                    continue;
+                }
+
+                let bytes = match fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
+                let face = match ttf_parser::Face::parse(&bytes, 0) {
+                    Ok(face) => face,
+                    Err(_) => continue,
+                };
+                if !face.is_monospaced() || !face.is_regular() {
+                    continue;
+                }
+                let Some(name) = Self::preferred_terminal_font_name(&face) else {
+                    continue;
+                };
+                fonts_by_name
+                    .entry(name.to_ascii_lowercase())
+                    .or_insert_with(|| InstalledTerminalFont {
+                        name,
+                        path: path.clone(),
+                    });
+            }
+
+            let mut fonts: Vec<InstalledTerminalFont> = fonts_by_name.into_values().collect();
+            fonts.sort_by(|a, b| a.name.cmp(&b.name));
+            let status = if fonts.is_empty() {
+                Some("No monospaced system fonts were found in the Windows Fonts directory."
+                    .to_string())
+            } else {
+                None
+            };
+            (fonts, status)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            (
+                Vec::new(),
+                Some("System font selection is only available on Windows.".to_string()),
+            )
+        }
+    }
+
+    fn reload_terminal_font_catalog(&mut self) {
+        let (fonts, status) = Self::scan_installed_terminal_fonts();
+        self.terminal_font_catalog = fonts;
+        self.terminal_font_catalog_status = status;
+        self.terminal_font_catalog_loaded = true;
+        self.mark_font_preferences_dirty();
+    }
+
+    fn ensure_terminal_font_catalog(&mut self) {
+        if !self.terminal_font_catalog_loaded {
+            self.reload_terminal_font_catalog();
+        }
+    }
+
+    fn selected_terminal_font(&self) -> Option<&InstalledTerminalFont> {
+        let selected = self.config.terminal_font_name.as_deref()?;
+        self.terminal_font_catalog
+            .iter()
+            .find(|font| font.name.eq_ignore_ascii_case(selected))
+    }
+
+    fn sync_selected_terminal_font_path_from_catalog(&mut self) -> bool {
+        let Some(font) = self.selected_terminal_font() else {
+            return false;
+        };
+        let path = font.path.to_string_lossy().to_string();
+        if self.config.terminal_font_path.as_deref() == Some(path.as_str()) {
+            return false;
+        }
+        self.config.terminal_font_path = Some(path);
+        true
+    }
+
+    fn configured_terminal_font_path(&self) -> Option<PathBuf> {
+        self.config
+            .terminal_font_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                self.selected_terminal_font()
+                    .map(|font| font.path.clone())
+            })
+    }
+
+    fn apply_font_preferences(&mut self, ctx: &egui::Context) {
+        let font_key = self.terminal_font_config_key();
+        if self.applied_font_key == font_key {
+            return;
+        }
+
+        const CUSTOM_FONT_NAME: &str = "rusty-dynamic-terminal-font";
+
+        let mut font_definitions = egui::FontDefinitions::default();
+        let mut applied_status = None;
+
+        if let Some(selected_name) = self.config.terminal_font_name.as_deref() {
+            match self.configured_terminal_font_path() {
+                Some(font_path) => match fs::read(&font_path) {
+                    Ok(bytes) => {
+                        font_definitions.font_data.insert(
+                            CUSTOM_FONT_NAME.to_string(),
+                            egui::FontData::from_owned(bytes),
+                        );
+                        if let Some(monospace) =
+                            font_definitions.families.get_mut(&egui::FontFamily::Monospace)
+                        {
+                            monospace.retain(|name| name != CUSTOM_FONT_NAME);
+                            monospace.insert(0, CUSTOM_FONT_NAME.to_string());
+                        }
+                        if self.config.terminal_font_apply_to_ui {
+                            if let Some(proportional) = font_definitions
+                                .families
+                                .get_mut(&egui::FontFamily::Proportional)
+                            {
+                                proportional.retain(|name| name != CUSTOM_FONT_NAME);
+                                proportional.insert(0, CUSTOM_FONT_NAME.to_string());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        applied_status = Some(format!(
+                            "Failed to load '{}' from {}: {err}",
+                            selected_name,
+                            font_path.display()
+                        ));
+                    }
+                },
+                None => {
+                    applied_status = Some(format!(
+                        "Selected font '{}' has no saved file path. Open Settings > Fonts to refresh it.",
+                        selected_name
+                    ));
+                }
+            }
+        }
+
+        self.invalidate_terminal_font_caches();
+        ctx.set_fonts(font_definitions);
+        self.applied_font_status = applied_status;
+        self.applied_font_key = font_key;
+        self.apply_global_style(ctx);
+        self.style_scale_key = Self::style_scale_key(ctx.pixels_per_point());
+        ctx.request_repaint();
     }
 
     fn parse_version_triplet(raw: &str) -> Option<(u64, u64, u64)> {
@@ -783,6 +1041,8 @@ impl AppState {
             egui_extras::install_image_loaders(ctx);
             self.style_initialized = true;
         }
+
+        self.apply_font_preferences(ctx);
 
         // Refresh style only when the snapped text pixel sizes would actually change.
         let scale_key = Self::style_scale_key(ctx.pixels_per_point());

@@ -6,6 +6,7 @@ struct TerminalViewOptions {
     term_font_size: f32,
     allow_resize: bool,
     focus_shade: bool,
+    show_active_border: bool,
 }
 
 impl AppState {
@@ -220,7 +221,7 @@ impl AppState {
         }
 
         // Only show the typing-focus border when the terminal widget actually owns keyboard focus.
-        if response.has_focus() {
+        if options.show_active_border && response.has_focus() {
             let c = options.theme.accent;
             let (a_stroke, a_glow) = (180u8, 70u8);
             let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a_stroke));

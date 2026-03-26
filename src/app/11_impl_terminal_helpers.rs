@@ -212,6 +212,20 @@ impl AppState {
         }
     }
 
+    fn scroll_terminal_to_bottom_for_input(tab: &mut SshTab) {
+        if tab.screen.scrollback() > 0 {
+            Self::set_scrollback(tab, 0);
+        }
+    }
+
+    fn send_keyboard_bytes(tab: &mut SshTab, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        Self::scroll_terminal_to_bottom_for_input(tab);
+        Self::send_bytes(tab, bytes);
+    }
+
     fn set_scrollback(tab: &mut SshTab, rows: usize) {
         let target = rows.min(tab.scrollback_max);
         tab.screen.set_scrollback(target);
@@ -280,7 +294,7 @@ impl AppState {
         } else {
             bytes.extend_from_slice(s.as_bytes());
         }
-        Self::send_bytes(tab, bytes);
+        Self::send_keyboard_bytes(tab, bytes);
     }
 
     fn paste_from_clipboard(tab: &mut SshTab, clipboard: &mut Option<Clipboard>) {
@@ -634,7 +648,7 @@ impl AppState {
 
     fn send_key(tab: &mut SshTab, key: egui::Key, mods: egui::Modifiers) {
         if let Some(bytes) = Self::key_event_bytes(key, mods, tab.screen.application_cursor()) {
-            Self::send_bytes(tab, bytes);
+            Self::send_keyboard_bytes(tab, bytes);
         }
     }
 
@@ -1284,17 +1298,17 @@ impl AppState {
                             }
                         } else {
                             // Treat Ctrl+C as SIGINT when nothing is selected.
-                            Self::send_bytes(tab, vec![0x03]);
+                            Self::send_keyboard_bytes(tab, vec![0x03]);
                         }
                     }
                     egui::Event::Cut => {
                         // Some platforms surface Ctrl+X as a high-level cut command instead of a
                         // raw key event. In a terminal, that should still reach the remote app.
-                        Self::send_bytes(tab, vec![0x18]);
+                        Self::send_keyboard_bytes(tab, vec![0x18]);
                     }
                     egui::Event::Text(t) => {
                         if let Some(bytes) = Self::text_event_bytes(t, global_mods) {
-                            Self::send_bytes(tab, bytes);
+                            Self::send_keyboard_bytes(tab, bytes);
                         }
                     }
                     egui::Event::Paste(s) => {
@@ -1342,7 +1356,7 @@ impl AppState {
                                 }
                             } else {
                                 // No local selection: behave like a real terminal (SIGINT).
-                                Self::send_bytes(tab, vec![0x03]);
+                                Self::send_keyboard_bytes(tab, vec![0x03]);
                             }
                             continue;
                         }
@@ -1962,5 +1976,27 @@ mod tests {
             AppState::key_event_bytes(egui::Key::Q, egui::Modifiers::CTRL | egui::Modifiers::ALT, false),
             None
         );
+    }
+
+    #[test]
+    fn keyboard_input_scrolls_terminal_back_to_bottom() {
+        let mut tab = SshTab::new(
+            1,
+            ConnectionSettings::default(),
+            None,
+            ssh::TERM_SCROLLBACK_LEN,
+            "logs\\tab-1.log".to_string(),
+        );
+        let mut parser = crate::terminal_emulator::Parser::new(2, 4, ssh::TERM_SCROLLBACK_LEN);
+        parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\n");
+        parser.set_scrollback(2);
+        tab.screen = parser.screen().clone();
+        tab.scrollback_max = tab.screen.scrollback_max();
+        assert!(tab.screen.scrollback() > 0);
+
+        AppState::send_key(&mut tab, egui::Key::Enter, egui::Modifiers::NONE);
+
+        assert_eq!(tab.screen.scrollback(), 0);
+        assert_eq!(tab.pending_scrollback, Some(0));
     }
 }

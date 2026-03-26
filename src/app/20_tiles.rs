@@ -99,6 +99,7 @@ struct SshTilesBehavior<'a> {
     term_font_size: f32,
     allow_resize: bool,
     focus_shade: bool,
+    show_active_border: bool,
     profiles: Vec<(String, ConnectionSettings)>,
     clipboard: &'a mut Option<Clipboard>,
     actions: Vec<TilesAction>,
@@ -112,6 +113,7 @@ struct SshTilesBehaviorInit<'a> {
     term_font_size: f32,
     allow_resize: bool,
     focus_shade: bool,
+    show_active_border: bool,
     profiles: Vec<(String, ConnectionSettings)>,
     clipboard: &'a mut Option<Clipboard>,
     active_tile: Option<TileId>,
@@ -126,6 +128,7 @@ impl<'a> SshTilesBehavior<'a> {
             term_font_size: init.term_font_size,
             allow_resize: init.allow_resize,
             focus_shade: init.focus_shade,
+            show_active_border: init.show_active_border,
             profiles: init.profiles,
             clipboard: init.clipboard,
             actions: Vec::new(),
@@ -167,6 +170,7 @@ impl<'a> TilesBehavior<SshTab> for SshTilesBehavior<'a> {
                     term_font_size: self.term_font_size,
                     allow_resize: self.allow_resize,
                     focus_shade: self.focus_shade,
+                    show_active_border: self.show_active_border,
                 },
             );
         } else {

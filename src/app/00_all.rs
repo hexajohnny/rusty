@@ -1,8 +1,8 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
-use std::{fs, path::PathBuf};
+use std::{fs, path::{Path, PathBuf}};
 
 use arboard::Clipboard;
 use eframe::egui;
@@ -496,6 +496,7 @@ enum SettingsPage {
     Autostart,
     Behavior,
     Appearance,
+    Fonts,
     UiTheme,
     Updates,
     TerminalColors,
@@ -508,6 +509,7 @@ impl SettingsPage {
             Self::Autostart => "Autostart",
             Self::Behavior => "Behavior",
             Self::Appearance => "Appearance",
+            Self::Fonts => "Fonts",
             Self::UiTheme => "UI Theme",
             Self::Updates => "Updates",
             Self::TerminalColors => "Terminal Colors",
@@ -542,6 +544,12 @@ impl SettingsDialog {
             just_opened: false,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct InstalledTerminalFont {
+    name: String,
+    path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1308,6 +1316,11 @@ pub struct AppState {
     theme_source: Option<PathBuf>,
     term_theme: TermTheme,
     terminal_theme_registry: ThemeRegistry,
+    terminal_font_catalog: Vec<InstalledTerminalFont>,
+    terminal_font_catalog_loaded: bool,
+    terminal_font_catalog_status: Option<String>,
+    applied_font_key: String,
+    applied_font_status: Option<String>,
 
     config: config::AppConfig,
     config_saver: AsyncConfigSaver,

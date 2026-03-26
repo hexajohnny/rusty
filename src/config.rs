@@ -35,11 +35,22 @@ pub enum UiThemeMode {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct SavedWindow {
     pub outer_pos: [f32; 2],
     pub inner_size: [f32; 2],
     #[serde(default)]
     pub maximized: bool,
+}
+
+impl Default for SavedWindow {
+    fn default() -> Self {
+        Self {
+            outer_pos: [0.0, 0.0],
+            inner_size: [1280.0, 800.0],
+            maximized: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -132,25 +143,28 @@ impl Default for TerminalColorsConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferDirectionConfig {
+    #[default]
     Download,
     Upload,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferStateConfig {
     Queued,
     Running,
     Paused,
+    #[default]
     Finished,
     Failed,
     Canceled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TransferHistoryEntry {
     pub request_id: u64,
     pub direction: TransferDirectionConfig,
@@ -164,7 +178,25 @@ pub struct TransferHistoryEntry {
     pub message: String,
 }
 
+impl Default for TransferHistoryEntry {
+    fn default() -> Self {
+        Self {
+            request_id: 0,
+            direction: TransferDirectionConfig::Download,
+            settings: ConnectionSettings::default(),
+            remote_path: String::new(),
+            local_path: String::new(),
+            transferred_bytes: 0,
+            total_bytes: None,
+            speed_bps: 0.0,
+            state: TransferStateConfig::Finished,
+            message: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub profiles: Vec<ConnectionProfile>,
     pub default_profile: Option<String>,
@@ -177,6 +209,14 @@ pub struct AppConfig {
     pub minimize_to_tray: bool,
     #[serde(default)]
     pub focus_shade: bool,
+    #[serde(default)]
+    pub hide_active_terminal_border: bool,
+    #[serde(default)]
+    pub terminal_font_name: Option<String>,
+    #[serde(default)]
+    pub terminal_font_path: Option<String>,
+    #[serde(default)]
+    pub terminal_font_apply_to_ui: bool,
     #[serde(default = "default_terminal_font_size")]
     pub terminal_font_size: f32,
     #[serde(default = "default_terminal_scrollback_lines")]
@@ -209,6 +249,10 @@ impl Default for AppConfig {
             ui_theme_file: None,
             minimize_to_tray: false,
             focus_shade: false,
+            hide_active_terminal_border: false,
+            terminal_font_name: None,
+            terminal_font_path: None,
+            terminal_font_apply_to_ui: false,
             terminal_font_size: default_terminal_font_size(),
             terminal_scrollback_lines: default_terminal_scrollback_lines(),
             save_session_layout: false,
@@ -224,12 +268,25 @@ impl Default for AppConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ConnectionProfile {
     pub name: String,
     pub settings: ConnectionSettings,
+    #[serde(default)]
     pub remember_password: bool,
     #[serde(default)]
     pub remember_key_passphrase: bool,
+}
+
+impl Default for ConnectionProfile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            settings: ConnectionSettings::default(),
+            remember_password: false,
+            remember_key_passphrase: false,
+        }
+    }
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -327,6 +384,27 @@ fn unreadable_config_outcome(path: &Path, bytes: &[u8], reason: &str) -> ConfigL
     );
 
     let backup = preserve_unreadable_config(path, bytes, reason);
+    if let Some((config, recovered_from)) = recover_from_corrupt_backups(path) {
+        save(&config);
+        let notice = match backup {
+            Some(ref preserved_as) => format!(
+                "Rusty could not read the saved config at {}. It was preserved as {}, and Rusty restored the most recent readable backup from {}.",
+                path.display(),
+                preserved_as.display(),
+                recovered_from.display()
+            ),
+            None => format!(
+                "Rusty could not read the saved config at {}. Rusty restored the most recent readable backup from {}.",
+                path.display(),
+                recovered_from.display()
+            ),
+        };
+        return ConfigLoadOutcome {
+            config,
+            notice: Some(notice),
+        };
+    }
+
     let notice = match backup {
         Some(backup) => format!(
             "Rusty could not read the saved config at {}. It was preserved as {} and defaults were loaded.",
@@ -365,6 +443,89 @@ fn sanitized_for_plaintext_fallback(cfg: &AppConfig) -> AppConfig {
     sanitized
 }
 
+fn parse_config_bytes(bytes: &[u8]) -> Result<AppConfig, String> {
+    if bytes.starts_with(CFG_MAGIC_PREFIX.as_bytes()) {
+        let b64 = &bytes[CFG_MAGIC_PREFIX.len()..];
+        let cipher = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|err| format!("base64 decode failed: {err}"))?;
+        let plain = crypto::decrypt_for_current_user(&cipher)
+            .map_err(|err| format!("decrypt failed: {err}"))?;
+        serde_json::from_slice::<AppConfig>(&plain)
+            .map_err(|err| format!("JSON parse failed after decrypt: {err}"))
+    } else {
+        serde_json::from_slice::<AppConfig>(bytes)
+            .map_err(|err| format!("JSON parse failed: {err}"))
+    }
+}
+
+fn recover_from_corrupt_backups(path: &Path) -> Option<(AppConfig, PathBuf)> {
+    let parent = path.parent()?;
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("config");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("json");
+    let prefix = format!("{stem}.corrupt-");
+    let suffix = if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{ext}")
+    };
+
+    let mut backups: Vec<PathBuf> = fs::read_dir(parent)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with(&prefix) && name.ends_with(&suffix))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    backups.sort_by_key(|candidate| {
+        fs::metadata(candidate)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+    backups.reverse();
+
+    for backup in backups {
+        let bytes = match fs::read(&backup) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                logger::log_line(
+                    "logs\\config.log",
+                    &format!(
+                        "Config backup read failed for {} while attempting recovery: {err}",
+                        backup.display()
+                    ),
+                );
+                continue;
+            }
+        };
+
+        match parse_config_bytes(&bytes) {
+            Ok(config) => return Some((config, backup)),
+            Err(err) => {
+                logger::log_line(
+                    "logs\\config.log",
+                    &format!(
+                        "Config backup {} was not readable during recovery: {err}",
+                        backup.display()
+                    ),
+                );
+            }
+        }
+    }
+
+    None
+}
+
 pub fn load() -> ConfigLoadOutcome {
     let path = config_path();
     let (bytes, loaded_from_path) = if let Ok(bytes) = fs::read(&path) {
@@ -392,48 +553,10 @@ pub fn load() -> ConfigLoadOutcome {
         }
     };
 
-    let cfg = if bytes.starts_with(CFG_MAGIC_PREFIX.as_bytes()) {
-        let b64 = &bytes[CFG_MAGIC_PREFIX.len()..];
-        let cipher = match base64::engine::general_purpose::STANDARD.decode(b64) {
-            Ok(cipher) => cipher,
-            Err(err) => {
-                return unreadable_config_outcome(
-                    &loaded_from_path,
-                    &bytes,
-                    &format!("base64 decode failed: {err}"),
-                );
-            }
-        };
-        let plain = match crypto::decrypt_for_current_user(&cipher) {
-            Ok(plain) => plain,
-            Err(err) => {
-                return unreadable_config_outcome(
-                    &loaded_from_path,
-                    &bytes,
-                    &format!("decrypt failed: {err}"),
-                );
-            }
-        };
-        match serde_json::from_slice::<AppConfig>(&plain) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                return unreadable_config_outcome(
-                    &loaded_from_path,
-                    &bytes,
-                    &format!("JSON parse failed after decrypt: {err}"),
-                );
-            }
-        }
-    } else {
-        match serde_json::from_slice::<AppConfig>(&bytes) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                return unreadable_config_outcome(
-                    &loaded_from_path,
-                    &bytes,
-                    &format!("JSON parse failed: {err}"),
-                );
-            }
+    let cfg = match parse_config_bytes(&bytes) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            return unreadable_config_outcome(&loaded_from_path, &bytes, &err);
         }
     };
 
@@ -501,9 +624,8 @@ pub fn save(cfg: &AppConfig) {
     };
 
     // Best-effort atomic write with bounded retries for transient file lock races.
-    let tmp = path.with_extension("json.tmp");
     for attempt in 0..=CONFIG_SAVE_RETRY_COUNT {
-        match write_config_atomic(&path, &tmp, &payload) {
+        match write_config_atomic(&path, &payload) {
             Ok(()) => return,
             Err(err) => {
                 let attempt_num = attempt + 1;
@@ -529,21 +651,62 @@ pub fn save(cfg: &AppConfig) {
     }
 }
 
-fn write_config_atomic(path: &Path, tmp: &Path, payload: &[u8]) -> std::io::Result<()> {
-    fs::write(tmp, payload)?;
+fn write_config_atomic(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let tmp = path.with_file_name(format!("{file_name}.{}.{}.tmp", std::process::id(), stamp));
+    fs::write(&tmp, payload)?;
 
-    if fs::rename(tmp, path).is_ok() {
-        return Ok(());
-    }
-
-    // If rename fails (e.g. cross-device), fall back to copy+remove.
-    let bytes = fs::read(tmp)?;
-    fs::write(path, bytes)?;
-    match fs::remove_file(tmp) {
+    match replace_config_file(&tmp, path) {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(err)
+        }
     }
+}
+
+#[cfg(windows)]
+fn replace_config_file(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let temp_wide: Vec<u16> = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect();
+    let final_wide: Vec<u16> = final_path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect();
+
+    let moved = unsafe {
+        MoveFileExW(
+            temp_wide.as_ptr(),
+            final_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_config_file(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    fs::rename(temp_path, final_path)
 }
 
 pub fn find_profile_index(cfg: &AppConfig, name: &str) -> Option<usize> {
@@ -689,6 +852,123 @@ mod tests {
 
         assert_eq!(backups.len(), 1);
         assert_eq!(fs::read(&backups[0]).unwrap(), bytes);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_configs_missing_new_fields_still_load() {
+        let json = br#"{
+            "profiles": [
+                {
+                    "name": "prod",
+                    "settings": {
+                        "host": "example.com",
+                        "port": 22,
+                        "username": "alice",
+                        "password": "pw"
+                    }
+                }
+            ],
+            "default_profile": "prod",
+            "autostart": true
+        }"#;
+
+        let cfg: AppConfig = serde_json::from_slice(json).unwrap();
+
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.profiles[0].name, "prod");
+        assert_eq!(cfg.profiles[0].settings.host, "example.com");
+        assert!(!cfg.profiles[0].remember_password);
+        assert!(!cfg.profiles[0].remember_key_passphrase);
+        assert_eq!(cfg.default_profile.as_deref(), Some("prod"));
+        assert!(cfg.autostart);
+        assert!(!cfg.hide_active_terminal_border);
+        assert_eq!(cfg.terminal_font_name, None);
+        assert_eq!(cfg.terminal_font_path, None);
+        assert!(!cfg.terminal_font_apply_to_ui);
+        assert_eq!(cfg.terminal_font_size, default_terminal_font_size());
+        assert_eq!(
+            cfg.terminal_scrollback_lines,
+            default_terminal_scrollback_lines()
+        );
+        assert!(cfg.transfer_history.is_empty());
+    }
+
+    #[test]
+    fn legacy_transfer_history_entries_missing_new_fields_still_load() {
+        let json = br#"{
+            "profiles": [
+                {
+                    "name": "prod",
+                    "settings": {
+                        "host": "example.com",
+                        "username": "alice"
+                    }
+                }
+            ],
+            "transfer_history": [
+                {
+                    "request_id": 7,
+                    "settings": {
+                        "host": "example.com",
+                        "username": "alice"
+                    },
+                    "remote_path": "/tmp/file.txt",
+                    "local_path": "file.txt"
+                }
+            ]
+        }"#;
+
+        let cfg: AppConfig = serde_json::from_slice(json).unwrap();
+
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.profiles[0].settings.port, 22);
+        assert_eq!(cfg.transfer_history.len(), 1);
+        assert_eq!(cfg.transfer_history[0].request_id, 7);
+        assert_eq!(
+            cfg.transfer_history[0].direction,
+            TransferDirectionConfig::Download
+        );
+        assert_eq!(cfg.transfer_history[0].state, TransferStateConfig::Finished);
+        assert_eq!(cfg.transfer_history[0].settings.port, 22);
+        assert_eq!(cfg.transfer_history[0].speed_bps, 0.0);
+    }
+
+    #[test]
+    fn recover_from_latest_readable_corrupt_backup() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rusty-config-recover-test-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let unreadable_backup = dir.join("config.corrupt-1.json");
+        let readable_backup = dir.join("config.corrupt-2.json");
+
+        fs::write(&unreadable_backup, b"not valid config").unwrap();
+        fs::write(
+            &readable_backup,
+            br#"{
+                "profiles": [
+                    {
+                        "name": "prod",
+                        "settings": {
+                            "host": "example.com",
+                            "username": "alice"
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let (cfg, recovered_from) = recover_from_corrupt_backups(&path).unwrap();
+        assert_eq!(recovered_from, readable_backup);
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.profiles[0].name, "prod");
+        assert_eq!(cfg.profiles[0].settings.port, 22);
 
         let _ = fs::remove_dir_all(&dir);
     }
